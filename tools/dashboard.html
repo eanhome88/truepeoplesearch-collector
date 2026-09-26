@@ -124,6 +124,13 @@
             <button type="button" class="modal-close" id="modalCloseBtn">×</button>
         </div>
         <div class="modal-body">
+            <div class="force-update-alert" id="forceUpdateAlert" style="display:none;">
+                <div class="force-alert-icon">🚨</div>
+                <div class="force-alert-content">
+                    <div class="force-alert-title">关键版本强制升级通知</div>
+                    <div class="force-alert-text" id="forceAlertText">系统核心反爬策略已变更，旧版已停用。您必须升级至最新版本后方可继续运行任务。</div>
+                </div>
+            </div>
             <div class="version-diff-card" id="versionDiffCard">
                 <div class="version-diff-side">
                     <span class="diff-label">当前运行版本</span>

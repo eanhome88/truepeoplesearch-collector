@@ -90,6 +90,21 @@ class VersionApiTests(unittest.TestCase):
             self.assertFalse(data.get("ok"))
             self.assertIn("尚未配置远程源", data.get("error", ""))
 
+    def test_force_update_active(self):
+        with patch("tps_version.check_for_updates") as mock_check:
+            mock_check.return_value = {"force_update": True, "force_update_reason": "协议升级"}
+            active, reason = tps_version.is_force_update_active(use_cache=False)
+            self.assertTrue(active)
+            self.assertEqual(reason, "协议升级")
+
+    def test_force_update_blocks_start(self):
+        with patch("tps_version.is_force_update_active") as mock_force:
+            mock_force.return_value = (True, "必须升级")
+            resp = self.client.post("/api/cluster/control", json={"action": "start"})
+            self.assertEqual(resp.status_code, 426)
+            data = resp.get_json()
+            self.assertEqual(data.get("code"), "force_update_required")
+
 
 if __name__ == "__main__":
     unittest.main()

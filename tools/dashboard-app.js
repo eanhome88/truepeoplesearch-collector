@@ -2537,6 +2537,7 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
     function closeModal() {
         if (!updateModalBackdrop) return;
         if (isUpgrading) return; // 升级进行中禁止关闭
+        if (updateModalBackdrop.dataset.force === 'true') return; // 强制更新状态下禁止关闭
         updateModalBackdrop.style.display = 'none';
     }
 
@@ -2612,12 +2613,36 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
                         modalNotesList.innerHTML = notes.map(n => `<li>${esc(n)}</li>`).join('');
                     }
 
-                    if (modalUpgradeBtn) {
-                        modalUpgradeBtn.disabled = false;
-                        modalUpgradeBtn.textContent = '🚀 立即一键升级';
+                    const isForce = Boolean(latestUpdateInfo.force_update);
+                    const forceAlert = document.getElementById('forceUpdateAlert');
+                    const forceText = document.getElementById('forceAlertText');
+                    if (isForce) {
+                        if (updateModalBackdrop) updateModalBackdrop.dataset.force = 'true';
+                        if (forceAlert) forceAlert.style.display = 'flex';
+                        if (forceText && latestUpdateInfo.force_update_reason) {
+                            forceText.textContent = latestUpdateInfo.force_update_reason;
+                        }
+                        if (modalCloseBtn) modalCloseBtn.style.display = 'none';
+                        if (modalCancelBtn) modalCancelBtn.style.display = 'none';
+                        if (bannerCloseBtn) bannerCloseBtn.style.display = 'none';
+                        if (modalUpgradeBtn) {
+                            modalUpgradeBtn.disabled = false;
+                            modalUpgradeBtn.textContent = '🚨 立即一键升级 (强制更新)';
+                        }
+                        // 强制更新立即自动弹窗
+                        openModal();
+                    } else {
+                        if (updateModalBackdrop) updateModalBackdrop.removeAttribute('data-force');
+                        if (forceAlert) forceAlert.style.display = 'none';
+                        if (modalCloseBtn) modalCloseBtn.style.display = 'inline-block';
+                        if (modalCancelBtn) modalCancelBtn.style.display = 'inline-block';
+                        if (bannerCloseBtn) bannerCloseBtn.style.display = 'inline-block';
+                        if (modalUpgradeBtn) {
+                            modalUpgradeBtn.disabled = false;
+                            modalUpgradeBtn.textContent = '🚀 立即一键升级';
+                        }
+                        if (interactive) openModal();
                     }
-
-                    if (interactive) openModal();
                 } else {
                     // 已是最新
                     if (versionBadge) versionBadge.classList.remove('has-update');

@@ -1201,6 +1201,14 @@ def api_pipeline_toggle(role):
     if action not in ("start", "stop"):
         return jsonify({"error": "action 只能是 start 或 stop", "ok": False}), 400
     if action == "start":
+        import tps_version
+        force_active, force_reason = tps_version.is_force_update_active()
+        if force_active:
+            return jsonify({
+                "ok": False,
+                "code": "force_update_required",
+                "error": f"系统存在关键更新必须升级：{force_reason}，请先在面板完成一键升级"
+            }), 426
         refused = _start_target_guard(role)
         if refused is not None:
             return refused
@@ -1442,6 +1450,14 @@ def api_cluster_control():
     if action not in ("start", "stop"):
         return jsonify({"ok": False, "error": "action 必须是 start 或 stop"}), 400
     if action == "start":
+        import tps_version
+        force_active, force_reason = tps_version.is_force_update_active()
+        if force_active:
+            return jsonify({
+                "ok": False,
+                "code": "force_update_required",
+                "error": f"系统存在关键更新必须升级：{force_reason}，请先在面板完成一键升级"
+            }), 426
         refused = _start_target_guard("cluster")
         if refused is not None:
             return refused

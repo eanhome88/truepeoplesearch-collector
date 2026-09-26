@@ -8,11 +8,18 @@ echo ============================================================
 REM 1. 启动 Docker 容器 (如果存在)
 docker --version >nul 2>&1
 if %errorlevel% equ 0 (
-    echo [1/3] 正在启动 TiDB 数据库与 Redis 容器...
+    echo [1/4] 正在启动 TiDB 数据库与 Redis 容器...
     docker compose -f "%~dp0deploy\docker-compose.yml" up -d
 )
 
-REM 2. 检查 Python 运行环境
+REM 2. 检查云端更新 (极速静默同步)
+git --version >nul 2>&1
+if %errorlevel% equ 0 (
+    echo [2/4] 正在检测并拉取云端核心版本...
+    git pull --ff-only origin main --quiet >nul 2>&1
+)
+
+REM 3. 检查 Python 运行环境
 set "PYTHON_EXE=%~dp0.venv\Scripts\python.exe"
 if not exist "%PYTHON_EXE%" (
     set "PYTHON_EXE=python"

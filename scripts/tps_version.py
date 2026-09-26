@@ -223,6 +223,11 @@ def check_for_updates(timeout_sec: float = 6.0) -> Dict[str, Any]:
                         if log_res.returncode == 0 and log_res.stdout.strip():
                             notes = [line.strip() for line in log_res.stdout.strip().splitlines() if line.strip()]
                             result["latest_release_notes"] = notes
+                            # 如果提交日志包含强制升级标记
+                            for note in notes:
+                                if any(tag in note for tag in ("[FORCE]", "[强制更新]", "BREAKING:", "CRITICAL:")):
+                                    result["force_update"] = True
+                                    result["force_update_reason"] = "检测到紧急安全/协议版本升级，旧版已停用"
 
                         # 获取最新远程提交 short commit
                         latest_hash = subprocess.run(
@@ -235,6 +240,33 @@ def check_for_updates(timeout_sec: float = 6.0) -> Dict[str, Any]:
                         )
                         if latest_hash.returncode == 0:
                             result["latest_commit"] = latest_hash.stdout.strip()
+
+                        # 核心黑科技：直接从远程分支提取最新的 version.json，检测强制升级元数据！
+                        vjson_res = subprocess.run(
+                            ["git", "show", f"origin/{branch}:version.json"],
+                            cwd=str(_ROOT_DIR),
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            timeout=3,
+                        )
+                        if vjson_res.returncode == 0 and vjson_res.stdout.strip():
+                            try:
+                                remote_vdata = json.loads(vjson_res.stdout.strip())
+                                remote_v = remote_vdata.get("version")
+                                if remote_v:
+                                    result["latest_version"] = remote_v
+                                if remote_vdata.get("release_notes"):
+                                    result["latest_release_notes"] = remote_vdata.get("release_notes")
+                                if remote_vdata.get("force_update"):
+                                    result["force_update"] = True
+                                    result["force_update_reason"] = remote_vdata.get("force_update_reason") or "系统核心升级，必须更新后方可使用"
+                                min_req = remote_vdata.get("min_required_version")
+                                if min_req and parse_semver(current_version) < parse_semver(min_req):
+                                    result["force_update"] = True
+                                    result["force_update_reason"] = remote_vdata.get("force_update_reason") or f"当前版本低于最低要求 (最低支持 v{min_req})，必须强制升级"
+                            except Exception as e:
+                                logger.debug("解析远程 version.json 异常: %s", e)
         except Exception as e:
             logger.debug("Git 远程更新检测跳过或超时: %s", e)
 
@@ -254,10 +286,39 @@ def check_for_updates(timeout_sec: float = 6.0) -> Dict[str, Any]:
                         result["source"] = "http_manifest"
                         if remote_data.get("release_notes"):
                             result["latest_release_notes"] = remote_data["release_notes"]
+                        if remote_data.get("force_update"):
+                            result["force_update"] = True
+                            result["force_update_reason"] = remote_data.get("force_update_reason") or "系统核心升级，必须更新后方可使用"
+                        min_req = remote_data.get("min_required_version")
+                        if min_req and parse_semver(current_version) < parse_semver(min_req):
+                            result["force_update"] = True
+                            result["force_update_reason"] = remote_data.get("force_update_reason") or f"当前版本低于最低要求 (最低支持 v{min_req})，必须强制升级"
         except Exception as e:
             logger.debug("HTTP 远程更新检测异常: %s", e)
 
+    _LAST_CHECK_CACHE["time"] = time.time()
+    _LAST_CHECK_CACHE["data"] = result
     return result
+
+
+_LAST_CHECK_CACHE = {"time": 0.0, "data": None}
+
+
+def is_force_update_active(use_cache: bool = True) -> Tuple[bool, str]:
+    """检查当前是否处于强制更新阻断状态"""
+    now = time.time()
+    cached = _LAST_CHECK_CACHE["data"]
+    if use_cache and cached and (now - _LAST_CHECK_CACHE["time"] < 60):
+        if cached.get("force_update"):
+            return True, cached.get("force_update_reason", "系统强制更新中")
+        return False, ""
+    try:
+        res = check_for_updates(timeout_sec=3.0)
+        if res.get("force_update"):
+            return True, res.get("force_update_reason", "系统强制更新中")
+    except Exception:
+        pass
+    return False, ""
 
 
 def execute_system_update(force_stash: bool = False) -> Dict[str, Any]:
