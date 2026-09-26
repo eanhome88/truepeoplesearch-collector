@@ -2,15 +2,20 @@
      TruePeopleSearch 企业情报中心 · Windows 客户端部署与使用指南
 ========================================================================
 
+【第零步：环境一键自检诊断 (极力推荐)】
+• 如果不确定电脑是否符合要求，直接双击运行：【check_env.bat】
+  全自动检测 Python、Git、Docker、云端网络连通性及数据库端口，缺失时提供一键安装方案。
+
 【第一步：运行环境准备 (仅首次需要)】
 1. 确保电脑已安装 Python 3.9 或更高版本（安装时请务必勾选 "Add Python to PATH"）。
-2. 本地数据库（二选一）：
+2. Git 版本控制工具（用于云端自动升级，推荐安装）。
+3. 本地数据库（二选一）：
    • 推荐方式：安装并打开 Docker Desktop，系统将全自动拉起本地 TiDB 与 Redis 容器。
    • 备选方式：若不使用 Docker，可在本机安装运行 MySQL (端口 4000 或 3306) 与 Redis (端口 6379)。
 
 【第二步：首次安装与环境初始化】
-• 双击运行：deploy\install.bat
-  脚本将自动创建 Python 虚拟环境、安装同步必要依赖，并全自动在数据库中创建 8 张核心数据表与高性能索引。
+• 双击运行：【deploy\install.bat】
+  脚本将自动创建独立 Python 虚拟环境 (.venv)、安装必要依赖、同步反爬浏览器内核，并全自动在数据库中创建 8 张核心数据表与高性能索引。
 
 【第三步：启动系统与打开控制台】
 • 方式一 (推荐桌面客户端)：双击【TruePeopleSearch.exe】
@@ -18,12 +23,12 @@
   控制台地址：http://127.0.0.1:5001
   代理配置页：http://127.0.0.1:5001/#/proxy
 
-• 方式二 (纯后台静默版)：双击【TruePeopleSearch_后台无窗启动.exe】
+• 方式二 (纯后台静默无窗版)：双击【TruePeopleSearch_GUI.exe】(或【TruePeopleSearch_后台无窗启动.exe】)
   无黑色命令行窗口，直接在后台静默运行并拉起浏览器控制台。
 
 【第四步：平稳停止退出】
 • 在 TruePeopleSearch.exe 窗口中输入字母 q 并按回车 (或按 Ctrl+C)；
-• 或者直接双击运行【TruePeopleSearch_停止.exe】(或 stop_client.bat)，后台进程与数据库连接将全部平稳释放。
+• 或者直接双击运行【TruePeopleSearch_Stop.exe】(或【TruePeopleSearch_停止.exe】、stop_client.bat)，后台进程与数据库连接将全部平稳释放。
 
 【关于云端自动检测与一键更新】
 • 本客户端已内置绑定自建云端仓库 (http://121.41.231.194:10886/wangqi/22)。
