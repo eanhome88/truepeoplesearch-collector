@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  # ============================================================
+  # 1. PingCAP TiDB 本地单机持久化数据库 (单容器全功能引擎)
+  # 默认监听端口：4000 (MySQL协议兼容), 10080 (HTTP 状态监控)
+  # ============================================================
+  tidb:
+    image: pingcap/tidb:v6.5.0
+    container_name: tps-tidb
+    restart: always
+    ports:
+      - "4000:4000"
+      - "10080:10080"
+    volumes:
+      - tidb_data:/tmp/tidb
+    command:
+      - --store=unistore
+      - --path=/tmp/tidb
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 4000 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  # ============================================================
+  # 2. Redis 内存缓存与分布式任务消息队列
+  # 默认监听端口：6379
+  # ============================================================
+  redis:
+    image: redis:7-alpine
+    container_name: tps-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+volumes:
+  tidb_data:
+    name: tps_tidb_data
+  redis_data:
+    name: tps_redis_data

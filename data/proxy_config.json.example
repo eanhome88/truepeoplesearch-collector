@@ -1,0 +1,9 @@
+{
+  "mode": "tunnel",
+  "tunnel": "http://username:password@gateway.proxy-provider.com:8888",
+  "proxy_file": "",
+  "api_url": "",
+  "sticky_requests": 25,
+  "cooldown_sec": 45.0,
+  "updated_at": 0
+}

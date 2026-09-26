@@ -1,0 +1,45 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# System & IDE files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Logs & runtime dumps
+*.log
+data/logs/*.log
+!data/logs/.gitkeep
+dump.rdb
+*.pid
+
+# Local secrets & proxy auth (keep template example)
+my_us_proxies.txt
+.proxy_config.json.lock
+data/proxy_config.json
+.env
+.env.local
+
+# Scrapling / Playwright cache
+.playwright-cli/
+.playwright-mcp/
+
+# Node modules
+node_modules/
+package-lock.json

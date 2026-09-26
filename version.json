@@ -1,0 +1,15 @@
+{
+  "version": "1.0.0",
+  "build": "20260926",
+  "release_date": "2026-09-26",
+  "name": "TruePeopleSearch Enterprise Intelligence Suite",
+  "channel": "stable",
+  "release_notes": [
+    "🚀 核心架构：TiDB 本地千万级高可用数据库与 Redis 实时消息队列全套解耦",
+    "🛡️ 反爬自愈：集成指数退避自适应断路器与智能代理故障转移",
+    "📊 可视化仪表盘：新增 5 级全链路流式漏斗监控、槽位矩阵雷达与实时情报流",
+    "🔔 告警联动：企业微信、飞书、钉钉、通用 Webhook 多平台毫秒级告警",
+    "🔄 自动更新：集成 Git 云端版本检测与 Web 仪表盘一键无损平滑升级"
+  ],
+  "update_check_url": ""
+}

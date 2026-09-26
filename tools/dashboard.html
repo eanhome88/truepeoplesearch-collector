@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TruePeopleSearch · 数据情报</title>
+    <link rel="stylesheet" href="/assets/dashboard.css">
+</head>
+<body data-page="overview">
+<div class="backdrop" id="backdrop" onclick="closeNav()"></div>
+<div class="app">
+    <aside class="sidebar" id="sidebar">
+        <div class="brand">
+            <div class="brand-mark" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                    <circle cx="10" cy="10" r="6"/>
+                    <path d="M15.5 15.5 21 21"/>
+                    <circle cx="10" cy="9" r="2"/>
+                </svg>
+            </div>
+            <div>
+                <div class="brand-name">TruePeople</div>
+                <div class="brand-sub">Intelligence</div>
+            </div>
+        </div>
+        <nav aria-label="主导航">
+            <div class="nav-group">
+                <div class="nav-label">主面板</div>
+                <button type="button" class="nav-item" data-route="/" aria-current="page">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+                    概览
+                </button>
+                <button type="button" class="nav-item" data-route="/pipeline">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 7h14"/><path d="M5 12h10"/><path d="M5 17h7"/><circle cx="18" cy="12" r="2"/><circle cx="14" cy="17" r="2"/></svg>
+                    抓取控制
+                </button>
+                <button type="button" class="nav-item" data-route="/proxy">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+                    代理与集群
+                </button>
+                <button type="button" class="nav-item" data-route="/persons">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="3.5"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                    人物列表
+                </button>
+                <button type="button" class="nav-item" data-route="/search">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+                    全局搜索
+                </button>
+            </div>
+            <div class="nav-group">
+                <div class="nav-label">分析</div>
+                <button type="button" class="nav-item" data-route="/charts">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 19V5"/><path d="M4 19h16"/><path d="M8 15l3.2-5 2.8 3.5L18 7"/></svg>
+                    图表分析
+                </button>
+                <button type="button" class="nav-item" data-route="/recent">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg>
+                    最近抓取
+                </button>
+            </div>
+        </nav>
+        <div class="sidebar-foot">
+            <div class="queue-metrics is-link" id="queueMetrics" hidden role="link" tabindex="0" title="打开抓取控制"></div>
+            按 <kbd>/</kbd> 聚焦搜索<br>点击城市可筛选人物
+        </div>
+    </aside>
+
+    <div class="workspace">
+        <header class="topbar">
+            <button type="button" class="menu-btn" onclick="toggleNav()" aria-label="打开导航">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+            </button>
+            <label class="search">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+                <input id="globalSearch" type="search" placeholder="搜索姓名、电话或邮箱" autocomplete="off" aria-label="全局搜索">
+                <kbd>/</kbd>
+            </label>
+            <div class="topbar-actions">
+                <div class="version-pill" id="versionBadge" role="button" tabindex="0" title="点击查看系统版本与更新详情">
+                    <span class="version-dot"></span>
+                    <span class="version-text" id="versionText">v1.0.0</span>
+                    <span class="version-update-tag" id="versionUpdateTag" style="display:none;">有更新</span>
+                </div>
+                <button type="button" class="btn btn-sm btn-ghost update-btn" id="checkUpdateBtn" title="检查新版本">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M21 21v-5h-5"/></svg>
+                    <span>检查更新</span>
+                </button>
+            </div>
+        </header>
+
+        <div class="update-banner" id="updateBanner" style="display: none;">
+            <div class="update-banner-content">
+                <div class="update-banner-icon">🚀</div>
+                <div class="update-banner-info">
+                    <div class="update-banner-title">
+                        <strong>发现系统新版本 <span id="bannerLatestVer">v1.1.0</span></strong>
+                        <span class="badge badge-accent" id="bannerCommitCount">1 个新升级</span>
+                    </div>
+                    <div class="update-banner-desc" id="bannerReleaseNotes">包含核心采集调优与反爬策略更新</div>
+                </div>
+            </div>
+            <div class="update-banner-actions">
+                <button type="button" class="btn btn-sm btn-primary" id="bannerApplyBtn">🚀 立即一键升级</button>
+                <button type="button" class="btn btn-sm" id="bannerViewBtn">查看更新日志</button>
+                <button type="button" class="btn-close-banner" id="bannerCloseBtn" aria-label="关闭提示">×</button>
+            </div>
+        </div>
+
+        <main class="main" id="mainContent"></main>
+    </div>
+</div>
+
+<!-- 更新详情与一键升级弹窗 -->
+<div class="modal-backdrop" id="updateModalBackdrop" style="display:none;">
+    <div class="modal update-modal" id="updateModal">
+        <div class="modal-header">
+            <div class="modal-title-group">
+                <div class="modal-icon">🔄</div>
+                <div>
+                    <h3 class="modal-title">系统版本与平滑升级</h3>
+                    <div class="modal-subtitle" id="updateModalSub">当前版本: <span id="modalCurrentVer">v1.0.0</span></div>
+                </div>
+            </div>
+            <button type="button" class="modal-close" id="modalCloseBtn">×</button>
+        </div>
+        <div class="modal-body">
+            <div class="version-diff-card" id="versionDiffCard">
+                <div class="version-diff-side">
+                    <span class="diff-label">当前运行版本</span>
+                    <span class="diff-value" id="diffCurrentVer">v1.0.0</span>
+                    <span class="diff-sub" id="diffCurrentCommit">本地构建</span>
+                </div>
+                <div class="version-diff-arrow">➔</div>
+                <div class="version-diff-side is-new">
+                    <span class="diff-label">最新云端版本</span>
+                    <span class="diff-value" id="diffLatestVer">v1.0.0</span>
+                    <span class="diff-sub" id="diffLatestCommit">已是最新</span>
+                </div>
+            </div>
+
+            <div class="update-notes-container">
+                <div class="notes-header">版本特性与更新日志：</div>
+                <ul class="update-notes-list" id="modalNotesList">
+                    <li>正在检测...</li>
+                </ul>
+            </div>
+
+            <div class="update-terminal" id="updateTerminal" style="display:none;">
+                <div class="terminal-bar">
+                    <span class="term-dot term-red"></span>
+                    <span class="term-dot term-yellow"></span>
+                    <span class="term-dot term-green"></span>
+                    <span class="term-title">实时升级控制台</span>
+                </div>
+                <pre class="terminal-content" id="terminalLogs"></pre>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn" id="modalCheckBtn">🔍 检查更新</button>
+            <button type="button" class="btn" id="modalCancelBtn">稍后处理</button>
+            <button type="button" class="btn btn-primary" id="modalUpgradeBtn">🚀 立即一键升级</button>
+        </div>
+    </div>
+</div>
+
+<script src="/assets/dashboard-runtime.js"></script>
+<script src="/assets/dashboard-app.js"></script>
+</body>
+</html>
