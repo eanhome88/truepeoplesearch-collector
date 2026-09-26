@@ -27,9 +27,10 @@ fi
 VENV_PYTHON="${ROOT_DIR}/.venv/bin/python3"
 VENV_PIP="${ROOT_DIR}/.venv/bin/pip"
 
-# 3. 安装依赖包
-echo "[2/4] 正在安装与同步依赖包..."
+# 3. 安装依赖包与浏览器引擎
+echo "[2/4] 正在安装与同步依赖包及反爬浏览器内核..."
 "${VENV_PIP}" install -r "${ROOT_DIR}/requirements.txt" --quiet
+"${VENV_PYTHON}" -m patchright install chromium --quiet 2>/dev/null || true
 
 # 4. 检查 Docker 及启动 TiDB + Redis
 echo "[3/4] 检查本地数据库 (TiDB) 与消息队列 (Redis)..."

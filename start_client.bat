@@ -26,11 +26,11 @@ if not exist "%PYTHON_EXE%" (
 )
 
 REM 3. 启动后台 Supervisor 守护集群与面板
-echo [2/3] 正在启动进程守护与面板服务...
+echo [3/4] 正在启动进程守护与面板服务...
 start "TPS Supervisor" /min "%PYTHON_EXE%" "%~dp0scripts\tps_supervisor.py" start
 
 REM 4. 等待 2 秒并拉起浏览器
-echo [3/3] 服务已就绪，正在打开控制台界面...
+echo [4/4] 服务已就绪，正在打开控制台界面...
 timeout /t 2 >nul
 start http://127.0.0.1:5001
 
