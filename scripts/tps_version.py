@@ -404,9 +404,21 @@ def execute_system_update(force_stash: bool = False) -> Dict[str, Any]:
         requirements_file = _ROOT_DIR / "requirements.txt"
         if requirements_file.exists():
             logs.append("📦 校验 Python 依赖清单 (requirements.txt)...")
-            # 可以在此运行 pip install -r requirements.txt (如果配置了虚拟环境)
-            venv_pip = _ROOT_DIR / ".venv" / "bin" / "pip"
-            if venv_pip.exists():
+            # 跨平台查找虚拟环境 pip：Windows 在 Scripts/，Unix 在 bin/
+            import sys as _sys
+            _venv_base = _ROOT_DIR / ".venv"
+            if _sys.platform == "win32":
+                _pip_candidates = [
+                    _venv_base / "Scripts" / "pip.exe",
+                    _venv_base / "Scripts" / "pip",
+                ]
+            else:
+                _pip_candidates = [
+                    _venv_base / "bin" / "pip",
+                    _venv_base / "bin" / "pip3",
+                ]
+            venv_pip = next((p for p in _pip_candidates if p.exists()), None)
+            if venv_pip is not None:
                 logs.append("📦 正在同步虚拟环境依赖...")
                 pip_res = subprocess.run(
                     [str(venv_pip), "install", "-r", str(requirements_file), "--quiet"],
@@ -414,7 +426,7 @@ def execute_system_update(force_stash: bool = False) -> Dict[str, Any]:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
-                    timeout=60,
+                    timeout=120,
                 )
                 if pip_res.returncode == 0:
                     logs.append("✅ 虚拟环境依赖同步成功")
