@@ -44,6 +44,8 @@ from queue import Empty
 from typing import Any, Optional
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
+
 _SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
@@ -1271,7 +1273,7 @@ class LeaseWorker:
         for proc in procs:
             proc.join(timeout=2)
             if proc.is_alive():
-                self._signal_proc(proc, signal.SIGKILL)
+                self._signal_proc(proc, _SIGKILL)
                 proc.join(timeout=1)
 
     def _signal_proc(self, proc, sig: int) -> None:

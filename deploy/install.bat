@@ -12,24 +12,24 @@ if %errorlevel% neq 0 (
     pause
     exit /b 1
 )
-echo [1/4] Python 环境检查通过。
+echo [1/6] Python 环境检查通过。
 
 REM 2. 创建虚拟环境
 if not exist "%~dp0..\.venv" (
-    echo [2/4] 正在创建 Python 虚拟环境 (.venv)...
+    echo [2/6] 正在创建 Python 虚拟环境 (.venv)...
     python -m venv "%~dp0..\.venv"
 )
 set "VENV_PYTHON=%~dp0..\.venv\Scripts\python.exe"
 set "VENV_PIP=%~dp0..\.venv\Scripts\pip.exe"
 
 REM 3. 安装依赖与反爬浏览器驱动
-echo [3/5] 正在安装与同步必要依赖包...
+echo [3/6] 正在安装与同步必要依赖包...
 "%VENV_PIP%" install -r "%~dp0..\requirements.txt" --quiet
-echo [4/5] 正在同步反爬浏览器核心引擎...
+echo [4/6] 正在同步反爬浏览器核心引擎...
 "%VENV_PYTHON%" -m patchright install chromium --quiet >nul 2>&1
 
 REM 4. 检查 Docker 并启动 TiDB + Redis
-echo [5/5] 检查本地数据库 (TiDB) 与消息队列 (Redis)...
+echo [5/6] 检查本地数据库 (TiDB) 与消息队列 (Redis)...
 docker --version >nul 2>&1
 if %errorlevel% equ 0 (
     echo 发现 Docker Desktop，正在启动本地 TiDB 与 Redis 容器...
@@ -40,6 +40,7 @@ if %errorlevel% equ 0 (
 )
 
 REM 5. 初始化数据库表结构
+echo [6/6] 正在检查并初始化数据库表结构...
 "%VENV_PYTHON%" "%~dp0init_db.py"
 
 echo ============================================================

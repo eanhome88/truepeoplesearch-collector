@@ -203,7 +203,9 @@ def cmd_stop() -> None:
     try:
         pid = int(PID_FILE.read_text().strip())
         print(f"正在停止 Supervisor (PID={pid})...")
-        os.kill(pid, signal.SIGTERM)
+        sig_term = getattr(signal, "SIGTERM", 15)
+        sig_kill = getattr(signal, "SIGKILL", sig_term)
+        os.kill(pid, sig_term)
         for _ in range(15):
             time.sleep(1)
             try:
@@ -211,8 +213,8 @@ def cmd_stop() -> None:
             except OSError:
                 print("Supervisor 已成功停止。")
                 return
-        print("停止超时，发送 SIGKILL...")
-        os.kill(pid, signal.SIGKILL)
+        print("停止超时，发送强退信号...")
+        os.kill(pid, sig_kill)
     except Exception as exc:
         print(f"停止 Supervisor 失败: {exc}")
 

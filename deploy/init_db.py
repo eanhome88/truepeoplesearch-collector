@@ -79,9 +79,10 @@ def run_init():
             print(f"  ⚠️ 发现端口 3306 (标准MySQL) 处于开启状态，尝试切换至 3306...")
             port = 3306
         else:
-            print(f"  ❌ 错误: 无法连接至 {host}:{port}！请确认 TiDB 或 MySQL 服务已启动。")
-            print(f"     若使用 Docker，请先执行: docker compose -f deploy/docker-compose.yml up -d")
-            sys.exit(1)
+            print(f"  ℹ️ 提示: 本地数据库服务 ({host}:{port}) 暂未启动。")
+            print(f"     若使用 Docker，请确保 Docker Desktop 处于运行状态。")
+            print(f"     待数据库就绪后，可随时运行: python deploy/init_db.py 完成表结构初始化。")
+            return
 
     print(f"  ✅ 数据库服务端口畅通！")
 

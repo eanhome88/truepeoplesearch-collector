@@ -38,6 +38,7 @@ except ImportError:
     psutil = None
 
 LOG_DIR = ROOT / "data" / "logs"
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 CONTROL_WORKER_KEY = "tps:control:worker"
 CONTROL_DISCOVER_KEY = "tps:control:discover"
@@ -533,7 +534,7 @@ def _stop_owned_tree(process, manager: bool = False) -> List[int]:
             break
         time.sleep(0.2)
     for child, created in reversed(captured):
-        _signal_same_process(child, created, signal.SIGKILL)
+        _signal_same_process(child, created, _SIGKILL)
     reap_deadline = time.monotonic() + 1
     for child, created in captured:
         remaining = reap_deadline - time.monotonic()
