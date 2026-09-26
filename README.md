@@ -336,3 +336,77 @@ export TPS_ALERT_WEBHOOK="https://oapi.dingtalk.com/robot/send?access_token=YOUR
 ./supervisor.sh start
 ```
 
+## 十、客户端独立安装部署与云端自动升级指南 (Client Deployment & Auto-Update)
+
+针对客户本地独立部署（Local Database + Local Queues + Web Dashboard），系统已提供完整的单机一键部署包与全自动在线热更新机制。
+
+### 1. 客户本地独立数据库与消息队列 (`deploy/docker-compose.yml`)
+
+在客户电脑上无需安装复杂服务，内置单容器 PingCAP TiDB 单机版引擎（完全兼容 MySQL 8.0 语法、支持千万级高并发与持久化存储）与 Redis 7 缓存队列：
+
+```bash
+# 启动本地 TiDB (端口 4000) 与 Redis (端口 6379)
+docker compose -f deploy/docker-compose.yml up -d
+
+# 自动初始化 8 张核心数据表与索引
+python3 deploy/init_db.py
+```
+
+### 2. Windows 客户一键安装与启动向导
+
+针对使用 Windows 电脑的客户，提供了开箱即用的批处理脚本：
+* **全新安装**：双击运行 `deploy/install.bat`，脚本将自动配置 Python 虚拟环境、拉起本地 TiDB 与 Redis 并初始化建表；
+* **一键启动**：双击根目录 `start_client.bat`，自动在后台拉起 Supervisor 集群与可视化面板，并自动在浏览器打开控制台 `http://127.0.0.1:5001`；
+* **平稳关闭**：双击根目录 `stop_client.bat`，平稳释放所有爬虫进程与数据库连接。
+
+### 3. Linux / macOS 客户一键安装与启动向导
+
+```bash
+# 一键安装环境与数据库
+chmod +x deploy/install.sh && ./deploy/install.sh
+
+# 启动后台守护集群
+./supervisor.sh start
+
+# 浏览器访问控制台
+open http://127.0.0.1:5001
+```
+
+### 4. Git 版本库关联与云端自动推送流程 (开发者端)
+
+当前项目已完成 Git 仓库初始化 (`main` 分支) 并创建了企业级过滤规则 `.gitignore`。
+如需与 GitHub 或 Gitee 仓库关联，只需在开发机执行：
+
+```bash
+# 1. 关联云端远程仓库 (将 your-org/repo 替换为您的真实仓库地址)
+git remote add origin https://gitee.com/your-org/truepeoplesearch.git
+# 或者 GitHub:
+# git remote add origin https://github.com/your-org/truepeoplesearch.git
+
+# 2. 推送初始版本到云端
+git branch -M main
+git push -u origin main
+```
+
+**后续更新发布流程**：
+1. 修改代码或在 `version.json` 中更新版本号与更新日志；
+2. 提交并推送到远端：
+   ```bash
+   git commit -am "feat: 升级反爬策略与性能优化"
+   git push origin main
+   ```
+
+### 5. 客户安装后自动检测更新与一键平滑升级 (客户端)
+
+客户安装系统后，拥有无感知的更新提示与无损平滑升级能力：
+* **自动检测**：客户打开仪表盘面板时，系统会在后台静默检测云端是否有新代码或新版本；
+* **顶部提醒横幅**：发现新版本后，面板顶部将以平滑动画浮现 `📢 发现系统新版本！包含反爬规则更新与性能优化` 提醒条，且右上角版本徽章呈现橙色呼吸呼吸光晕；
+* **在线一键升级**：
+  * 客户点击「🚀 立即一键升级」；
+  * 系统弹出升级弹窗并提供实时终端控制台，自动在后台安全执行 `git pull` 同步最新代码、校验数据库增量更新并热重载 Supervisor 守护集群；
+  * 升级成功后控制台自动刷新，平滑接入最新版本，零停机且不丢失正在执行的任务队列！
+* **命令行离线备用更新**：
+  * Windows 客户双击 `deploy/update.bat`；
+  * Linux/macOS 客户执行 `./deploy/update.sh`。
+
+
