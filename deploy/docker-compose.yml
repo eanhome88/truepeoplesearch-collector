@@ -18,7 +18,7 @@ services:
       - --store=unistore
       - --path=/tmp/tidb
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 4000 || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:10080/status >/dev/null || nc -z 127.0.0.1 4000 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 12

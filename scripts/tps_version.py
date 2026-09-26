@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -296,19 +297,23 @@ def check_for_updates(timeout_sec: float = 6.0) -> Dict[str, Any]:
         except Exception as e:
             logger.debug("HTTP 远程更新检测异常: %s", e)
 
-    _LAST_CHECK_CACHE["time"] = time.time()
-    _LAST_CHECK_CACHE["data"] = result
+    with _CACHE_LOCK:
+        _LAST_CHECK_CACHE["time"] = time.time()
+        _LAST_CHECK_CACHE["data"] = result
     return result
 
 
+_CACHE_LOCK = threading.Lock()
 _LAST_CHECK_CACHE = {"time": 0.0, "data": None}
 
 
 def is_force_update_active(use_cache: bool = True) -> Tuple[bool, str]:
     """检查当前是否处于强制更新阻断状态"""
     now = time.time()
-    cached = _LAST_CHECK_CACHE["data"]
-    if use_cache and cached and (now - _LAST_CHECK_CACHE["time"] < 60):
+    with _CACHE_LOCK:
+        cached = _LAST_CHECK_CACHE["data"]
+        cache_time = _LAST_CHECK_CACHE["time"]
+    if use_cache and cached and (now - cache_time < 60):
         if cached.get("force_update"):
             return True, cached.get("force_update_reason", "系统强制更新中")
         return False, ""
@@ -423,21 +428,26 @@ def execute_system_update(force_stash: bool = False) -> Dict[str, Any]:
             logs.append("✅ 数据库表结构检查通过")
 
         # 4. 平滑重载后台集群与 Supervisor
+        supervisor_py = _ROOT_DIR / "scripts" / "tps_supervisor.py"
         supervisor_sh = _ROOT_DIR / "supervisor.sh"
-        if supervisor_sh.exists() and os.access(str(supervisor_sh), os.X_OK):
-            logs.append("🔄 正在向后台 Supervisor 发送平滑重载指令...")
-            reload_res = subprocess.run(
-                ["bash", str(supervisor_sh), "restart"],
-                cwd=str(_ROOT_DIR),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=15,
-            )
-            if reload_res.returncode == 0:
-                logs.append("✅ 后台服务集群已平滑重启并加载最新代码")
-            else:
-                logs.append("ℹ️ Supervisor 服务指令已就绪")
+        if sys.platform != "win32" and supervisor_sh.exists() and os.access(str(supervisor_sh), os.X_OK):
+            reload_cmd = ["bash", str(supervisor_sh), "restart"]
+        else:
+            reload_cmd = [sys.executable, str(supervisor_py), "restart"]
+
+        logs.append("🔄 正在向后台 Supervisor 发送平滑重载指令...")
+        reload_res = subprocess.run(
+            reload_cmd,
+            cwd=str(_ROOT_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+        )
+        if reload_res.returncode == 0:
+            logs.append("✅ 后台服务集群已平滑重启并加载最新代码")
+        else:
+            logs.append("ℹ️ Supervisor 服务指令已就绪")
 
         # 获取更新后的版本与哈希
         new_version_info = read_local_version_info()

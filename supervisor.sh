@@ -13,6 +13,18 @@ else
     PYTHON="python3"
 fi
 
+if [ -f "$BASE_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$BASE_DIR/.env"
+    set +a
+elif [ -f "$BASE_DIR/deploy/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$BASE_DIR/deploy/.env"
+    set +a
+fi
+
 export PYTHONPATH="$BASE_DIR/scripts:$BASE_DIR/tools:${PYTHONPATH:-}"
 
 case "${1:-status}" in

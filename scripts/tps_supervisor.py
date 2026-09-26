@@ -29,9 +29,14 @@ if str(SCRIPTS) not in sys.path:
 
 import tps_alert
 
-PYTHON = str(ROOT / ".venv" / "bin" / "python3")
-if not Path(PYTHON).exists():
-    PYTHON = sys.executable
+PYTHON = sys.executable
+for _candidate in (
+    ROOT / ".venv" / "bin" / "python3",
+    ROOT / ".venv" / "Scripts" / "python.exe",
+):
+    if _candidate.exists():
+        PYTHON = str(_candidate)
+        break
 
 
 class ProcessSpec:

@@ -39,7 +39,23 @@ def wait_for_port(host: str, port: int, timeout_sec: int = 30) -> bool:
     return False
 
 
+def load_env_file():
+    for candidate in (_ROOT_DIR / ".env", _ROOT_DIR / "deploy" / ".env"):
+        if candidate.exists():
+            try:
+                for line in candidate.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k, v = k.strip(), v.strip().strip("'\"")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+            except Exception:
+                pass
+
+
 def run_init():
+    load_env_file()
     host = os.environ.get("TPS_DB_HOST", "127.0.0.1")
     port = int(os.environ.get("TPS_DB_PORT", 4000))
     user = os.environ.get("TPS_DB_USER", "root")
