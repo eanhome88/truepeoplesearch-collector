@@ -43,3 +43,11 @@ data/proxy_config.json
 # Node modules
 node_modules/
 package-lock.json
+
+# Large binaries & temporary screenshots
+*.zip
+*.exe
+data/*.png
+data/*.jpg
+data/*.zip
+data/*.exe

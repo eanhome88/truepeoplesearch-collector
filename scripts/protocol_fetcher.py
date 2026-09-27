@@ -28,7 +28,7 @@ from curl_cffi.requests import AsyncSession
 from curl_cffi.curl import CurlError
 from scrapling.parser import Adaptor
 
-from scrape_to_tidb import extract_person_id, parse_date
+from scrape_to_tidb import extract_person_id, parse_date, split_full_name, extract_phone_numbers, MONTHS
 
 
 # ============================================================
@@ -170,42 +170,70 @@ def _raise_if_captcha_page(html_text: str, url: str, full_name: Optional[str] = 
 def parse_person_lean(page, url: str) -> dict:
     """
     精简高通量解析器：
-    提取核心资产：姓名、年龄、出生年月、当前城市/州、当前地址、房产估值建筑详情、全部电话、全部邮箱。
+    提取核心资产：姓名、姓名分词(名/中间名/姓)、性别、年龄、出生年月、当前城市/州、当前地址、居住时长、房产详情、全部电话(无线/座机/VoIP)、移动号码1/2/3、全部邮箱。
     剔除极其冗余的历史过往地址 (previous_addresses) 与别名 (aliases)，
     配合流式截断，数据库写行数减少 65%，流量节省 50% 以上。
     """
-    person_id = extract_person_id(url)
-    text = page.get_all_text()
+    real_url = url
+    for attr in ("response", "url", "_selector"):
+        obj = getattr(page, attr, None)
+        if obj is not None:
+            found = getattr(obj, "url", None) if attr != "url" else obj
+            if found and "/person/" in str(found):
+                real_url = str(found)
+                break
+
+    person_id = extract_person_id(real_url) or extract_person_id(url)
+    text = page.get_all_text() if hasattr(page, "get_all_text") else ""
 
     data = {
         "person_id": person_id,
-        "source_url": url,
+        "source_url": real_url or url,
         "full_name": None,
+        "first_name": None,
+        "middle_name": None,
+        "last_name": None,
+        "gender": "未知",
         "age": None,
         "birth_month": None,
         "birth_year": None,
         "current_city": None,
         "current_state": None,
         "marital_status": None,
+        "current_address": None,
+        "address_duration": None,
+        "primary_phone": None,
+        "primary_phone_type": None,
+        "all_phones": None,
+        "wireless_phone_1": None,
+        "wireless_phone_2": None,
+        "wireless_phone_3": None,
         "aliases": [],               # 剔除：大幅减轻数据库子表写入
-        "current_address": {},
+        "current_address_detail": {},
         "previous_addresses": [],    # 剔除：大幅减轻数据库子表写入
         "phone_numbers": [],
         "emails": [],
     }
 
     # --- 姓名（从 title 提取） ---
-    title = page.css("title::text").get() or ""
+    title = page.css("title::text").get() if hasattr(page, "css") else ""
+    title = title or ""
     name_match = re.match(r"^([^,]+)", title)
     if name_match:
         name = name_match.group(1).strip()
+        name = re.sub(r"\s+-\s+TruePeopleSearch.*$", "", name, flags=re.I).strip()
         folded = name.lower().strip(" .…")
-        if folded not in {
+        is_phone_title = bool(re.match(r"^\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{4}", name))
+        if not is_phone_title and folded not in {
             "captcha", "just a moment", "attention required",
             "access denied", "rate limited", "please wait", "checking your browser",
-            "请稍候",
+            "请稍候", "phone number lookup", "reverse phone lookup",
         } and not folded.startswith("请稍候"):
             data["full_name"] = name
+            fn, mn, ln = split_full_name(name)
+            data["first_name"] = fn or None
+            data["middle_name"] = mn or None
+            data["last_name"] = ln or None
 
     # --- 年龄 ---
     age_match = re.search(r"Age\s*(\d+)", text)
@@ -215,12 +243,7 @@ def parse_person_lean(page, url: str) -> dict:
     # --- 出生年月 ---
     birth_match = re.search(r"Born\s+(\w+)\s+(\d{4})", text)
     if birth_match:
-        months = {
-            "January": 1, "February": 2, "March": 3, "April": 4,
-            "May": 5, "June": 6, "July": 7, "August": 8,
-            "September": 9, "October": 10, "November": 11, "December": 12,
-        }
-        data["birth_month"] = months.get(birth_match.group(1))
+        data["birth_month"] = MONTHS.get(birth_match.group(1).lower())
         data["birth_year"] = int(birth_match.group(2))
 
     # --- 当前城市/州 ---
@@ -233,7 +256,8 @@ def parse_person_lean(page, url: str) -> dict:
     if "does not appear to be married" in text:
         data["marital_status"] = "single"
 
-    # --- 当前地址 ---
+    # --- 当前地址与居住时长 ---
+    cur_detail = {}
     addr_match = re.search(
         r"Current Address.*?This is the most recently reported.*?address.*?\n"
         r"((.+?)\n(.+?)\n)",
@@ -249,10 +273,20 @@ def parse_person_lean(page, url: str) -> dict:
         city_state = addr_match.group(3).strip()
         cs_match = re.match(r"([^,]+),\s+(\w{2})\s+(\d+)", city_state)
         if cs_match:
-            data["current_address"]["street"] = street
-            data["current_address"]["city"] = cs_match.group(1)
-            data["current_address"]["state"] = cs_match.group(2)
-            data["current_address"]["zip_code"] = cs_match.group(3)
+            cur_detail["street"] = street
+            cur_detail["city"] = cs_match.group(1)
+            cur_detail["state"] = cs_match.group(2)
+            cur_detail["zip_code"] = cs_match.group(3)
+            data["current_address_text"] = f"{street}, {city_state}".strip(", ")
+        elif street:
+            data["current_address_text"] = street
+
+    data["current_address"] = cur_detail
+    data["current_address_detail"] = cur_detail
+
+    dur_match = re.search(r"(\([A-Za-z]{3,}\s+\d{4}\s*-\s*(?:[A-Za-z]{3,}\s+\d{4}|Present|Current)\))", text, re.I)
+    if dur_match:
+        data["address_duration"] = dur_match.group(1).strip()
 
     # --- 房产详情 ---
     value_match = re.search(
@@ -260,14 +294,10 @@ def parse_person_lean(page, url: str) -> dict:
         text,
     )
     if value_match:
-        data["current_address"]["estimated_value"] = float(
-            value_match.group(1).replace(",", "")
-        )
-        data["current_address"]["bathrooms"] = int(value_match.group(2))
-        data["current_address"]["square_feet"] = int(
-            value_match.group(3).replace(",", "")
-        )
-        data["current_address"]["year_built"] = int(value_match.group(4))
+        cur_detail["estimated_value"] = float(value_match.group(1).replace(",", ""))
+        cur_detail["bathrooms"] = int(value_match.group(2))
+        cur_detail["square_feet"] = int(value_match.group(3).replace(",", ""))
+        cur_detail["year_built"] = int(value_match.group(4))
 
     # --- 县 (County) ---
     county_match = re.search(
@@ -277,29 +307,57 @@ def parse_person_lean(page, url: str) -> dict:
         county_text = county_match.group()
         c = re.search(r"(\w+)\s+County", county_text)
         if c:
-            data["current_address"]["county"] = c.group(1) + " County"
+            cur_detail["county"] = c.group(1) + " County"
 
-    # --- 电话号码 ---
-    phone_section = re.search(r"Phone Numbers.*?(?:Email Addresses|Previous Addresses|Possible Relatives|$)", text, re.DOTALL)
-    if phone_section:
-        phone_text = phone_section.group()
-        phones = re.findall(
-            r"\((\d{3})\)\s*(\d{3})-(\d{4}).*?(Wireless|Landline).*?"
-            r"(?:Last reported\s+(\w+\s+\d{4}))?.*?"
-            r"((?:AT&T|T-Mobile|Verizon.*?|Bijou.*?|Qwest|Verizon Maryland)[^\n]*)",
-            phone_text, re.DOTALL,
-        )
-        for p in phones:
-            number = f"({p[0]}) {p[1]}-{p[2]}"
-            carrier = p[4].strip() if p[4] else None
-            last_reported = p[3] if p[3] else None
-            data["phone_numbers"].append({
-                "phone_number": number,
-                "line_type": p[1].lower() if p[1] else None,
-                "carrier": carrier,
-                "last_reported": parse_date(last_reported),
-                "is_primary": "Possible Primary" in phone_text,
-            })
+    data["current_address_detail"] = cur_detail
+
+    # --- 电话号码 (全量采集，无漏损) ---
+    parsed_phones = extract_phone_numbers(text)
+    data["phone_numbers"] = parsed_phones
+
+    if parsed_phones:
+        # 1. 电话列表 (逗号拼接所有捕获的号码)
+        data["all_phones"] = ", ".join(p["phone_number"] for p in parsed_phones if p.get("phone_number"))
+
+        # 2. 无线号码排序 (按最后报告时间倒序，最近的排在最前面)
+        def _date_sort_key(p):
+            return p.get("last_reported") or "0000-00-00"
+
+        wireless_phones = [
+            p for p in parsed_phones
+            if str(p.get("line_type", "")).lower() == "wireless"
+        ]
+        wireless_sorted = sorted(wireless_phones, key=_date_sort_key, reverse=True)
+
+        data["wireless_phone_1"] = wireless_sorted[0]["phone_number"] if len(wireless_sorted) > 0 else None
+        data["wireless_phone_2"] = wireless_sorted[1]["phone_number"] if len(wireless_sorted) > 1 else None
+        data["wireless_phone_3"] = wireless_sorted[2]["phone_number"] if len(wireless_sorted) > 2 else None
+
+        # 3. 客户核心规则：如果主要电话号码后面是座机，就找下面最近时间的无线
+        marked_primary = None
+        for p in parsed_phones:
+            if p.get("is_primary"):
+                marked_primary = p
+                break
+
+        chosen = None
+        if marked_primary:
+            if str(marked_primary.get("line_type", "")).lower() == "wireless":
+                chosen = marked_primary
+            else:
+                # 主要电话是座机或其他：优先选用最近时间的无线号码
+                if wireless_sorted:
+                    chosen = wireless_sorted[0]
+                else:
+                    chosen = marked_primary
+        else:
+            if wireless_sorted:
+                chosen = wireless_sorted[0]
+            else:
+                chosen = parsed_phones[0]
+
+        data["primary_phone"] = chosen.get("phone_number")
+        data["primary_phone_type"] = chosen.get("line_type")
 
     # --- 电子邮箱 ---
     email_section = re.search(
@@ -441,16 +499,42 @@ class ProtocolFetcher:
             if cf_blocked:
                 raise CloudflareChallengeError(f"Cloudflare challenge encountered for {url}")
 
+            # 检查是否为电话反查或搜索结果列表页
+            final_req_url = str(getattr(resp, "url", "") or url)
+            is_search = "resultphone" in url.lower() or "/results?" in url.lower() or "resultname" in url.lower()
+            has_person_path = bool(re.search(r"/(?:find/)?person/([a-zA-Z0-9_]+)", final_req_url))
+
+            if is_search and not has_person_path:
+                person_links = re.findall(r"/find/person/([a-zA-Z0-9_]+)", html_text)
+                if person_links:
+                    unique_pids = list(dict.fromkeys(person_links))
+                    try:
+                        import redis
+                        r = redis.Redis(
+                            host=os.environ.get("REDIS_HOST", "127.0.0.1"),
+                            port=int(os.environ.get("REDIS_PORT", "6379")),
+                            decode_responses=True,
+                        )
+                        from tps_queue import feed
+                        full_urls = [f"https://www.truepeoplesearch.com/find/person/{pid}" for pid in unique_pids]
+                        res = feed(r, full_urls)
+                        print(f"[SEARCH_RESULT] 协议层电话搜索已捕获并注入 {len(unique_pids)} 个目标人物档案: {res}", flush=True)
+                    except Exception as feed_err:
+                        print(f"[SEARCH_FEED_ERR] 注入队列提示: {feed_err}", flush=True)
+                    return {"is_search_result": True, "count": len(unique_pids), "person_ids": unique_pids}
+                else:
+                    raise EmptyPageError(f"电话反查无匹配记录 (0 results): {url}")
+
             doc = Adaptor(html_text)
-            data = parse_person_lean(doc, url)
+            data = parse_person_lean(doc, final_req_url)
             full_name = data.get("full_name")
 
             if status == 200 and not cf_blocked:
                 _raise_if_captcha_page(html_text, url, full_name)
 
-            if not full_name:
+            if not full_name or not data.get("person_id"):
                 _raise_if_captcha_page(html_text, url, full_name)
-                raise EmptyPageError(f"Empty page (no full_name) for {url}")
+                raise EmptyPageError(f"Empty page (no valid person) for {url}")
 
             return data
 

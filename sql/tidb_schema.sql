@@ -16,9 +16,21 @@ USE people_search;
 CREATE TABLE IF NOT EXISTS persons (
     person_id          VARCHAR(64) PRIMARY KEY,   -- TruePeopleSearch 内部 ID
     full_name          VARCHAR(200) NOT NULL,
+    first_name         VARCHAR(100),               -- 名
+    middle_name        VARCHAR(100),               -- 中间名
+    last_name          VARCHAR(100),               -- 姓
+    gender             VARCHAR(10) DEFAULT '未知',  -- 性别
     age                INT,
     birth_month        INT,                        -- 出生月（1-12）
     birth_year         INT,                        -- 出生年
+    primary_phone      VARCHAR(30),                -- 当前电话 (优先移动无线号)
+    primary_phone_type VARCHAR(30),                -- 当前电话类型 (Wireless/Landline/Voip)
+    current_address    VARCHAR(500),               -- 当前完整地址
+    address_duration   VARCHAR(100),               -- 当前地址居住时长
+    all_phones         TEXT,                       -- 全部电话列表 (逗号拼接)
+    wireless_phone_1   VARCHAR(30),                -- 移动号码1
+    wireless_phone_2   VARCHAR(30),                -- 移动号码2
+    wireless_phone_3   VARCHAR(30),                -- 移动号码3
     current_city       VARCHAR(100),
     current_state      VARCHAR(10),
     current_zip        VARCHAR(20),
@@ -35,6 +47,7 @@ CREATE TABLE IF NOT EXISTS persons (
     INDEX idx_persons_name (full_name),
     INDEX idx_persons_city (current_city, current_state),
     INDEX idx_persons_age (age),
+    INDEX idx_persons_phone (primary_phone),
     INDEX idx_persons_name_id (full_name, person_id)  -- 面板 keyset 翻页
 );
 
@@ -179,3 +192,26 @@ SELECT
     (SELECT COUNT(*) FROM associates WHERE person_id = p.person_id) AS associate_count
 FROM persons p
 LEFT JOIN current_addresses ca ON p.person_id = ca.person_id;
+
+-- ============================================================
+-- 客户视图：Navicat 与 Excel 导出专用（全中文字段，匹配客户竞品底表）
+-- ============================================================
+CREATE OR REPLACE VIEW 人物主表 AS
+SELECT
+    person_id AS `人物ID`,
+    full_name AS `全名`,
+    gender AS `性别`,
+    age AS `年龄`,
+    primary_phone AS `当前电话`,
+    primary_phone_type AS `当前电话类型`,
+    current_address AS `当前地址`,
+    address_duration AS `当前地址时长`,
+    last_name AS `姓`,
+    first_name AS `名`,
+    middle_name AS `中间名`,
+    all_phones AS `电话列表`,
+    wireless_phone_1 AS `移动号码1`,
+    wireless_phone_2 AS `移动号码2`,
+    wireless_phone_3 AS `移动号码3`
+FROM persons;
+

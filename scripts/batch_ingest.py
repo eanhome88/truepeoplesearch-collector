@@ -160,7 +160,7 @@ class BatchIngester:
                 content_hash = compute_content_hash(data)
                 counts = _child_counts(data)
 
-                row_dict = {f: data.get(f) for f in _PERSON_CORE_FIELDS}
+                row_dict = {f: data.get(f) for f in _PERSON_CORE_FIELDS if not cols or f in cols}
                 if "content_hash" in cols:
                     row_dict["content_hash"] = content_hash
                 for c in _COUNT_FIELDS:

@@ -535,7 +535,8 @@ def _queue_get(q):
 def browser_group_main(slot_ids: list, queues: list, out_q, proxy=None, generation: int = 0) -> None:
     """One Chrome process, several tabs. Playwright stays inside this process."""
     try:
-        os.setsid()
+        if hasattr(os, "setsid"):
+            os.setsid()
     except OSError:
         pass
     signal.signal(signal.SIGINT, signal.SIG_IGN)

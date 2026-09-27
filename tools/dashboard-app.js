@@ -1327,9 +1327,9 @@ function applyPipeline(d) {
     const jobs = (worker.inflight && worker.inflight.length)
         ? worker.inflight
         : (clusterJobs.length ? clusterJobs : (d.jobs || []));
-    const activeCount = (d.cluster && d.cluster.running && (d.cluster.inflight_count || queue.processing))
-        ? (d.cluster.inflight_count || queue.processing)
-        : (queue.processing || jobs.length);
+    const activeCount = (d.cluster && d.cluster.running && (d.cluster.inflight_count || q.processing))
+        ? (d.cluster.inflight_count || q.processing)
+        : (q.processing || jobs.length);
     setText('jobCount', fmt(activeCount));
     const qps = Number(counters.qps || 0);
     const qpsText = qps > 0 ? `实时 ${qps.toFixed(1)} QPS · 预计日产 ${fmtYi(qps * 86400)}` : (activeCount > 0 ? `活跃 ${activeCount} 并发在飞` : '待命 / 准备就绪');

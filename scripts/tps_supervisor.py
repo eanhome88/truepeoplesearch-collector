@@ -86,9 +86,10 @@ class ProcessSpec:
 
 
 class Supervisor:
-    def __init__(self, concurrency: int = 2, with_dashboard: bool = True):
-        self.concurrency = concurrency
+    def __init__(self, concurrency: int = None, with_dashboard: bool = True, with_feeder: bool = True):
+        self.concurrency = concurrency or int(os.environ.get("TPS_CONCURRENCY", "32"))
         self.with_dashboard = with_dashboard
+        self.with_feeder = with_feeder
         self.stopping = False
         self.specs: Dict[str, ProcessSpec] = {}
         self._init_specs()
@@ -105,6 +106,18 @@ class Supervisor:
             cmd=worker_cmd,
             log_file=LOGS / "worker.log",
         )
+
+        if self.with_feeder:
+            feeder_cmd = [
+                PYTHON,
+                str(SCRIPTS / "phone_discover.py"),
+                "--start-area", os.environ.get("TPS_START_AREA", "201"),
+            ]
+            self.specs["phone_feeder"] = ProcessSpec(
+                name="phone_feeder",
+                cmd=feeder_cmd,
+                log_file=LOGS / "phone_feeder.log",
+            )
 
         if self.with_dashboard:
             dashboard_cmd = [
@@ -222,8 +235,9 @@ def cmd_stop() -> None:
 def main():
     parser = argparse.ArgumentParser(description="TPS 生产级守护进程与自愈管理器")
     parser.add_argument("action", choices=["start", "stop", "status", "restart"], nargs="?", default="start")
-    parser.add_argument("--concurrency", type=int, default=2, help="Worker 抓取并发数 (默认 2)")
+    parser.add_argument("--concurrency", type=int, default=int(os.environ.get("TPS_CONCURRENCY", "32")), help="Worker 抓取并发数 (默认 32)")
     parser.add_argument("--no-dashboard", action="store_true", help="不守护 Dashboard，仅守护 Worker")
+    parser.add_argument("--no-feeder", action="store_true", help="不守护电话号码自动发生器")
     args = parser.parse_args()
 
     if args.action == "status":
@@ -233,9 +247,9 @@ def main():
     elif args.action == "restart":
         cmd_stop()
         time.sleep(1)
-        Supervisor(concurrency=args.concurrency, with_dashboard=not args.no_dashboard).run()
+        Supervisor(concurrency=args.concurrency, with_dashboard=not args.no_dashboard, with_feeder=not args.no_feeder).run()
     else:
-        Supervisor(concurrency=args.concurrency, with_dashboard=not args.no_dashboard).run()
+        Supervisor(concurrency=args.concurrency, with_dashboard=not args.no_dashboard, with_feeder=not args.no_feeder).run()
 
 
 if __name__ == "__main__":

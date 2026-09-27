@@ -118,12 +118,18 @@ def run_init():
         sys.exit(1)
 
     sql_content = _SCHEMA_SQL_FILE.read_text(encoding="utf-8")
-    # 分割 SQL 语句 (处理分号与注释)
+    # MySQL 8 没有 TiDB 的 AUTO_RANDOM，建表前换成 AUTO_INCREMENT。
+    sql_content = sql_content.replace("AUTO_RANDOM", "AUTO_INCREMENT")
+    # 分割 SQL 语句。分号前的注释行不能把后面的 CREATE 整段丢掉。
     raw_statements = sql_content.split(";")
     statements = []
     for stmt in raw_statements:
-        clean = stmt.strip()
-        if clean and not clean.startswith("--"):
+        lines = [
+            line for line in stmt.splitlines()
+            if line.strip() and not line.strip().startswith("--")
+        ]
+        clean = "\n".join(lines).strip()
+        if clean:
             statements.append(clean)
 
     try:
@@ -152,6 +158,69 @@ def run_init():
 
         conn.commit()
         print(f"  ✅ 成功执行 {executed_count} 条 DDL 建表与索引语句！")
+
+        # 3.1 兼容旧表升级：检查并自动补齐缺失的新列与中文视图
+        cursor.execute("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'persons'", (dbname,))
+        current_cols = set(row[0].lower() for row in cursor.fetchall())
+        col_defs = [
+            ("first_name", "VARCHAR(100) NULL"),
+            ("middle_name", "VARCHAR(100) NULL"),
+            ("last_name", "VARCHAR(100) NULL"),
+            ("gender", "VARCHAR(10) DEFAULT '未知'"),
+            ("primary_phone", "VARCHAR(30) NULL"),
+            ("primary_phone_type", "VARCHAR(30) NULL"),
+            ("current_address", "VARCHAR(500) NULL"),
+            ("address_duration", "VARCHAR(100) NULL"),
+            ("all_phones", "TEXT NULL"),
+            ("wireless_phone_1", "VARCHAR(30) NULL"),
+            ("wireless_phone_2", "VARCHAR(30) NULL"),
+            ("wireless_phone_3", "VARCHAR(30) NULL"),
+        ]
+        for col_name, col_type in col_defs:
+            if col_name.lower() not in current_cols:
+                try:
+                    cursor.execute(f"ALTER TABLE persons ADD COLUMN {col_name} {col_type};")
+                    print(f"  • 自动迁移补齐字段: `persons`.`{col_name}`")
+                except Exception as alter_err:
+                    pass
+
+        # 3.2 清理前期因反查代码BUG造成的 URL 污染记录
+        try:
+            cursor.execute("DELETE FROM persons WHERE person_id LIKE '%resultphone%' OR person_id LIKE 'http%' OR full_name LIKE '%TruePeopleSearch%';")
+            deleted = cursor.rowcount
+            if deleted > 0:
+                print(f"  🧹 已自动清理前期测试残留的 {deleted} 条无效记录！")
+        except Exception:
+            pass
+
+        # 3.3 确保创建客户专属中文视图 [人物主表]
+        try:
+            view_sql = """
+            CREATE OR REPLACE VIEW 人物主表 AS
+            SELECT
+                person_id          AS `人物ID`,
+                full_name          AS `全名`,
+                gender             AS `性别`,
+                age                AS `年龄`,
+                primary_phone      AS `当前电话`,
+                primary_phone_type AS `当前电话类型`,
+                current_address    AS `当前地址`,
+                address_duration   AS `当前地址时长`,
+                last_name          AS `姓`,
+                first_name         AS `名`,
+                middle_name        AS `中间名`,
+                all_phones         AS `电话列表`,
+                wireless_phone_1   AS `移动号码1`,
+                wireless_phone_2   AS `移动号码2`,
+                wireless_phone_3   AS `移动号码3`
+            FROM persons;
+            """
+            cursor.execute(view_sql)
+            print("  ✅ 客户专属视图 `人物主表` (对标竞品底表) 校验就绪！")
+        except Exception as v_err:
+            print(f"  ⚠️ 创建人物主表视图提示: {v_err}")
+
+        conn.commit()
 
         # 4. 校验表完整性
         print(f"[4/4] 验证数据库表结构完整性...")
