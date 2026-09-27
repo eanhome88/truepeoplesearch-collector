@@ -20,7 +20,7 @@ import re
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 from flask import Flask, Response, g, jsonify, make_response, request, send_file
@@ -290,13 +290,26 @@ def _close_db(_exc):
         pass
 
 
+def _clean_val(v):
+    if isinstance(v, (datetime, date)):
+        return v.strftime("%Y-%m-%d %H:%M:%S")
+    return v
+
+
+def _clean_row(row):
+    if not isinstance(row, dict):
+        return row
+    return {k: _clean_val(v) for k, v in row.items()}
+
+
 def query(sql, params=None):
     """执行查询，返回 dict 列表（复用请求内连接）。"""
     db = get_db()
     cur = db.cursor(dictionary=True, buffered=True)
     try:
         cur.execute(sql, params or ())
-        return cur.fetchall()
+        rows = cur.fetchall()
+        return [_clean_row(r) for r in rows] if rows else []
     finally:
         cur.close()
 
@@ -307,7 +320,8 @@ def query_one(sql, params=None):
     cur = db.cursor(dictionary=True, buffered=True)
     try:
         cur.execute(sql, params or ())
-        return cur.fetchone()
+        row = cur.fetchone()
+        return _clean_row(row) if row else None
     finally:
         cur.close()
 

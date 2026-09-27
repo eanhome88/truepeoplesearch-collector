@@ -145,14 +145,37 @@ function avatarClass(name) {
 }
 function relTime(s) {
     if (!s) return '—';
-    const t = new Date(s).getTime();
+    const parseable = typeof s === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(s)
+        ? s.replace(' ', 'T')
+        : s;
+    const t = new Date(parseable).getTime();
     if (Number.isNaN(t)) return '—';
     const d = Date.now() - t;
-    if (d < 60_000) return '刚刚';
-    if (d < 3_600_000) return Math.floor(d / 60_000) + ' 分钟前';
-    if (d < 86_400_000) return Math.floor(d / 3_600_000) + ' 小时前';
-    if (d < 7 * 86_400_000) return Math.floor(d / 86_400_000) + ' 天前';
-    return new Date(s).toLocaleString('zh-CN');
+    if (d >= 0 && d < 60_000) return '刚刚';
+    if (d >= 0 && d < 3_600_000) return Math.floor(d / 60_000) + ' 分钟前';
+    if (d >= 0 && d < 86_400_000) return Math.floor(d / 3_600_000) + ' 小时前';
+    if (d >= 0 && d < 7 * 86_400_000) return Math.floor(d / 86_400_000) + ' 天前';
+    return String(s).slice(0, 19);
+}
+function formatExactTime(s) {
+    if (!s) return '—';
+    if (typeof s === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(s)) {
+        return s.slice(0, 19);
+    }
+    const d = new Date(s);
+    if (Number.isNaN(d.getTime())) return String(s);
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+function formatDateTimeWithRel(s) {
+    if (!s) return '—';
+    const exact = formatExactTime(s);
+    if (exact === '—') return '—';
+    const rel = relTime(s);
+    return `<div class="time-cell">
+        <span class="time-cell-exact">${esc(exact)}</span>
+        <span class="time-cell-rel">${esc(rel)}</span>
+    </div>`;
 }
 function personCell(name, sub) {
     return `<div class="person">
@@ -566,7 +589,7 @@ async function loadOverview() {
                         <span class="${badgeCls}">${typeLabel}</span>
                         <button type="button" class="phone-copy-btn" title="点击复制" onclick="copyPhone(event, '${esc(p.primary_phone)}')">📋</button>
                     </div>` : '<span class="muted">—</span>';
-                return `<td>${phoneDisplay}</td><td class="hide-sm">${dash(p.current_state)}</td><td class="muted">${esc(relTime(p.scraped_at))}</td>`;
+                return `<td>${phoneDisplay}</td><td class="hide-sm">${dash(p.current_state)}</td><td>${formatDateTimeWithRel(p.scraped_at)}</td>`;
             };
             return personTable((data || []).slice(0, 8), extra, cells);
         }),
@@ -738,7 +761,7 @@ async function loadPersons(pageOrOpts = 1) {
                 <td>${wirelessDisplay}</td>
                 <td>${addrDisplay}</td>
                 <td class="hide-sm">${dash(p.current_state)}</td>
-                <td class="hide-sm muted" style="font-size:12px">${relTime(p.scraped_at)}</td>
+                <td class="hide-sm" style="font-size:12px">${formatDateTimeWithRel(p.scraped_at)}</td>
             `;
         };
 
@@ -950,7 +973,7 @@ function intelFeedList(rows) {
             const city = p.current_city || '';
             const state = p.current_state || '';
             const loc = [city, state].filter(Boolean).join(', ') || '美国';
-            const timeStr = relTime(p.scraped_at);
+            const timeStr = formatExactTime(p.scraped_at) + (p.scraped_at ? ' (' + relTime(p.scraped_at) + ')' : '');
             const phones = Number(p.phone_count || 0);
             const emails = Number(p.email_count || 0);
             const addrs = Number(p.prev_addr_count || 0);
@@ -2052,7 +2075,7 @@ async function refreshRecent() {
         const panel = document.getElementById('recentPanel');
         if (panel && Array.isArray(data)) {
             panel.innerHTML = personTable(data, '<th>入库时间</th>', p =>
-                `<td class="muted" title="${esc(p.scraped_at || '')}">${esc(relTime(p.scraped_at))}</td>`);
+                `<td title="${esc(formatExactTime(p.scraped_at))}">${formatDateTimeWithRel(p.scraped_at)}</td>`);
         }
         return true;
     } catch (e) {
@@ -2069,7 +2092,7 @@ async function loadRecent() {
         const data = await res.json();
         render(`${pageHead('Activity', '最近抓取', '最新入库档案 · 自动实时刷新')}
             <article class="panel" id="recentPanel">${personTable(data, '<th>入库时间</th>', p =>
-                `<td class="muted" title="${esc(p.scraped_at || '')}">${esc(relTime(p.scraped_at))}</td>`)}</article>`);
+                `<td title="${esc(formatExactTime(p.scraped_at))}">${formatDateTimeWithRel(p.scraped_at)}</td>`)}</article>`);
         recentTimer = dashboardRuntime.startPoll(refreshRecent, 2000, { backoff: true });
     } catch (e) {
         if (isCancelledRequest(e)) return;

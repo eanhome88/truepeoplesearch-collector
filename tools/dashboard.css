@@ -2010,4 +2010,24 @@
     margin-top: 2px;
 }
 
+/* 入库时间单元格 */
+.time-cell {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    line-height: 1.3;
+}
+.time-cell-exact {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ink, #1e293b);
+    letter-spacing: -0.01em;
+}
+.time-cell-rel {
+    font-size: 11px;
+    color: var(--ink-3, #64748b);
+}
+
+
 
