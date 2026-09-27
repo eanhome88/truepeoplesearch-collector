@@ -433,11 +433,26 @@ def execute_system_update(force_stash: bool = False) -> Dict[str, Any]:
                 else:
                     logs.append(f"⚠️ 依赖同步提示: {pip_res.stderr.strip()[:100]}")
 
-        # 3. 检查数据库增量迁移
-        migrate_sql = _ROOT_DIR / "sql" / "migrate_existing.sql"
-        if migrate_sql.exists():
-            logs.append("🗄️ 检查数据库结构迁移脚本...")
-            logs.append("✅ 数据库表结构检查通过")
+        # 3. 检查数据库增量迁移与表结构同步
+        init_db_py = _ROOT_DIR / "deploy" / "init_db.py"
+        if init_db_py.exists():
+            logs.append("🗄️ 正在自动同步数据库结构与视图 (deploy/init_db.py)...")
+            try:
+                py_bin = sys.executable
+                db_res = subprocess.run(
+                    [py_bin, str(init_db_py)],
+                    cwd=str(_ROOT_DIR),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=60,
+                )
+                if db_res.returncode == 0:
+                    logs.append("✅ 数据库表结构增量迁移与 [人物主表] 视图同步成功")
+                else:
+                    logs.append(f"⚠️ 数据库结构同步提示: {db_res.stderr.strip()[:120]}")
+            except Exception as e:
+                logs.append(f"⚠️ 执行数据库迁移异常: {e}")
 
         # 4. 平滑重载后台集群与 Supervisor
         supervisor_py = _ROOT_DIR / "scripts" / "tps_supervisor.py"
