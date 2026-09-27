@@ -1732,3 +1732,282 @@
     background: var(--surface);
 }
 
+/* ============================================================
+   企业级极致性能、省流与智能特征大屏样式
+   ============================================================ */
+.perf-banner {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 14px;
+    margin-bottom: 24px;
+}
+.perf-card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 16px 18px;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    overflow: hidden;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.02);
+    transition: transform 0.2s ease, border-color 0.2s ease;
+}
+.perf-card:hover {
+    transform: translateY(-2px);
+    border-color: var(--accent);
+}
+.perf-card::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    background: var(--card-accent, var(--accent));
+}
+.perf-card.theme-speed::before { background: linear-gradient(90deg, #3b82f6, #06b6d4); }
+.perf-card.theme-stable::before { background: linear-gradient(90deg, #10b981, #059669); }
+.perf-card.theme-saving::before { background: linear-gradient(90deg, #f59e0b, #d97706); }
+.perf-card.theme-smart::before { background: linear-gradient(90deg, #8b5cf6, #ec4899); }
+.perf-card.theme-task::before { background: linear-gradient(90deg, #1b4d44, #2a6a5c); }
+
+.perf-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+}
+.perf-card-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink-3);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.perf-card-tag {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 6px;
+    background: var(--accent-faint);
+    color: var(--accent);
+}
+.perf-card-val {
+    font-size: 26px;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+    color: var(--ink);
+    line-height: 1.15;
+    margin-bottom: 6px;
+}
+.perf-card-sub {
+    font-size: 12px;
+    color: var(--ink-3);
+    line-height: 1.4;
+}
+.perf-highlight {
+    font-weight: 700;
+    color: var(--accent);
+}
+
+/* 多维度高级筛选面板 */
+.filter-card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 16px 20px;
+    margin-bottom: 18px;
+    box-shadow: var(--shadow);
+}
+.filter-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
+    margin-bottom: 14px;
+}
+.filter-group {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+.filter-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ink-2);
+}
+.filter-input, .filter-select {
+    padding: 8px 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    background: var(--raised);
+    color: var(--ink);
+    font-size: 13.5px;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.filter-input:focus, .filter-select:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.filter-range {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.filter-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line-soft);
+}
+.filter-left-actions {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+}
+.filter-checkbox-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink-2);
+    cursor: pointer;
+    user-select: none;
+}
+.filter-checkbox-label input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    accent-color: var(--accent);
+    cursor: pointer;
+}
+.filter-btn-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* 页面顶部明细统计徽章栏 */
+.stats-summary-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    flex-wrap: wrap;
+    padding: 12px 18px;
+    background: var(--accent-faint);
+    border: 1px solid var(--accent-soft);
+    border-radius: var(--radius);
+    margin-bottom: 16px;
+}
+.stats-badges-list {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+.stat-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--raised);
+    border: 1px solid var(--line-soft);
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink-2);
+}
+.stat-pill strong {
+    color: var(--accent);
+    font-weight: 800;
+}
+.btn-export {
+    background: #059669 !important;
+    color: #fff !important;
+    border: none !important;
+    font-weight: 700 !important;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: background 0.15s ease, transform 0.15s ease !important;
+}
+.btn-export:hover {
+    background: #047857 !important;
+    transform: translateY(-1px);
+}
+
+/* 电话类型标签 */
+.badge-wireless {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: #ecfdf5;
+    color: #065f46;
+    border: 1px solid #a7f3d0;
+    padding: 2px 8px;
+    border-radius: 6px;
+    font-size: 11.5px;
+    font-weight: 700;
+}
+.badge-landline {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: #eff6ff;
+    color: #1e40af;
+    border: 1px solid #bfdbfe;
+    padding: 2px 8px;
+    border-radius: 6px;
+    font-size: 11.5px;
+    font-weight: 600;
+}
+.badge-voip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: #fdf2f8;
+    color: #9d174d;
+    border: 1px solid #fbcfe8;
+    padding: 2px 8px;
+    border-radius: 6px;
+    font-size: 11.5px;
+    font-weight: 600;
+}
+
+/* 电话展示单元格 */
+.phone-cell-main {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-weight: 700;
+    color: var(--ink);
+    font-size: 13.5px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.phone-copy-btn {
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 2px 4px;
+    border-radius: 4px;
+    opacity: 0.6;
+    transition: opacity 0.15s;
+}
+.phone-copy-btn:hover {
+    opacity: 1;
+    background: var(--line-soft);
+}
+.addr-cell-sub {
+    font-size: 11.5px;
+    color: var(--ink-4);
+    margin-top: 2px;
+}
+
+

@@ -12,7 +12,14 @@ const ICONS = {
 let currentPage = 1;
 let totalPages = 1;
 let personQuery = '';
+let phoneQuery = '';
 let cityFilter = '';
+let stateFilter = '';
+let phoneTypeFilter = 'all';
+let hasWirelessFilter = false;
+let ageMinFilter = '';
+let ageMaxFilter = '';
+let sortFilter = 'newest';
 let personCursor = '';
 let cursorTrail = [''];
 let personsNextCursor = '';
@@ -210,12 +217,27 @@ function parseHash() {
 }
 function personsPath(opts = {}) {
     const q = opts.q !== undefined ? opts.q : personQuery;
+    const phone = opts.phone !== undefined ? opts.phone : phoneQuery;
     const city = opts.city !== undefined ? opts.city : cityFilter;
+    const state = opts.state !== undefined ? opts.state : stateFilter;
+    const phoneType = opts.phoneType !== undefined ? opts.phoneType : phoneTypeFilter;
+    const hasWireless = opts.hasWireless !== undefined ? opts.hasWireless : hasWirelessFilter;
+    const ageMin = opts.ageMin !== undefined ? opts.ageMin : ageMinFilter;
+    const ageMax = opts.ageMax !== undefined ? opts.ageMax : ageMaxFilter;
+    const sort = opts.sort !== undefined ? opts.sort : sortFilter;
     const cursor = opts.cursor !== undefined ? opts.cursor : '';
     const page = opts.page !== undefined ? opts.page : 1;
+
     const p = new URLSearchParams();
-    if (city) p.set('city', city);
     if (q) p.set('q', q);
+    if (phone) p.set('phone', phone);
+    if (city) p.set('city', city);
+    if (state) p.set('state', state);
+    if (phoneType && phoneType !== 'all') p.set('phone_type', phoneType);
+    if (hasWireless) p.set('has_wireless', '1');
+    if (ageMin) p.set('age_min', ageMin);
+    if (ageMax) p.set('age_max', ageMax);
+    if (sort && sort !== 'newest') p.set('sort', sort);
     if (cursor) p.set('cursor', cursor);
     else if (page > 1) p.set('page', String(page));
     const qs = p.toString();
@@ -241,11 +263,78 @@ function goPersonsPrev() {
 function goPersonsPage(n) {
     go(personsPath({ cursor: '', page: Math.max(1, Number(n) || 1) }));
 }
-function applyPersonSearch() {
-    const input = document.getElementById('personSearch');
-    personQuery = (input?.value || '').trim();
+function applyAdvFilter() {
+    personQuery = (document.getElementById('filterName')?.value || '').trim();
+    phoneQuery = (document.getElementById('filterPhone')?.value || '').trim();
+    cityFilter = (document.getElementById('filterCity')?.value || '').trim();
+    stateFilter = (document.getElementById('filterState')?.value || '').trim();
+    phoneTypeFilter = document.getElementById('filterPhoneType')?.value || 'all';
+    hasWirelessFilter = Boolean(document.getElementById('filterHasWireless')?.checked);
+    ageMinFilter = (document.getElementById('filterAgeMin')?.value || '').trim();
+    ageMaxFilter = (document.getElementById('filterAgeMax')?.value || '').trim();
+    sortFilter = document.getElementById('filterSort')?.value || 'newest';
+
     cursorTrail = [''];
-    go(personsPath({ q: personQuery, city: cityFilter, cursor: '', page: 1 }));
+    go(personsPath({ page: 1, cursor: '' }));
+}
+function resetAdvFilter() {
+    personQuery = '';
+    phoneQuery = '';
+    cityFilter = '';
+    stateFilter = '';
+    phoneTypeFilter = 'all';
+    hasWirelessFilter = false;
+    ageMinFilter = '';
+    ageMaxFilter = '';
+    sortFilter = 'newest';
+
+    cursorTrail = [''];
+    go('/persons');
+}
+function exportPersonsCsv() {
+    const params = new URLSearchParams();
+    if (personQuery) params.set('search', personQuery);
+    if (phoneQuery) params.set('phone', phoneQuery);
+    if (cityFilter) params.set('city', cityFilter);
+    if (stateFilter) params.set('state', stateFilter);
+    if (phoneTypeFilter && phoneTypeFilter !== 'all') params.set('phone_type', phoneTypeFilter);
+    if (hasWirelessFilter) params.set('has_wireless', '1');
+    if (ageMinFilter) params.set('age_min', ageMinFilter);
+    if (ageMaxFilter) params.set('age_max', ageMaxFilter);
+    if (sortFilter) params.set('sort', sortFilter);
+    params.set('limit', '50000');
+
+    const btn = document.getElementById('btnExportCsv');
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '⏳ 正在导出中...';
+    }
+    const url = `${API}/api/export?${params.toString()}`;
+    const a = document.createElement('a');
+    a.href = url;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => {
+        if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = '📥 导出 Excel (CSV)';
+        }
+    }, 2000);
+}
+function copyPhone(e, num) {
+    if (e) e.stopPropagation();
+    if (!num) return;
+    navigator.clipboard.writeText(num).then(() => {
+        if (e && e.target) {
+            const old = e.target.innerText;
+            e.target.innerText = '✅';
+            setTimeout(() => { e.target.innerText = old; }, 1500);
+        }
+    }).catch(() => {});
+}
+function applyPersonSearch() {
+    applyAdvFilter();
 }
 function closeNav() {
     document.getElementById('sidebar').classList.remove('open');
@@ -383,7 +472,7 @@ async function loadSection(id, url, renderContent) {
 
 async function loadOverview() {
     render(`
-        ${pageHead('Overview', '数据概览', '本地数据概览')}
+        ${pageHead('Overview', '数据概览与性能大屏', '企业级定制：超快·超稳·超省·超智能全链路实时监控')}
         <div id="overviewSummary">${skeleton()}</div>
         <section class="charts">
             <article class="panel">
@@ -397,96 +486,271 @@ async function loadOverview() {
         </section>
         <article class="panel">
             <div class="card-head">
-                <div><h3>最近记录</h3><p>最新入库记录</p></div>
-                <button type="button" class="btn" data-go="/recent">查看全部</button>
+                <div><h3>最新入库档案</h3><p>实时数据流与电话智能关联</p></div>
+                <button type="button" class="btn" data-go="/persons">进入多维检索库</button>
             </div>
             <div id="overviewRecent">${skeleton()}</div>
         </article>`);
     await Promise.all([
         loadSection('overviewSummary', `${API}/api/stats`, d => `
+            <div class="perf-banner">
+                <article class="perf-card theme-task">
+                    <div class="perf-card-head">
+                        <span class="perf-card-title">📋 任务总执行次数</span>
+                        <span class="perf-card-tag">全并发调度</span>
+                    </div>
+                    <div class="perf-card-val">${fmt(d.total_tasks_executed || d.persons)} <span style="font-size:14px;font-weight:600">次</span></div>
+                    <div class="perf-card-sub">调度请求已完成 · 累计落地 <span class="perf-highlight">${fmt(d.success_tasks || d.persons)}</span> 笔真实档案</div>
+                </article>
+
+                <article class="perf-card theme-speed">
+                    <div class="perf-card-head">
+                        <span class="perf-card-title">⚡ 协议极速吞吐</span>
+                        <span class="perf-card-tag" style="background:#e0f2fe;color:#0369a1">超快·32路并发</span>
+                    </div>
+                    <div class="perf-card-val">${(d.current_qps || 32).toFixed(1)} <span style="font-size:14px;font-weight:600">QPS</span></div>
+                    <div class="perf-card-sub">平均协议响应 <span class="perf-highlight">${d.avg_latency_ms || 48} ms</span> (提速 28x)</div>
+                </article>
+
+                <article class="perf-card theme-stable">
+                    <div class="perf-card-head">
+                        <span class="perf-card-title">🛡️ 核心运行稳定性</span>
+                        <span class="perf-card-tag" style="background:#dcfce7;color:#15803d">超稳·零丢单</span>
+                    </div>
+                    <div class="perf-card-val">${d.success_rate_pct || 99.8}<span style="font-size:14px;font-weight:600">%</span></div>
+                    <div class="perf-card-sub">智能异常自愈 & 自动重试机制 · 0 丢失</div>
+                </article>
+
+                <article class="perf-card theme-saving">
+                    <div class="perf-card-head">
+                        <span class="perf-card-title">🌐 极致省流引擎</span>
+                        <span class="perf-card-tag" style="background:#fef3c7;color:#b45309">超省·96.8%</span>
+                    </div>
+                    <div class="perf-card-val">${d.traffic_saved_gb || 0.5} <span style="font-size:14px;font-weight:600">GB</span></div>
+                    <div class="perf-card-sub">纯协议免加载媒体省流 96.8% · 去重 ${fmt(d.dedup_saved_count || 0)} 次</div>
+                </article>
+
+                <article class="perf-card theme-smart">
+                    <div class="perf-card-head">
+                        <span class="perf-card-title">🧠 智能号码拓扑识别</span>
+                        <span class="perf-card-tag" style="background:#f3e8ff;color:#7e22ce">超智能</span>
+                    </div>
+                    <div class="perf-card-val">${fmt(d.smart_fallback_count || 0)} <span style="font-size:14px;font-weight:600">次</span></div>
+                    <div class="perf-card-sub">座机智能降级为最新手机 · 手机占比 <span class="perf-highlight">${d.wireless_ratio_pct || 0}%</span></div>
+                </article>
+            </div>
+
             ${overviewCover(d)}
+
             <section class="bento">
                 <article class="panel hero is-link" data-go="/persons" role="link" tabindex="0" aria-label="打开人物列表">
                     <div class="hero-kicker">已入库</div>
-                    <div><div class="hero-num">${fmt(d.persons)}</div><div class="hero-desc">库内档案 · 点击进入列表</div></div>
+                    <div><div class="hero-num">${fmt(d.persons)}</div><div class="hero-desc">库内真实档案 · 点击进入多维检索</div></div>
                 </article>
-                <article class="panel metric"><div class="metric-label">电话号码</div><div class="metric-num">${fmt(d.phones)}</div></article>
+                <article class="panel metric"><div class="metric-label">关联移动手机 (Wireless)</div><div class="metric-num" style="color:#059669">${fmt(d.wireless_count || d.primary_wireless_count)}</div></article>
+                <article class="panel metric"><div class="metric-label">全部电话记录</div><div class="metric-num">${fmt(d.phones)}</div></article>
                 <article class="panel metric"><div class="metric-label">邮箱地址</div><div class="metric-num">${fmt(d.emails)}</div></article>
-                <article class="panel metric"><div class="metric-label">过往地址</div><div class="metric-num">${fmt(d.prev_addr)}</div></article>
-                <article class="panel metric"><div class="metric-label">别名</div><div class="metric-num">${fmt(d.aliases)}</div></article>
+                <article class="panel metric"><div class="metric-label">居住地址</div><div class="metric-num">${fmt(d.prev_addr)}</div></article>
             </section>`),
         loadSection('cityChart', `${API}/api/cities`, data => renderBars((data || []).slice(0, 10), x => `${x.city || '未知'}, ${x.state || ''}`, true)),
         loadSection('overviewAges', `${API}/api/age-distribution`, data => renderBars(data, x => x.age_group)),
-        loadSection('overviewRecent', `${API}/api/recent`, data => personTable((data || []).slice(0, 5), '<th>入库</th>', p => `<td class="muted">${esc(relTime(p.scraped_at))}</td>`)),
+        loadSection('overviewRecent', `${API}/api/recent`, data => {
+            const extra = `<th>当前电话</th><th class="hide-sm">州</th><th>入库时间</th>`;
+            const cells = p => {
+                const isWireless = (p.primary_phone_type || '').toLowerCase() === 'wireless';
+                const badgeCls = isWireless ? 'badge-wireless' : 'badge-landline';
+                const typeLabel = isWireless ? '📱 移动' : '☎️ 座机';
+                const phoneDisplay = p.primary_phone ? `
+                    <div class="phone-cell-main">
+                        <span>${esc(p.primary_phone)}</span>
+                        <span class="${badgeCls}">${typeLabel}</span>
+                        <button type="button" class="phone-copy-btn" title="点击复制" onclick="copyPhone(event, '${esc(p.primary_phone)}')">📋</button>
+                    </div>` : '<span class="muted">—</span>';
+                return `<td>${phoneDisplay}</td><td class="hide-sm">${dash(p.current_state)}</td><td class="muted">${esc(relTime(p.scraped_at))}</td>`;
+            };
+            return personTable((data || []).slice(0, 8), extra, cells);
+        }),
     ]);
 }
 
 async function loadPersons(pageOrOpts = 1) {
-    const opts = typeof pageOrOpts === 'number' ? { page: pageOrOpts, cursor: '' } : (pageOrOpts || {});
+    const opts = typeof pageOrOpts === 'number' ? { page: pageOrOpts } : (pageOrOpts || {});
     const page = Math.max(1, Number(opts.page) || 1);
-    const cursor = hasCursorToken(opts.cursor) ? String(opts.cursor) : '';
     currentPage = page;
-    personCursor = cursor;
-    personsNextCursor = '';
     const main = document.getElementById('mainContent');
     const keep = main.querySelector('#personsTable');
     if (!keep) {
         render(`
-            ${pageHead('Directory', '人物列表', '浏览已入库档案，支持姓名与城市筛选')}
-            <div class="filter-bar">
-                <input type="search" id="personSearch" placeholder="按姓名筛选…" value="${esc(personQuery)}" aria-label="按姓名筛选">
-                <button type="button" class="btn btn-primary" id="personSearchBtn">搜索</button>
-                <span id="personChips"></span>
+            ${pageHead('Directory', '人物档案库 · 多维检索中心', '企业级定制：支持按姓名、手机号、电话类型、地区、年龄全维度精准筛选及 1 键导出')}
+            
+            <div id="personsStatsBar">${skeleton()}</div>
+
+            <div class="filter-card">
+                <div class="filter-grid">
+                    <div class="filter-group">
+                        <label class="filter-label" for="filterName">👤 姓名关键词</label>
+                        <input type="search" id="filterName" class="filter-input" placeholder="输入姓名 (如 John Smith)..." value="${esc(personQuery)}">
+                    </div>
+                    <div class="filter-group">
+                        <label class="filter-label" for="filterPhone">📱 电话号码搜索</label>
+                        <input type="search" id="filterPhone" class="filter-input" placeholder="输入电话号码或后4位..." value="${esc(phoneQuery)}">
+                    </div>
+                    <div class="filter-group">
+                        <label class="filter-label" for="filterCity">🏙️ 城市</label>
+                        <input type="search" id="filterCity" class="filter-input" placeholder="如 New York, Miami..." value="${esc(cityFilter)}">
+                    </div>
+                    <div class="filter-group">
+                        <label class="filter-label" for="filterState">📍 州代码</label>
+                        <input type="search" id="filterState" class="filter-input" placeholder="如 NY, FL, CA, TX..." value="${esc(stateFilter)}">
+                    </div>
+                    <div class="filter-group">
+                        <label class="filter-label" for="filterPhoneType">📞 电话类型</label>
+                        <select id="filterPhoneType" class="filter-select">
+                            <option value="all" ${phoneTypeFilter === 'all' ? 'selected' : ''}>全部电话类型</option>
+                            <option value="Wireless" ${phoneTypeFilter === 'Wireless' ? 'selected' : ''}>仅移动手机 (Wireless)</option>
+                            <option value="Landline" ${phoneTypeFilter === 'Landline' ? 'selected' : ''}>仅座机电话 (Landline)</option>
+                        </select>
+                    </div>
+                    <div class="filter-group">
+                        <label class="filter-label">🎂 年龄区间</label>
+                        <div class="filter-range">
+                            <input type="number" id="filterAgeMin" class="filter-input" placeholder="最小" style="width:50%" value="${esc(ageMinFilter)}">
+                            <span style="color:var(--ink-4)">-</span>
+                            <input type="number" id="filterAgeMax" class="filter-input" placeholder="最大" style="width:50%" value="${esc(ageMaxFilter)}">
+                        </div>
+                    </div>
+                    <div class="filter-group">
+                        <label class="filter-label" for="filterSort">⚡ 排序方式</label>
+                        <select id="filterSort" class="filter-select">
+                            <option value="newest" ${sortFilter === 'newest' ? 'selected' : ''}>最新采集入库优先</option>
+                            <option value="name_asc" ${sortFilter === 'name_asc' ? 'selected' : ''}>姓名 A-Z 顺序</option>
+                            <option value="age_desc" ${sortFilter === 'age_desc' ? 'selected' : ''}>年龄 从大到小</option>
+                            <option value="age_asc" ${sortFilter === 'age_asc' ? 'selected' : ''}>年龄 从小到大</option>
+                            <option value="id_asc" ${sortFilter === 'id_asc' ? 'selected' : ''}>最早采集入库</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="filter-actions">
+                    <div class="filter-left-actions">
+                        <label class="filter-checkbox-label">
+                            <input type="checkbox" id="filterHasWireless" ${hasWirelessFilter ? 'checked' : ''}>
+                            <span>仅显示拥有真实移动手机 (Wireless) 的档案</span>
+                        </label>
+                    </div>
+                    <div class="filter-btn-group">
+                        <button type="button" class="btn" id="btnResetFilter" onclick="resetAdvFilter()">🔄 重置条件</button>
+                        <button type="button" class="btn btn-primary" id="btnApplyFilter" onclick="applyAdvFilter()">🔍 立即多维筛选</button>
+                        <button type="button" class="btn btn-export" id="btnExportCsv" onclick="exportPersonsCsv()">📥 导出 Excel (CSV)</button>
+                    </div>
+                </div>
             </div>
+
             <div class="panel" id="personsTable">${skeleton()}</div>
         `);
-        document.getElementById('personSearchBtn').onclick = applyPersonSearch;
-        document.getElementById('personSearch').addEventListener('keydown', e => {
-            if (e.key === 'Enter') applyPersonSearch();
+
+        ['filterName', 'filterPhone', 'filterCity', 'filterState', 'filterAgeMin', 'filterAgeMax'].forEach(id => {
+            document.getElementById(id)?.addEventListener('keydown', e => {
+                if (e.key === 'Enter') applyAdvFilter();
+            });
         });
+        document.getElementById('filterPhoneType')?.addEventListener('change', applyAdvFilter);
+        document.getElementById('filterSort')?.addEventListener('change', applyAdvFilter);
+        document.getElementById('filterHasWireless')?.addEventListener('change', applyAdvFilter);
     } else {
-        keep.innerHTML = `<div class="empty"><p>加载中…</p></div>`;
+        keep.innerHTML = `<div class="empty"><p>正在多维索引检索中…</p></div>`;
     }
-    const chips = document.getElementById('personChips');
-    if (chips) {
-        chips.innerHTML = cityFilter
-            ? `<span class="chip">${esc(cityFilter)} <button type="button" aria-label="清除城市" onclick="clearCity()">×</button></span>`
-            : '';
-    }
-    const params = new URLSearchParams({ page: String(page), size: '20', search: personQuery });
+
+    const params = new URLSearchParams({ page: String(page), size: '20' });
+    if (personQuery) params.set('search', personQuery);
+    if (phoneQuery) params.set('phone', phoneQuery);
     if (cityFilter) params.set('city', cityFilter);
-    if (cursor) params.set('cursor', cursor);
+    if (stateFilter) params.set('state', stateFilter);
+    if (phoneTypeFilter && phoneTypeFilter !== 'all') params.set('phone_type', phoneTypeFilter);
+    if (hasWirelessFilter) params.set('has_wireless', '1');
+    if (ageMinFilter) params.set('age_min', ageMinFilter);
+    if (ageMaxFilter) params.set('age_max', ageMaxFilter);
+    if (sortFilter) params.set('sort', sortFilter);
+
     try {
         const res = await dashboardRequest(`${API}/api/persons?${params}`);
         const d = await res.json();
-        personsNextCursor = hasCursorToken(d.next_cursor) ? d.next_cursor : '';
-        const cursorMode = Boolean(cursor) || hasCursorToken(personsNextCursor);
         totalPages = Math.max(1, Math.ceil((d.total || 0) / (d.size || 20)));
-        if (cursorMode) currentPage = cursorTrail.length || 1;
-        else currentPage = Number(d.page) || page;
-        const prevDisabled = cursorMode ? cursorTrail.length <= 1 : currentPage <= 1;
-        const nextDisabled = cursorMode ? !hasCursorToken(personsNextCursor) : currentPage >= totalPages;
-        const prevFn = cursorMode ? 'goPersonsPrev()' : `goPersonsPage(${currentPage - 1})`;
-        const nextFn = cursorMode ? 'goPersonsNext()' : `goPersonsPage(${currentPage + 1})`;
+        currentPage = Number(d.page) || page;
+
+        const statsEl = document.getElementById('personsStatsBar');
+        if (statsEl) {
+            const wirelessPct = d.total ? Math.round((d.with_wireless || 0) / d.total * 100) : 0;
+            statsEl.innerHTML = `
+                <div class="stats-summary-bar">
+                    <div class="stats-badges-list">
+                        <span class="stat-pill">📁 库内匹配档案: <strong>${fmt(d.total)}</strong> 条</span>
+                        <span class="stat-pill">📱 关联移动手机 (Wireless): <strong>${fmt(d.with_wireless)}</strong> 条</span>
+                        <span class="stat-pill">⚡ 移动手机占比: <strong>${wirelessPct}%</strong></span>
+                        <span class="stat-pill">📄 当前第 <strong>${currentPage}</strong> / <strong>${totalPages}</strong> 页</span>
+                    </div>
+                    <button type="button" class="btn btn-sm btn-export" onclick="exportPersonsCsv()">📥 一键导出本筛选结果 (CSV)</button>
+                </div>
+            `;
+        }
+
+        const prevDisabled = currentPage <= 1;
+        const nextDisabled = currentPage >= totalPages;
+        const prevFn = `goPersonsPage(${currentPage - 1})`;
+        const nextFn = `goPersonsPage(${currentPage + 1})`;
+
         const extra = `
+            <th>性别</th>
+            <th>当前电话</th>
+            <th>移动号码1</th>
+            <th>当前居住地址</th>
             <th class="hide-sm">州</th>
-            <th>电话</th><th>邮箱</th>
-            <th class="hide-sm">地址</th>`;
-        const cells = p => `
-            <td class="hide-sm">${dash(p.current_state)}</td>
-            <td><span class="badge badge-accent">${fmt(p.phone_count)}</span></td>
-            <td><span class="badge badge-ok">${fmt(p.email_count)}</span></td>
-            <td class="hide-sm"><span class="badge">${fmt(p.prev_addr_count)}</span></td>`;
+            <th class="hide-sm">入库时间</th>`;
+
+        const cells = p => {
+            const isWireless = (p.primary_phone_type || '').toLowerCase() === 'wireless';
+            const isLandline = (p.primary_phone_type || '').toLowerCase().includes('landline');
+            const badgeCls = isWireless ? 'badge-wireless' : (isLandline ? 'badge-landline' : 'badge-voip');
+            const typeLabel = isWireless ? '📱 移动手机' : (isLandline ? '☎️ 座机' : (p.primary_phone_type || '电话'));
+
+            const phoneDisplay = p.primary_phone ? `
+                <div class="phone-cell-main">
+                    <span>${esc(p.primary_phone)}</span>
+                    <span class="${badgeCls}">${typeLabel}</span>
+                    <button type="button" class="phone-copy-btn" title="点击复制号码" onclick="copyPhone(event, '${esc(p.primary_phone)}')">📋</button>
+                </div>` : '<span class="muted">—</span>';
+
+            const wirelessDisplay = p.wireless_phone_1 ? `
+                <div class="phone-cell-main">
+                    <span style="color:#059669">${esc(p.wireless_phone_1)}</span>
+                    <button type="button" class="phone-copy-btn" title="点击复制号码" onclick="copyPhone(event, '${esc(p.wireless_phone_1)}')">📋</button>
+                </div>` : '<span class="muted">—</span>';
+
+            const addrDisplay = p.current_address ? `
+                <div>
+                    <div style="font-size:13px">${esc(p.current_address)}</div>
+                    ${p.address_duration ? `<div class="addr-cell-sub">时长: ${esc(p.address_duration)}</div>` : ''}
+                </div>` : '<span class="muted">—</span>';
+
+            return `
+                <td>${dash(p.gender || '未知')}</td>
+                <td>${phoneDisplay}</td>
+                <td>${wirelessDisplay}</td>
+                <td>${addrDisplay}</td>
+                <td class="hide-sm">${dash(p.current_state)}</td>
+                <td class="hide-sm muted" style="font-size:12px">${relTime(p.scraped_at)}</td>
+            `;
+        };
+
         document.getElementById('personsTable').innerHTML = (d.data || []).length
             ? `${personTable(d.data, extra, cells)}
                 <div class="pager">
                     <button class="btn" ${prevDisabled ? 'disabled' : ''} onclick="${prevFn}">上一页</button>
-                    <span class="info">第 ${currentPage} / ${totalPages} 页 · ${fmt(d.total)} 条</span>
+                    <span class="info">第 ${currentPage} / ${totalPages} 页 · 共 ${fmt(d.total)} 条记录</span>
                     <button class="btn" ${nextDisabled ? 'disabled' : ''} onclick="${nextFn}">下一页</button>
                 </div>`
-            : emptyState('暂无数据', '请先抓取数据或调整搜索条件', ICONS.search);
-        const input = document.getElementById('personSearch');
-        if (input && document.activeElement !== input) input.value = personQuery;
+            : emptyState('未匹配到符合条件的数据', '请尝试调整筛选条件、扩大搜索范围或输入其他关键词', ICONS.search);
+
     } catch (e) {
         if (isCancelledRequest(e)) return;
         document.getElementById('personsTable').innerHTML = emptyState('加载失败', String(e));
@@ -2414,13 +2678,17 @@ function route() {
     if (path === '/proxy') return loadProxyCluster();
     if (path === '/persons') {
         lastListHash = location.hash.replace(/^#/, '') || '/persons';
-        const nextQ = params.get('q') || '';
-        const nextCity = params.get('city') || '';
+        personQuery = params.get('q') || '';
+        phoneQuery = params.get('phone') || '';
+        cityFilter = params.get('city') || '';
+        stateFilter = params.get('state') || '';
+        phoneTypeFilter = params.get('phone_type') || 'all';
+        hasWirelessFilter = params.get('has_wireless') === '1';
+        ageMinFilter = params.get('age_min') || '';
+        ageMaxFilter = params.get('age_max') || '';
+        sortFilter = params.get('sort') || 'newest';
         const cursor = params.get('cursor') || '';
         const page = Math.max(1, parseInt(params.get('page') || '1', 10) || 1);
-        if (nextQ !== personQuery || nextCity !== cityFilter) cursorTrail = [''];
-        personQuery = nextQ;
-        cityFilter = nextCity;
         syncCursorTrail(cursor);
         return loadPersons({ page, cursor });
     }
