@@ -17,6 +17,7 @@ import csv
 import io
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -27,7 +28,8 @@ from flask import Flask, Response, g, jsonify, make_response, request, send_file
 import mysql.connector
 from werkzeug.exceptions import HTTPException
 
-# 仓库 scripts/（tps_metrics / tps_queue）
+# 仓库根目录与 scripts/（tps_metrics / tps_queue）
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 _SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts")
 _SCRIPTS_DIR = os.path.normpath(_SCRIPTS_DIR)
 if _SCRIPTS_DIR not in sys.path:
@@ -217,7 +219,13 @@ def _background_target_state(role):
             return "mismatch"
         if role in ("worker", "cluster"):
             database_target = _background_database_target()
-            if any(database_target[key] != TIDB_CONFIG[key] for key in _BACKGROUND_DB_KEYS):
+            eff_target = dict(database_target)
+            if "TPS_DB_PORT" in os.environ:
+                try:
+                    eff_target["port"] = int(os.environ["TPS_DB_PORT"])
+                except ValueError:
+                    pass
+            if any(eff_target[key] != TIDB_CONFIG[key] for key in _BACKGROUND_DB_KEYS):
                 return "mismatch"
         elif role != "discover":
             return "unverifiable"
@@ -1736,6 +1744,95 @@ def system_apply_update():
         return jsonify(res), status_code
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+# ============================================================
+# 批量 100 条验证采集任务 API
+# ============================================================
+_batch100_proc = None
+_BATCH100_LOG = _REPO_ROOT / "data" / "logs" / "batch100.log"
+
+
+@app.route("/api/batch100/status", methods=["GET"])
+def api_batch100_status():
+    global _batch100_proc
+    running = False
+    pid = None
+    if _batch100_proc is not None:
+        if _batch100_proc.poll() is None:
+            running = True
+            pid = _batch100_proc.pid
+        else:
+            _batch100_proc = None
+
+    logs = []
+    if _BATCH100_LOG.exists():
+        try:
+            lines = _BATCH100_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+            logs = lines[-120:]
+        except Exception:
+            pass
+
+    current = 0
+    total = 100
+    for line in reversed(logs):
+        m = re.search(r"\[(\d+)/(\d+)\]", line)
+        if m:
+            current = int(m.group(1))
+            total = int(m.group(2))
+            break
+
+    return jsonify({
+        "ok": True,
+        "running": running,
+        "pid": pid,
+        "current": current,
+        "total": total,
+        "logs": logs,
+    })
+
+
+@app.route("/api/batch100/start", methods=["POST"])
+def api_batch100_start():
+    global _batch100_proc
+    if _batch100_proc is not None and _batch100_proc.poll() is None:
+        return jsonify({"ok": True, "running": True, "pid": _batch100_proc.pid, "message": "任务已在运行中"})
+
+    body = request.get_json(silent=True) or {}
+    count = int(body.get("count", 100))
+
+    _BATCH100_LOG.parent.mkdir(parents=True, exist_ok=True)
+    log_file = open(_BATCH100_LOG, "w", encoding="utf-8")
+
+    env = os.environ.copy()
+    env["TPS_DB_PORT"] = str(TIDB_CONFIG.get("port", 3306))
+    env["TPS_DB_PASSWORD"] = str(TIDB_CONFIG.get("password", ""))
+
+    cmd = [sys.executable, "-u", str(_REPO_ROOT / "tools" / "batch_collector_100.py"), str(count)]
+    _batch100_proc = subprocess.Popen(
+        cmd,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        env=env,
+        cwd=str(_REPO_ROOT),
+    )
+    return jsonify({"ok": True, "running": True, "pid": _batch100_proc.pid})
+
+
+@app.route("/api/batch100/stop", methods=["POST"])
+def api_batch100_stop():
+    global _batch100_proc
+    if _batch100_proc is not None:
+        try:
+            _batch100_proc.terminate()
+            _batch100_proc.wait(timeout=3)
+        except Exception:
+            try:
+                _batch100_proc.kill()
+            except Exception:
+                pass
+        _batch100_proc = None
+    return jsonify({"ok": True, "running": False})
 
 
 # ============================================================

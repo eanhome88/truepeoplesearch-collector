@@ -1074,7 +1074,38 @@
             white-space: pre-wrap;
             word-break: break-all;
         }
-    
+        .batch-progress-bar-wrap {
+            height: 8px;
+            background: var(--line);
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 10px 0 6px 0;
+        }
+        .batch-progress-bar-fill {
+            height: 100%;
+            width: 0%;
+            background: #1b8a5a;
+            border-radius: 4px;
+            transition: width 0.3s ease;
+        }
+        .quick-step-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+        }
+        .quick-step-num {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            background: var(--line);
+            color: var(--ink);
+            font-size: 11px;
+            font-weight: 700;
+        }
 
 /* High-Density Command Flow & Slot Radar Styles */
 .flow-funnel-panel {

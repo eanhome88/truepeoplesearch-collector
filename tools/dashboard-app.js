@@ -2105,6 +2105,7 @@ async function loadRecent() {
 // ============================================================
 
 let proxyPollTimer = null;
+let batch100PollTimer = null;
 let proxyTesting = false;
 let clusterBusy = false;
 let clusterStatusSeq = 0;
@@ -2114,6 +2115,10 @@ function stopProxyPoll() {
     if (proxyPollTimer) {
         proxyPollTimer.stop();
         proxyPollTimer = null;
+    }
+    if (batch100PollTimer) {
+        batch100PollTimer.stop();
+        batch100PollTimer = null;
     }
 }
 
@@ -2184,6 +2189,33 @@ function renderProxyClusterView(cfg, cluster, metrics) {
     const html = `
         ${pageHead('Infrastructure & Cluster', 'IP 代理与高通量集群管理', '集中管理动态住宅代理、实时发起 TLS/Cloudflare 穿透实测，并一键调度 3000万/天 极速协议集群')}
 
+        <!-- 极简 3 步快速操作向导 -->
+        <section class="panel" style="margin-bottom: 20px; padding: 16px 20px; background: linear-gradient(135deg, rgba(27,77,68,0.06), rgba(30,60,90,0.04)); border: 1px solid var(--line); border-radius: var(--radius-sm);">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px;">
+                <div>
+                    <div style="font-weight:700; font-size:15px; display:flex; align-items:center; gap:8px;">
+                        <span>⚡️ 极简极速操作向导</span>
+                        <span class="badge badge-ok">小白开箱即用</span>
+                    </div>
+                    <div style="margin-top:6px; display:flex; align-items:center; gap:14px; flex-wrap:wrap; color:var(--ink-2); font-size:13px;">
+                        <span class="quick-step-item"><span class="quick-step-num">1</span> 粘贴代理连接串 (自动秒级识别)</span>
+                        <span style="color:var(--ink-4)">➔</span>
+                        <span class="quick-step-item"><span class="quick-step-num">2</span> 点击「保存并测试」</span>
+                        <span style="color:var(--ink-4)">➔</span>
+                        <span class="quick-step-item"><span class="quick-step-num">3</span> 点击「测试采集 100 条」或「启动集群」</span>
+                    </div>
+                </div>
+                <div style="display:flex; gap:10px; align-items:center;">
+                    <button type="button" class="btn btn-primary" id="btnQuickBatch100" style="padding:9px 18px; font-weight:600; font-size:13px; background:#1b8a5a; border-color:#1b8a5a; color:#fff;">
+                        🎯 一键测试采集 100 条
+                    </button>
+                    <button type="button" class="btn" id="btnQuickToggleCluster" style="padding:9px 18px; font-weight:600; font-size:13px; ${isRunning ? 'background:var(--danger);border-color:var(--danger);color:#fff;' : ''}">
+                        ${isRunning ? '🛑 停止协议集群' : '🚀 启动全速集群'}
+                    </button>
+                </div>
+            </div>
+        </section>
+
         <section class="pipe-kpis" style="margin-bottom: 20px;">
             <article class="panel pipe-kpi">
                 <div class="metric-label">实时抓取吞吐</div>
@@ -2219,6 +2251,21 @@ function renderProxyClusterView(cfg, cluster, metrics) {
                 </div>
 
                 <div class="card-body">
+                    <!-- 智能一键解析框 -->
+                    <div style="background:var(--surface); padding:14px; border-radius:var(--radius-sm); border:1px solid var(--line); margin-bottom:16px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                            <span style="font-weight:600; font-size:13px;">⚡️ 智能一键解析（直接粘贴任意格式代理）</span>
+                            <span id="smartParsedTag" style="display:none; font-size:11px; font-weight:600;" class="badge badge-ok"></span>
+                        </div>
+                        <div style="display:flex; gap:8px;">
+                            <input id="pxSmartInput" placeholder="直接粘贴如: gate.decodo.com:10001:spevk8xxrl:password 或 curl 命令" style="flex:1; font-family:monospace; font-size:12px;" autocomplete="off">
+                            <button type="button" class="btn btn-primary" id="btnSmartFill" style="padding:0 14px; font-size:13px; white-space:nowrap;">一键识别填入</button>
+                        </div>
+                        <div style="font-size:11px; color:var(--ink-4); margin-top:6px;">
+                            支持格式：<code>IP:端口:账号:密码</code>、<code>http://账号:密码@IP:端口</code> 或 <code>curl -U ... -x ...</code>，粘贴即自动解析拆解。
+                        </div>
+                    </div>
+
                     <!-- 模式选择 Tab -->
                     <div class="seg" role="group" aria-label="代理模式" style="margin-bottom:16px;" id="proxyModeSeg">
                         <button type="button" class="proxy-seg-btn" data-mode="tunnel" aria-pressed="${mode === 'tunnel' ? 'true' : 'false'}">隧道轮换 (推荐)</button>
@@ -2284,7 +2331,7 @@ function renderProxyClusterView(cfg, cluster, metrics) {
                             <div style="font-weight:600;font-size:13px;">Cloudflare 穿透与连通性实测</div>
                             <button type="button" class="btn btn-primary" id="btnTestProxy" style="padding:6px 14px;font-size:13px;">立即测试当前代理</button>
                         </div>
-                        <input id="pxTestUrl" value="https://www.truepeoplesearch.com/find/person/px82l44nur68u2l2l8n60" style="font-size:12px;margin-bottom:8px;" placeholder="测试目标 URL" autocomplete="off">
+                        <input id="pxTestUrl" value="https://www.truepeoplesearch.com/find/person/px82l44nur68u2l8n60" style="font-size:12px;margin-bottom:8px;" placeholder="测试目标 URL" autocomplete="off">
                         
                         <div id="testResultBox" style="display:none;margin-top:10px;">
                             <div style="display:flex;gap:8px;align-items:center;">
@@ -2306,8 +2353,8 @@ function renderProxyClusterView(cfg, cluster, metrics) {
             <article class="panel proxy-card">
                 <div class="card-head">
                     <div>
-                        <h3>3000万级高通量抓取集群</h3>
-                        <p>多进程协程架构 · 突破 GIL · 解耦微批极速入库</p>
+                        <h3>任务采集与集群调度</h3>
+                        <p>支持一键验证采集 100 条 · 多进程协程集群架构 · 解耦微批极速入库</p>
                     </div>
                     <div class="pipe-status">
                         <span class="live-dot ${isRunning ? 'on' : ''}" id="clusterLiveDot"></span>
@@ -2316,6 +2363,34 @@ function renderProxyClusterView(cfg, cluster, metrics) {
                 </div>
 
                 <div class="card-body">
+                    <!-- 🎯 极速测试采集 100 条专区 -->
+                    <div style="background:var(--surface); padding:16px; border-radius:var(--radius-sm); border:1px solid var(--line); margin-bottom:16px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <div>
+                                <div style="font-weight:700; font-size:14px; display:flex; align-items:center; gap:8px;">
+                                    <span>🎯 极速测试采集 100 条</span>
+                                    <span class="badge badge-ok" id="batch100StatusBadge">就绪</span>
+                                </div>
+                                <div style="font-size:12px; color:var(--ink-3); margin-top:4px;">
+                                    通过当前配置代理实机抓取 100 个真实档案并入库 MySQL，实时检验连通与字段采全率
+                                </div>
+                            </div>
+                            <button type="button" class="btn btn-primary" id="btnRunBatch100" style="padding:9px 18px; font-size:13px; font-weight:600; background:#1b8a5a; border-color:#1b8a5a; color:#fff; white-space:nowrap;">
+                                ▶ 开始采集 100 条
+                            </button>
+                        </div>
+                        <div id="batch100ProgressBox" style="display:none; margin-top:14px;">
+                            <div style="display:flex; justify-content:space-between; font-size:12px; color:var(--ink-2); font-weight:600;">
+                                <span id="batch100ProgressText">正在准备采集目标...</span>
+                                <span id="batch100ProgressPct">0%</span>
+                            </div>
+                            <div class="batch-progress-bar-wrap">
+                                <div class="batch-progress-bar-fill" id="batch100ProgressFill"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 3000万级全速集群参数 -->
                     <div class="field-grid" style="grid-template-columns: 1fr 1fr; margin-bottom:16px;">
                         <label class="field">Worker 进程数 (充分发挥多核)
                             <input id="clWorkers" type="number" min="1" max="16" value="1" ${isRunning ? 'disabled' : ''}>
@@ -2338,8 +2413,8 @@ function renderProxyClusterView(cfg, cluster, metrics) {
                     </div>
 
                     <div style="display:flex;gap:12px;margin-bottom:16px;">
-                        <button type="button" class="btn" id="btnToggleCluster" style="flex:1;padding:10px 16px;${isRunning ? 'background:var(--danger);border-color:var(--danger);color:#f7f2ea;' : ''}">
-                            ${isRunning ? '停止抓取集群' : '次要：启动协议集群'}
+                        <button type="button" class="btn" id="btnToggleCluster" style="flex:1;padding:12px 18px;font-size:14px;font-weight:600;${isRunning ? 'background:var(--danger);border-color:var(--danger);color:#fff;' : 'background:var(--primary);color:#fff;'}">
+                            ${isRunning ? '停止抓取集群' : '🚀 启动全速抓取集群 (3000万/天)'}
                         </button>
                     </div>
 
@@ -2351,10 +2426,10 @@ function renderProxyClusterView(cfg, cluster, metrics) {
                     </div>
 
                     <div class="section-label" style="margin-bottom:6px;display:flex;justify-content:space-between;">
-                        <span>集群实时控制台日志</span>
+                        <span>实时控制台与抓取日志</span>
                         <span style="font-size:11px;font-weight:normal;color:var(--ink-4)" id="logSyncTime">每 3 秒刷新</span>
                     </div>
-                    <pre class="cluster-log-box" id="clusterLogText">${esc((cluster.logs || []).join('\n') || '暂无集群运行日志。点击上方【启动抓取集群】开始作业。')}</pre>
+                    <pre class="cluster-log-box" id="clusterLogText">${esc((cluster.logs || []).join('\n') || '暂无运行日志。可点击上方【开始采集 100 条】或【启动全速集群】。')}</pre>
                 </div>
             </article>
         </div>
@@ -2362,6 +2437,50 @@ function renderProxyClusterView(cfg, cluster, metrics) {
 
     render(html);
     bindProxyClusterEvents(cfg, cluster);
+}
+
+function smartParseProxyString(str) {
+    if (!str || typeof str !== 'string') return null;
+    str = str.trim();
+    if (!str) return null;
+
+    // 1. Curl pattern: curl -U "user:pass" -x "host:port" ...
+    const uMatch = str.match(/-U\s+["']?([^"'\s]+)["']?/i);
+    const xMatch = str.match(/-x\s+["']?([^"'\s]+)["']?/i);
+    if (uMatch && xMatch) {
+        const uVal = uMatch[1];
+        const xVal = xMatch[1].replace(/^https?:\/\//, '');
+        const [host, port] = xVal.split(':');
+        const [user, ...pRest] = uVal.split(':');
+        if (host && port) return { host, port, user: user || '', pass: pRest.join(':') };
+    }
+
+    // 2. Standard URL: http://user:pass@host:port or user:pass@host:port
+    const atIdx = str.lastIndexOf('@');
+    if (atIdx !== -1) {
+        const authPart = str.slice(0, atIdx).replace(/^https?:\/\//, '');
+        const hostPart = str.slice(atIdx + 1);
+        const [user, ...pRest] = authPart.split(':');
+        const [host, port] = hostPart.split(':');
+        if (host && port) return { host, port, user: user || '', pass: pRest.join(':') };
+    }
+
+    // 3. 4-part colon format: host:port:user:pass (e.g. gate.decodo.com:10001:spevk8xxrl:cOctvu~5aSud5FC72b)
+    const parts = str.split(':');
+    if (parts.length >= 4) {
+        const host = parts[0].replace(/^https?:\/\//, '');
+        const port = parts[1];
+        const user = parts[2];
+        const pass = parts.slice(3).join(':');
+        if (/^\d+$/.test(port)) return { host, port, user, pass };
+    }
+
+    // 4. 2-part format: host:port (no auth)
+    if (parts.length === 2 && /^\d+$/.test(parts[1])) {
+        return { host: parts[0].replace(/^https?:\/\//, ''), port: parts[1], user: '', pass: '' };
+    }
+
+    return null;
 }
 
 function bindProxyClusterEvents(initialCfg, initialCluster) {
@@ -2383,9 +2502,53 @@ function bindProxyClusterEvents(initialCfg, initialCluster) {
         });
     });
 
+    // 智能一键解析代理输入
+    const pxSmartInput = document.getElementById('pxSmartInput');
+    const btnSmartFill = document.getElementById('btnSmartFill');
+    const smartParsedTag = document.getElementById('smartParsedTag');
+    const pxHost = document.getElementById('pxHost');
+    const pxPort = document.getElementById('pxPort');
+    const pxUser = document.getElementById('pxUser');
+    const pxPass = document.getElementById('pxPass');
+    const pxTunnelUrl = document.getElementById('pxTunnelUrl');
+
+    function applySmartParse() {
+        const raw = pxSmartInput?.value?.trim() || '';
+        const parsed = smartParseProxyString(raw);
+        if (parsed) {
+            if (pxHost) pxHost.value = parsed.host;
+            if (pxPort) pxPort.value = parsed.port;
+            if (pxUser) pxUser.value = parsed.user;
+            if (pxPass) pxPass.value = parsed.pass;
+            syncToTunnelUrl();
+
+            // 自动切到隧道模式
+            const tunnelBtn = document.querySelector('.proxy-seg-btn[data-mode="tunnel"]');
+            if (tunnelBtn) tunnelBtn.click();
+
+            if (smartParsedTag) {
+                smartParsedTag.style.display = 'inline-block';
+                smartParsedTag.textContent = `✅ 已识别: ${parsed.host}:${parsed.port} (${parsed.user || '免密'})`;
+            }
+        } else if (raw) {
+            if (smartParsedTag) {
+                smartParsedTag.style.display = 'inline-block';
+                smartParsedTag.className = 'badge';
+                smartParsedTag.textContent = '无法识别此格式，请检查';
+            }
+        }
+    }
+
+    if (pxSmartInput) {
+        pxSmartInput.addEventListener('input', applySmartParse);
+        pxSmartInput.addEventListener('paste', () => setTimeout(applySmartParse, 50));
+    }
+    if (btnSmartFill) {
+        btnSmartFill.addEventListener('click', applySmartParse);
+    }
+
     // 密码查看切换
     const btnTogglePass = document.getElementById('btnTogglePass');
-    const pxPass = document.getElementById('pxPass');
     if (btnTogglePass && pxPass) {
         btnTogglePass.addEventListener('click', () => {
             pxPass.type = pxPass.type === 'password' ? 'text' : 'password';
@@ -2393,11 +2556,6 @@ function bindProxyClusterEvents(initialCfg, initialCluster) {
     }
 
     // 自动组装 Tunnel URL
-    const pxHost = document.getElementById('pxHost');
-    const pxPort = document.getElementById('pxPort');
-    const pxUser = document.getElementById('pxUser');
-    const pxTunnelUrl = document.getElementById('pxTunnelUrl');
-
     function syncToTunnelUrl() {
         const h = (pxHost?.value || '').trim();
         const p = (pxPort?.value || '').trim();
@@ -2463,7 +2621,7 @@ function bindProxyClusterEvents(initialCfg, initialCluster) {
                     testBadge.className = 'test-res-badge fail';
                     testBadge.textContent = '探测失败';
                     testSummary.textContent = data.message || '网络连接超时或代理未响应';
-                    testDetail.textContent = data.error || '';
+                    testDetail.textContent = data.error || '若报 Empty reply，请检查 Decodo 仪表盘「验证方法」中的白名单 IP 或账密是否有效。';
                 }
             } catch (err) {
                 if (isCancelledRequest(err)) return;
@@ -2530,69 +2688,167 @@ function bindProxyClusterEvents(initialCfg, initialCluster) {
         });
     }
 
-    // 启停集群按钮
-    const btnCluster = document.getElementById('btnToggleCluster');
-    if (btnCluster) {
-        btnCluster.addEventListener('click', async () => {
-            if (clusterBusy) return;
-            clusterBusy = true;
-            btnCluster.disabled = true;
+    // 🎯 极速测试采集 100 条处理函数
+    async function triggerBatch100() {
+        const btnRun = document.getElementById('btnRunBatch100');
+        const btnTop = document.getElementById('btnQuickBatch100');
+        const progBox = document.getElementById('batch100ProgressBox');
+        const progText = document.getElementById('batch100ProgressText');
+        const progPct = document.getElementById('batch100ProgressPct');
+        const progFill = document.getElementById('batch100ProgressFill');
+        const statusBadge = document.getElementById('batch100StatusBadge');
+        const logBox = document.getElementById('clusterLogText');
 
-            const isCurrentlyRunning = document.getElementById('clusterLiveDot')?.classList.contains('on');
-            const action = isCurrentlyRunning ? 'stop' : 'start';
-            btnCluster.textContent = isCurrentlyRunning ? '正在停止集群...' : '正在启动集群...';
+        if (btnRun) { btnRun.disabled = true; btnRun.textContent = '正在采集...'; }
+        if (btnTop) { btnTop.disabled = true; btnTop.textContent = '正在采集...'; }
+        if (progBox) progBox.style.display = 'block';
+        if (statusBadge) { statusBadge.textContent = '正在采集'; statusBadge.className = 'badge badge-warn'; }
 
-            const toast = document.getElementById('proxyToast');
-            const showClusterError = (message) => {
-                if (!toast) return;
+        try {
+            const startRes = await dashboardRequest(`${API}/api/batch100/start`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ count: 100 }),
+            });
+            const startData = await startRes.json();
+            if (!startData.ok) throw new Error(startData.error || '启动采集失败');
+
+            if (batch100PollTimer) {
+                batch100PollTimer.stop();
+                batch100PollTimer = null;
+            }
+            batch100PollTimer = dashboardRuntime.startPoll(async () => {
+                try {
+                    const stRes = await dashboardRequest(`${API}/api/batch100/status`);
+                    const st = await stRes.json();
+                    if (!st.ok) return;
+
+                    const cur = st.current || 0;
+                    const tot = st.total || 100;
+                    const pct = Math.min(100, Math.round((cur / tot) * 100));
+
+                    if (progText) progText.textContent = `已采集入库: ${cur} / ${tot} 条人物档案`;
+                    if (progPct) progPct.textContent = `${pct}%`;
+                    if (progFill) progFill.style.width = `${pct}%`;
+
+                    if (st.logs && st.logs.length && logBox) {
+                        logBox.textContent = st.logs.join('\n');
+                        logBox.scrollTop = logBox.scrollHeight;
+                    }
+
+                    if (!st.running) {
+                        if (batch100PollTimer) {
+                            batch100PollTimer.stop();
+                            batch100PollTimer = null;
+                        }
+                        if (btnRun) { btnRun.disabled = false; btnRun.textContent = '▶ 开始采集 100 条'; }
+                        if (btnTop) { btnTop.disabled = false; btnTop.textContent = '🎯 一键测试采集 100 条'; }
+                        if (statusBadge) {
+                            statusBadge.textContent = cur >= tot ? '采集完成 100 条' : '就绪';
+                            statusBadge.className = cur >= tot ? 'badge badge-ok' : 'badge';
+                        }
+                        if (toast && cur >= tot) {
+                            toast.className = 'toast-msg success';
+                            toast.textContent = '🎉 100 条验证档案已全部采集并成功入库 MySQL！可在【人物数据档案】页面查看并导出！';
+                        }
+                    }
+                } catch (e) {}
+            }, 1500, { backoff: false });
+
+        } catch (err) {
+            if (btnRun) { btnRun.disabled = false; btnRun.textContent = '▶ 开始采集 100 条'; }
+            if (btnTop) { btnTop.disabled = false; btnTop.textContent = '🎯 一键测试采集 100 条'; }
+            if (toast) {
                 toast.className = 'toast-msg error';
-                toast.textContent = message;
+                toast.textContent = '采集启动失败: ' + String(err);
+            }
+        }
+    }
+
+    const btnRunBatch100 = document.getElementById('btnRunBatch100');
+    if (btnRunBatch100) btnRunBatch100.addEventListener('click', triggerBatch100);
+    const btnQuickBatch100 = document.getElementById('btnQuickBatch100');
+    if (btnQuickBatch100) btnQuickBatch100.addEventListener('click', triggerBatch100);
+
+    // 启停集群逻辑 (统一处理大卡片按钮与顶部向导按钮)
+    async function toggleClusterAction() {
+        if (clusterBusy) return;
+        clusterBusy = true;
+
+        const btnCluster = document.getElementById('btnToggleCluster');
+        const btnTop = document.getElementById('btnQuickToggleCluster');
+        if (btnCluster) btnCluster.disabled = true;
+        if (btnTop) btnTop.disabled = true;
+
+        const isCurrentlyRunning = document.getElementById('clusterLiveDot')?.classList.contains('on');
+        const action = isCurrentlyRunning ? 'stop' : 'start';
+        if (btnCluster) btnCluster.textContent = isCurrentlyRunning ? '正在停止集群...' : '正在启动集群...';
+        if (btnTop) btnTop.textContent = isCurrentlyRunning ? '正在停止...' : '正在启动...';
+
+        const toast = document.getElementById('proxyToast');
+        const showClusterError = (message) => {
+            if (!toast) return;
+            toast.className = 'toast-msg error';
+            toast.textContent = message;
+        };
+        try {
+            const workersInput = document.getElementById('clWorkers');
+            const concInput = document.getElementById('clConcurrency');
+            if (workersInput) workersInput.value = '1';
+            if (concInput) concInput.value = '2';
+            const body = {
+                action,
+                workers: 1,
+                concurrency: 2,
+                decoupled: !!document.getElementById('clDecoupled')?.checked,
             };
-            try {
-                const workersInput = document.getElementById('clWorkers');
-                const concInput = document.getElementById('clConcurrency');
-                if (workersInput) workersInput.value = '1';
-                if (concInput) concInput.value = '2';
-                const body = {
-                    action,
-                    workers: 1,
-                    concurrency: 2,
-                    decoupled: !!document.getElementById('clDecoupled')?.checked,
-                };
-                const res = await dashboardRequest(`${API}/api/cluster/control`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(body),
-                });
-                const d = await res.json();
-                if (res.status === 409 || !res.ok || d?.ok === false) {
-                    const raw = d?.error || d?.result?.error || d?.message;
-                    const message = (typeof raw === 'string' && raw.trim()) ? raw.trim() : '操作失败';
-                    showClusterError(message);
-                    return;
-                }
-                if (toast && toast.className.includes('error')) {
-                    toast.className = 'toast-msg';
-                    toast.textContent = '';
-                }
+            const res = await dashboardRequest(`${API}/api/cluster/control`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            const d = await res.json();
+            if (res.status === 409 || !res.ok || d?.ok === false) {
+                const raw = d?.error || d?.result?.error || d?.message;
+                const message = (typeof raw === 'string' && raw.trim()) ? raw.trim() : '操作失败';
+                showClusterError(message);
+                return;
+            }
+            if (toast && toast.className.includes('error')) {
+                toast.className = 'toast-msg';
+                toast.textContent = '';
+            }
 
-                // 立即刷新状态
-                await refreshClusterLiveStatus({ fresh: true });
+            // 立即刷新状态
+            await refreshClusterLiveStatus({ fresh: true });
 
-            } catch (err) {
-                if (isCancelledRequest(err)) return;
-                showClusterError(err?.message || String(err));
-            } finally {
-                clusterBusy = false;
-                const unavailable = document.getElementById('clusterLiveStatus')?.textContent === '状态暂不可用';
+        } catch (err) {
+            if (isCancelledRequest(err)) return;
+            showClusterError(err?.message || String(err));
+        } finally {
+            clusterBusy = false;
+            const unavailable = document.getElementById('clusterLiveStatus')?.textContent === '状态暂不可用';
+            if (btnCluster) {
                 btnCluster.disabled = unavailable;
                 if (!unavailable) {
                     const running = document.getElementById('clusterLiveDot')?.classList.contains('on');
-                    btnCluster.textContent = running ? '停止抓取集群' : '次要：启动协议集群';
+                    btnCluster.textContent = running ? '停止抓取集群' : '🚀 启动全速抓取集群 (3000万/天)';
                 }
             }
-        });
+            if (btnTop) {
+                btnTop.disabled = unavailable;
+                if (!unavailable) {
+                    const running = document.getElementById('clusterLiveDot')?.classList.contains('on');
+                    btnTop.textContent = running ? '🛑 停止协议集群' : '🚀 启动全速集群';
+                }
+            }
+        }
     }
+
+    const btnCluster = document.getElementById('btnToggleCluster');
+    if (btnCluster) btnCluster.addEventListener('click', toggleClusterAction);
+    const btnQuickToggle = document.getElementById('btnQuickToggleCluster');
+    if (btnQuickToggle) btnQuickToggle.addEventListener('click', toggleClusterAction);
 }
 
 function showClusterStatusUnavailable() {
@@ -2652,10 +2908,19 @@ async function refreshClusterLiveStatus({ fresh = false } = {}) {
         const btnCluster = document.getElementById('btnToggleCluster');
         if (btnCluster && !clusterBusy) {
             btnCluster.disabled = false;
-            btnCluster.textContent = isRunning ? '停止抓取集群' : '次要：启动协议集群';
+            btnCluster.textContent = isRunning ? '停止抓取集群' : '🚀 启动全速抓取集群 (3000万/天)';
             btnCluster.style.background = isRunning ? 'var(--danger)' : '';
             btnCluster.style.borderColor = isRunning ? 'var(--danger)' : '';
             btnCluster.style.color = isRunning ? '#f7f2ea' : '';
+        }
+
+        const btnTop = document.getElementById('btnQuickToggleCluster');
+        if (btnTop && !clusterBusy) {
+            btnTop.disabled = false;
+            btnTop.textContent = isRunning ? '🛑 停止协议集群' : '🚀 启动全速集群';
+            btnTop.style.background = isRunning ? 'var(--danger)' : '';
+            btnTop.style.borderColor = isRunning ? 'var(--danger)' : '';
+            btnTop.style.color = isRunning ? '#f7f2ea' : '';
         }
 
         const clWorkers = document.getElementById('clWorkers');
