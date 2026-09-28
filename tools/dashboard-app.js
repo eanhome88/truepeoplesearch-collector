@@ -2960,6 +2960,30 @@ function route() {
     stopProxyPoll();
     stopRecentPoll();
     const { path, params } = parseHash();
+    // Customer releases receive this mode before the first hash is routed. The
+    // body marker preserves the same boundary after the version endpoint has
+    // confirmed the release mode during a long-lived dashboard session.
+    const customerReleaseMode = (
+        typeof window !== 'undefined'
+        && String(window.__TPS_RELEASE_MODE__ || '').trim().toLowerCase() === 'customer'
+    ) || (
+        typeof document !== 'undefined'
+        && document.body?.dataset?.releaseMode === 'customer'
+    );
+    const customerControlRoute = customerReleaseMode && [
+        '/pipeline', '/proxy', '/cluster', '/control', '/update', '/updates',
+    ].some(prefix => path === prefix || path.startsWith(prefix + '/'));
+    if (customerControlRoute) {
+        // Replace instead of push so browser Back cannot reopen a hidden
+        // control surface. Do this before selecting or loading the view.
+        if (typeof history !== 'undefined' && typeof history.replaceState === 'function') {
+            history.replaceState(null, '', '#/');
+        } else {
+            location.hash = '/';
+        }
+        setActive('/');
+        return loadOverview();
+    }
     setActive(path);
     if (path === '/' || path === '') return loadOverview();
     if (path === '/pipeline') return loadPipeline();
@@ -3068,6 +3092,7 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
     const bannerCloseBtn = document.getElementById('bannerCloseBtn');
 
     const updateModalBackdrop = document.getElementById('updateModalBackdrop');
+    const updateModal = document.getElementById('updateModal');
     const modalCloseBtn = document.getElementById('modalCloseBtn');
     const modalCurrentVer = document.getElementById('modalCurrentVer');
     const diffCurrentVer = document.getElementById('diffCurrentVer');
@@ -3084,17 +3109,94 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
     let currentSystemInfo = null;
     let latestUpdateInfo = null;
     let isUpgrading = false;
+    let modalFocusOrigin = null;
+    let customerReleaseMode = false;
 
-    function openModal() {
+    // 作为所有操作暂不可用时的焦点保底，避免键盘焦点落回背景页面。
+    if (updateModal && !updateModal.hasAttribute('tabindex')) updateModal.setAttribute('tabindex', '-1');
+
+    function isModalOpen() {
+        return Boolean(updateModalBackdrop && updateModalBackdrop.style.display !== 'none');
+    }
+
+    function applyCustomerReleasePresentation() {
+        customerReleaseMode = true;
+        document.body.dataset.releaseMode = 'customer';
+        if (versionBadge) {
+            versionBadge.title = '客户离线发布：使用经核验的离线升级包';
+            versionBadge.classList.remove('has-update');
+        }
+        if (checkUpdateBtn) checkUpdateBtn.hidden = true;
+        if (versionUpdateTag) versionUpdateTag.style.display = 'none';
+        if (updateBanner) updateBanner.style.display = 'none';
+        if (updateModalBackdrop) updateModalBackdrop.style.display = 'none';
+        if (typeof document.querySelectorAll === 'function') {
+            document.querySelectorAll('[data-route="/pipeline"], [data-route="/proxy"]').forEach(control => {
+                control.hidden = true;
+            });
+        }
+    }
+
+    function isFocusable(control) {
+        if (!control || control.disabled || control.hidden || control.getAttribute('aria-hidden') === 'true') return false;
+        if (control.style.display === 'none' || control.style.visibility === 'hidden') return false;
+        return true;
+    }
+
+    function getModalFocusableControls() {
+        if (!updateModal) return [];
+        return [...updateModal.querySelectorAll(
+            'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        )].filter(isFocusable);
+    }
+
+    function focusControl(control) {
+        if (!control || typeof control.focus !== 'function') return;
+        try {
+            control.focus({ preventScroll: true });
+        } catch (_) {
+            control.focus();
+        }
+    }
+
+    function focusInitialModalControl() {
+        const preferredControl = [modalCloseBtn, modalUpgradeBtn, modalCheckBtn, modalCancelBtn]
+            .find(isFocusable);
+        focusControl(preferredControl || getModalFocusableControls()[0] || updateModal);
+    }
+
+    function restoreFocusAfterClose() {
+        const restoreTarget = modalFocusOrigin;
+        modalFocusOrigin = null;
+        if (restoreTarget && document.contains(restoreTarget) && isFocusable(restoreTarget)) {
+            focusControl(restoreTarget);
+        }
+    }
+
+    function openModal(focusOrigin = null) {
+        if (customerReleaseMode) return;
         if (!updateModalBackdrop) return;
+        const wasOpen = isModalOpen();
+        if (!wasOpen) {
+            const activeElement = focusOrigin || document.activeElement;
+            if (activeElement && activeElement !== document.body && !updateModalBackdrop.contains(activeElement)) {
+                modalFocusOrigin = activeElement;
+            }
+        }
         updateModalBackdrop.style.display = 'grid';
+        const activeElement = document.activeElement;
+        if (!wasOpen || !updateModal?.contains(activeElement) || !isFocusable(activeElement)) {
+            focusInitialModalControl();
+        }
     }
 
     function closeModal() {
-        if (!updateModalBackdrop) return;
-        if (isUpgrading) return; // 升级进行中禁止关闭
-        if (updateModalBackdrop.dataset.force === 'true') return; // 强制更新状态下禁止关闭
+        if (!updateModalBackdrop) return false;
+        if (isUpgrading) return false; // 升级进行中禁止关闭
+        if (updateModalBackdrop.dataset.force === 'true') return false; // 强制更新状态下禁止关闭
         updateModalBackdrop.style.display = 'none';
+        restoreFocusAfterClose();
+        return true;
     }
 
     async function loadVersionInfo() {
@@ -3116,6 +3218,9 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
                         .map(n => `<li>${esc(n)}</li>`)
                         .join('');
                 }
+                if (currentSystemInfo.release_mode === 'customer') {
+                    applyCustomerReleasePresentation();
+                }
             }
         } catch (e) {
             console.debug('读取版本信息异常', e);
@@ -3123,6 +3228,7 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
     }
 
     async function checkUpdate(interactive = false) {
+        if (customerReleaseMode) return;
         if (interactive && checkUpdateBtn) {
             checkUpdateBtn.disabled = true;
             checkUpdateBtn.querySelector('span').textContent = '检查中...';
@@ -3226,6 +3332,7 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
     }
 
     async function applyUpdate() {
+        if (customerReleaseMode) return;
         if (isUpgrading) return;
         if (!confirm('确定立即升级系统吗？\n升级过程中将拉取最新核心代码并平滑重载后台服务。')) return;
 
@@ -3306,10 +3413,12 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
     });
 
     // 初始化加载
-    loadVersionInfo();
-    // 页面加载后 1.5 秒自动进行一次静默检查
-    setTimeout(() => checkUpdate(false), 1500);
-    // 每 15 分钟静默检测一次新版本
-    dashboardRuntime.startPoll(() => checkUpdate(false), 900000, { global: true, backoff: true });
+    loadVersionInfo().then(() => {
+        if (customerReleaseMode) return;
+        // 页面加载后 1.5 秒自动进行一次静默检查
+        setTimeout(() => checkUpdate(false), 1500);
+        // 每 15 分钟静默检测一次新版本
+        dashboardRuntime.startPoll(() => checkUpdate(false), 900000, { global: true, backoff: true });
+    });
 })();
 

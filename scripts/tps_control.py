@@ -300,7 +300,8 @@ def _scan_heartbeats(r) -> List[dict]:
     return out
 
 
-def _role_status(r, role: str) -> dict:
+def _role_status(r, role: str, *, read_only: bool = False) -> dict:
+    """Return a role's state, preserving stale records for read-only callers."""
     key = CONTROL_WORKER_KEY if role == "worker" else CONTROL_DISCOVER_KEY
     saved = _read_control(r, key)
     procs = find_role_pids(role)
@@ -309,7 +310,7 @@ def _role_status(r, role: str) -> dict:
     if saved_pid and saved_pid not in pids and _owned_process(saved, "distributed_worker.py" if role == "worker" else "discover.py"):
         pids.append(saved_pid)
     running = bool(pids)
-    if not running and saved:
+    if not running and saved and not read_only:
         r.delete(key)
         saved = {}
     status = {
@@ -350,7 +351,7 @@ def _role_status(r, role: str) -> dict:
         status["pause_remaining_sec"] = pause_remaining
     else:
         beat = _loads(r.get(HB_DISCOVER_KEY)) or {}
-        if beat and not running:
+        if beat and not running and not read_only:
             clear_discover_heartbeat(r)
             beat = {}
         status["heartbeat"] = beat
@@ -870,7 +871,8 @@ def cluster_status(r) -> dict:
     }
 
 
-def pipeline_status(r) -> dict:
+def pipeline_status(r, *, read_only: bool = False) -> dict:
+    """Report pipeline state without mutating legacy queue records when requested."""
     queue = queue_stats(r)
     try:
         discover_pending = _as_int(r.llen(DISCOVER_PENDING))
@@ -889,7 +891,8 @@ def pipeline_status(r) -> dict:
     coverage = {}
     try:
         from tps_coverage import coverage_snapshot, migrate_seen_to_queued
-        migrate_seen_to_queued(r)
+        if not read_only:
+            migrate_seen_to_queued(r)
         coverage = coverage_snapshot(r)
     except Exception as exc:
         coverage = {"error": str(exc)}
@@ -908,8 +911,8 @@ def pipeline_status(r) -> dict:
         "discover_pending": discover_pending,
         "discover_seen": discover_seen,
         "discover_dirs": discover_dirs,
-        "worker": _role_status(r, "worker"),
-        "discover": _role_status(r, "discover"),
+        "worker": _role_status(r, "worker", read_only=read_only),
+        "discover": _role_status(r, "discover", read_only=read_only),
         "cluster": cluster_status(r),
         "jobs": peek_processing(r, 20),
         "dlq_jobs": peek_dlq(r, 8),

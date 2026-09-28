@@ -18,18 +18,30 @@ ALERT_COOLDOWN_SEC = 300
 _LAST_ALERT_TIMES: Dict[str, float] = {}
 
 
+def _customer_release_mode() -> bool:
+    """Customer dashboard launches must not initiate external notifications."""
+    return os.environ.get("TPS_RELEASE_MODE", "").strip().casefold() == "customer"
+
+
 def send_alert(
     title: str,
     message: str,
     level: str = "WARNING",
     webhook_url: Optional[str] = None,
     force: bool = False,
+    outbound_enabled: Optional[bool] = None,
 ) -> bool:
     """
     发送告警通知。
     webhook_url 默认读取环境变量 TPS_ALERT_WEBHOOK。
     level 可选: INFO, WARNING, ERROR, CRITICAL
     """
+    # This check deliberately happens before URL selection, payload creation,
+    # throttling, or network setup.  An explicit URL and force=True cannot
+    # bypass the customer-release boundary.
+    if outbound_enabled is False or _customer_release_mode():
+        return False
+
     url = (webhook_url or os.environ.get("TPS_ALERT_WEBHOOK", "")).strip()
     if not url:
         # 未配置 Webhook 时静默返回，仅打印日志

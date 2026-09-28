@@ -24,16 +24,33 @@ import time
 from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
-from flask import Flask, Response, g, jsonify, make_response, request, send_file
-import mysql.connector
-from werkzeug.exceptions import HTTPException
 
-# 仓库根目录与 scripts/（tps_metrics / tps_queue）
+# Repository configuration needs to be available before importing application
+# dependencies or evaluating their module-level runtime settings.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts")
 _SCRIPTS_DIR = os.path.normpath(_SCRIPTS_DIR)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
+
+from tps_env import (
+    customer_release_mode as _environment_customer_release_mode,
+    dashboard_port,
+    load_project_env,
+    release_launch_token,
+)
+
+# Customer mode is determined from the process that launched this dashboard,
+# not from an editable .env file.  Its file input is consequently restricted
+# to local DB/Redis/dashboard-port values before Flask or database imports.
+load_project_env(
+    _REPO_ROOT,
+    customer_safe=_environment_customer_release_mode(os.environ),
+)
+
+from flask import Flask, Response, g, jsonify, make_response, request, send_file
+import mysql.connector
+from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__, static_folder=None)
 
@@ -82,12 +99,19 @@ def _load_runtime_config(environ):
     }
     dashboard = {
         "host": _loopback_host(environ.get("TPS_DASHBOARD_HOST", "127.0.0.1"), "TPS_DASHBOARD_HOST"),
-        "port": _config_port(environ, "TPS_DASHBOARD_PORT", 5001),
+        "port": dashboard_port(environ),
     }
     return database, redis, dashboard
 
 
 TIDB_CONFIG, REDIS_CONFIG, DASHBOARD_CONFIG = _load_runtime_config(os.environ)
+
+
+def _customer_release_mode() -> bool:
+    """Whether this dashboard was started through the restricted customer path."""
+    return _environment_customer_release_mode(os.environ)
+
+
 READINESS_TIMEOUT_SEC = 3
 DB_CONNECT_TIMEOUT_SEC = 3
 DB_IO_TIMEOUT_SEC = 30
@@ -562,9 +586,25 @@ def _load_stats():
 
 @app.route("/")
 def index():
-    """返回前端页面"""
+    """Return the dashboard shell with a non-secret customer-mode bootstrap."""
     html_path = os.path.join(os.path.dirname(__file__), "dashboard.html")
-    resp = make_response(send_file(html_path))
+    if _customer_release_mode():
+        try:
+            document = Path(html_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return _internal_error()
+        # The mode marker is deliberately not a capability or launch token. It
+        # lets the browser reject control hashes before it makes any page-level
+        # API request; the server remains the enforcement boundary.
+        document = document.replace(
+            "<head>",
+            '<head><script>window.__TPS_RELEASE_MODE__="customer";</script>',
+            1,
+        )
+        resp = make_response(document)
+        resp.mimetype = "text/html"
+    else:
+        resp = make_response(send_file(html_path))
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -771,6 +811,36 @@ def _require_local_browser_origin():
                 raise ValueError("invalid origin")
     except (TypeError, ValueError):
         return jsonify({"ok": False, "error": "仅允许从当前本机页面访问"}), 403
+    return None
+
+
+@app.before_request
+def _restrict_customer_release_actions():
+    """Keep the customer launcher local and view-only even after the UI loads."""
+    if not _customer_release_mode():
+        return None
+    customer_control_prefixes = (
+        "/api/pipeline",
+        "/api/proxy",
+        "/api/cluster",
+        "/api/batch100",
+    )
+    is_control_surface = any(
+        request.path == prefix or request.path.startswith(prefix + "/")
+        for prefix in customer_control_prefixes
+    )
+    if is_control_surface:
+        return jsonify({
+            "ok": False,
+            "code": "customer_release_control_surface_disabled",
+            "error": "客户离线发布模式不提供采集、代理或集群控制页面。",
+        }), 403
+    if request.method not in ("GET", "HEAD", "OPTIONS") or request.path == "/api/system/check-update":
+        return jsonify({
+            "ok": False,
+            "code": "customer_release_read_only",
+            "error": "客户离线发布模式仅支持本机只读查看；后台控制、代理测试和在线更新已禁用。",
+        }), 403
     return None
 
 
@@ -1174,7 +1244,7 @@ def api_metrics():
     return jsonify(payload)
 
 
-def _pipeline_payload():
+def _pipeline_payload(*, read_only: bool = False):
     r = get_redis()
     if r is None:
         return {
@@ -1199,7 +1269,7 @@ def _pipeline_payload():
         }
 
     from tps_control import pipeline_status
-    payload = pipeline_status(r)
+    payload = pipeline_status(r, read_only=read_only)
     try:
         row = query_one("SELECT COUNT(*) AS n FROM persons")
         payload["persons"] = _as_int((row or {}).get("n"))
@@ -1248,7 +1318,7 @@ def _pipeline_payload():
 def api_pipeline():
     """抓取开关状态、队列进度、当前任务。"""
     try:
-        return jsonify(_pipeline_payload())
+        return jsonify(_pipeline_payload(read_only=_customer_release_mode()))
     except Exception:
         return _internal_error(redis_ok=False)
 
@@ -1703,11 +1773,24 @@ def api_cluster_control():
 @app.route("/api/system/version", methods=["GET"])
 def system_version():
     """获取当前系统运行版本、Git 状态与更新配置"""
+    customer_release = _customer_release_mode()
+    launch_token = None
+    if customer_release:
+        launch_token = release_launch_token(os.environ)
+        if launch_token is None:
+            # Do not disclose an invalid/missing value.  The customer launcher
+            # uses this exact response to distinguish a new local process from
+            # an unrelated service occupying the configured loopback port.
+            return jsonify({
+                "ok": False,
+                "code": "customer_release_launch_token_unavailable",
+                "error": "客户发布启动校验令牌不可用",
+            }), 503
     try:
         import tps_version
         local_info = tps_version.read_local_version_info()
         git_info = tps_version.get_git_status()
-        return jsonify({
+        payload = {
             "ok": True,
             "version": local_info.get("version", "1.0.0"),
             "build": local_info.get("build", ""),
@@ -1716,7 +1799,11 @@ def system_version():
             "name": local_info.get("name", "TruePeopleSearch Enterprise Intelligence"),
             "release_notes": local_info.get("release_notes", []),
             "git": git_info,
-        })
+            "release_mode": "customer" if customer_release else "standard",
+        }
+        if launch_token is not None:
+            payload["launch_token"] = launch_token
+        return jsonify(payload)
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
@@ -1873,6 +1960,11 @@ def _build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=_port_argument, default=DASHBOARD_CONFIG["port"], help="启动端口 (默认 5001，可通过 TPS_DASHBOARD_PORT 配置)")
     parser.add_argument("--host", type=_host_argument, default=DASHBOARD_CONFIG["host"], help="监听地址 (仅 127.0.0.1、::1、localhost)")
+    parser.add_argument(
+        "--strict-port",
+        action="store_true",
+        help="端口被占用时失败，不自动切换到其他端口",
+    )
     return parser
 
 
@@ -1881,7 +1973,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     try:
-        actual_port = find_available_port(args.host, args.port)
+        actual_port = find_available_port(
+            args.host,
+            args.port,
+            max_attempts=1 if args.strict_port else 20,
+        )
     except (ValueError, RuntimeError) as exc:
         parser.exit(1, f"[错误] {exc}\n")
     if actual_port != args.port:

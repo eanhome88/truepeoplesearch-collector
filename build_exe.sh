@@ -17,11 +17,11 @@ echo "  正在交叉编译 Windows 原生 PE 64位 EXE 客户端..."
 echo "============================================================"
 
 # 1. 编译带控制台主启动器 (支持实时输出和安全退出)
-GOOS=windows GOARCH=amd64 "${GO_CMD}" build -ldflags="-s -w" -o TruePeopleSearch.exe launcher/main.go
+GOOS=windows GOARCH=amd64 "${GO_CMD}" build -ldflags="-s -w" -o TruePeopleSearch.exe launcher/main.go launcher/process_windows.go
 echo "  ✅ TruePeopleSearch.exe 编译完成"
 
 # 2. 编译纯后台无黑窗版本 (GUI子系统，双击静默启动并打开浏览器)
-GOOS=windows GOARCH=amd64 "${GO_CMD}" build -ldflags="-s -w -H windowsgui" -o TruePeopleSearch_后台无窗启动.exe launcher/main.go
+GOOS=windows GOARCH=amd64 "${GO_CMD}" build -ldflags="-s -w -H windowsgui" -o TruePeopleSearch_后台无窗启动.exe launcher/main.go launcher/process_windows.go
 echo "  ✅ TruePeopleSearch_后台无窗启动.exe 编译完成"
 
 # 3. 编译一键停止器
