@@ -316,8 +316,11 @@ def parse_person_lean(page, url: str) -> dict:
     data["phone_numbers"] = parsed_phones
 
     if parsed_phones:
-        # 1. 电话列表 (逗号拼接所有捕获的号码)
-        data["all_phones"] = ", ".join(p["phone_number"] for p in parsed_phones if p.get("phone_number"))
+        # 1. 电话列表 (逗号拼接所有捕获的号码，附带线路类型)
+        data["all_phones"] = ", ".join(
+            f"{p['phone_number']} ({p.get('line_type') or 'Wireless'})"
+            for p in parsed_phones if p.get("phone_number")
+        )
 
         # 2. 无线号码排序 (按最后报告时间倒序，最近的排在最前面)
         def _date_sort_key(p):

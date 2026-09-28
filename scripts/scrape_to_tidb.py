@@ -26,8 +26,8 @@ from scrapling.fetchers import StealthyFetcher
 # TiDB 连接配置 — 改成你自己的
 # ============================================================
 TIDB_CONFIG = {
-    "host": "127.0.0.1",      # 本地 TiDB 或 TiDB Cloud 地址
-    "port": 4000,              # TiDB 默认端口
+    "host": "127.0.0.1",
+    "port": 4000,
     "user": "root",
     "password": "",
     "database": "people_search",
@@ -172,15 +172,17 @@ def extract_phone_numbers(text: str) -> list:
     """
     无死角提取 Phone Numbers 区域全部电话、类型、主号标记、运营商、最后报告日期
     """
+    if not text:
+        return []
+
+    # 1. 定位电话区域（兼容单复数 Phone Number / Phone Numbers 及各类后置分节符）
     phone_section = re.search(
-        r"Phone Numbers.*?(?:Email Addresses|Current Address Property Details|Previous Addresses|Possible Relatives|$)",
+        r"Phone Numbers?.*?(?:Email Addresses|Current Address Property Details|Previous Addresses|Possible Relatives|Possible Associates|Businesses|Associated Names|Online Profiles|$)",
         text,
         re.DOTALL | re.IGNORECASE,
     )
-    if not phone_section:
-        return []
+    section_text = phone_section.group() if phone_section else text
 
-    section_text = phone_section.group()
     phone_regex = re.compile(r"(?:\+?1[-.\s]*)?\(?([2-9]\d{2})\)?[-.\s]*([2-9]\d{2})[-.\s]*(\d{4})")
     matches = list(phone_regex.finditer(section_text))
     if not matches:
@@ -200,13 +202,15 @@ def extract_phone_numbers(text: str) -> list:
 
         # 1. 线路类型: Wireless / Landline / Landline/Services / VoIP
         type_match = re.search(r"\b(Wireless|Landline(?:/Services)?|VoIP|Voip)\b", block, re.IGNORECASE)
-        line_type = "Wireless" if not type_match else type_match.group(1)
-        if line_type.lower() == "voip":
-            line_type = "Voip"
-        elif line_type.lower() == "wireless":
-            line_type = "Wireless"
-        elif "landline" in line_type.lower():
-            line_type = "Landline/Services" if "services" in line_type.lower() else "Landline"
+        line_type = "Wireless"
+        if type_match:
+            lt = type_match.group(1).lower()
+            if lt == "voip":
+                line_type = "Voip"
+            elif lt == "wireless":
+                line_type = "Wireless"
+            elif "landline" in lt:
+                line_type = "Landline/Services" if "services" in lt else "Landline"
 
         # 2. 是否主号
         is_primary = bool(re.search(r"Possible\s+Primary", block, re.IGNORECASE))
@@ -217,19 +221,32 @@ def extract_phone_numbers(text: str) -> list:
         if date_match:
             last_reported = parse_date(f"{date_match.group(1)} {date_match.group(2)}")
 
-        # 4. 运营商提取（排除电话本身、类型、Last reported 等关键词）
-        cleaned_block = block
-        cleaned_block = phone_regex.sub("", cleaned_block)
-        cleaned_block = re.sub(r"\b(Wireless|Landline(?:/Services)?|VoIP|Voip)\b", "", cleaned_block, flags=re.I)
-        cleaned_block = re.sub(r"Possible\s+Primary", "", cleaned_block, flags=re.I)
-        cleaned_block = re.sub(r"Last\s+reported\s+[A-Za-z]+\s+\d{4}", "", cleaned_block, flags=re.I)
-        cleaned_block = re.sub(r"Phone Numbers", "", cleaned_block, flags=re.I)
-        cleaned_block = re.sub(r"[-–—|]", " ", cleaned_block)
+        # 4. 运营商提取（逐行过滤，保留完整运营商名称，避免误伤与残余词干扰）
+        lines = [l.strip() for l in block.splitlines() if l.strip()]
+        carrier_candidates = []
+        for line in lines:
+            if phone_regex.search(line):
+                rem = phone_regex.sub("", line)
+                rem = re.sub(r"\b(Wireless|Landline(?:/Services)?|VoIP|Voip)\b", "", rem, flags=re.I)
+                rem = re.sub(r"Possible\s+Primary", "", rem, flags=re.I)
+                rem = re.sub(r"[-–—|\s]+", " ", rem).strip()
+                if rem and rem.lower() not in ("phone", "phones", "primary phone") and len(rem) > 2:
+                    carrier_candidates.append(rem)
+                continue
+            if re.match(r"^Phone Numbers?$", line, re.I):
+                continue
+            if re.search(r"Last\s+reported", line, re.I):
+                continue
+            norm = re.sub(r"\b(Wireless|Landline(?:/Services)?|VoIP|Voip)\b", "", line, flags=re.I)
+            norm = re.sub(r"Possible\s+Primary", "", norm, flags=re.I)
+            norm = re.sub(r"[-–—|\s]+", " ", norm).strip().lower()
+            if not norm or norm in ("possible primary", "possible primary phone", "primary phone", "phone", "phones"):
+                continue
 
-        carrier_candidates = [
-            line.strip() for line in cleaned_block.splitlines()
-            if line.strip() and not line.strip().startswith("(") and len(line.strip()) > 1
-        ]
+            clean_cand = re.sub(r"^[-–—|\s]+|[-–—|\s]+$", "", line).strip()
+            if clean_cand and not clean_cand.startswith("(") and len(clean_cand) > 1:
+                carrier_candidates.append(clean_cand)
+
         carrier = carrier_candidates[0] if carrier_candidates else None
         if carrier:
             carrier = re.sub(r"\s+", " ", carrier).strip()
@@ -414,8 +431,11 @@ def parse_person(page, url: str) -> dict:
     data["phone_numbers"] = parsed_phones
 
     if parsed_phones:
-        # 1. 电话列表 (逗号拼接所有捕获的号码)
-        data["all_phones"] = ", ".join(p["phone_number"] for p in parsed_phones if p.get("phone_number"))
+        # 1. 电话列表 (逗号拼接所有捕获的号码，附带线路类型)
+        data["all_phones"] = ", ".join(
+            f"{p['phone_number']} ({p.get('line_type') or 'Wireless'})"
+            for p in parsed_phones if p.get("phone_number")
+        )
 
         # 2. 无线号码排序 (按最后报告时间倒序，最近的排在最前面)
         def _date_sort_key(p):
