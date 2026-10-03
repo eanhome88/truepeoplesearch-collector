@@ -43,6 +43,7 @@ APP_ALLOWLIST = (
     "deploy/windows-full/README.md",
     "deploy/windows-full/Start-Stack.ps1",
     "deploy/windows-full/Start-Collector.ps1",
+    "deploy/windows-full/Start-Customer.ps1",
     "deploy/windows-full/Stop-Collector.ps1",
     "deploy/windows-full/Stop-Stack.ps1",
     "deploy/windows-full/Test-FullBundle.ps1",

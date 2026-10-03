@@ -91,6 +91,18 @@ python scripts\package_windows_full_bundle.py `
 
 需同时停止基础服务时，显式增加 `-StopInfrastructure`。该操作不删除数据卷、队列、日志或备份。
 
+## 一键启动（推荐给客户）
+
+环境装好后，客户日常只需要一个脚本：按顺序拉起基础栈和采集，全中文提示：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File D:\TruePeopleSearch\app\deploy\windows-full\Start-Customer.ps1
+```
+
+- 基础栈已在跑就跳过，不会重复启动；
+- 没配代理会停下来告诉客户往 `config\runtime.env` 加哪一行，面板不受影响；
+- 只要面板不要采集时加 `-NoCollection`。
+
 ## 采集
 
 基础栈默认只启动安全面板，不启动采集。采集是独立的、已评审的操作，需要客户现场先配好代理再手动启动：
