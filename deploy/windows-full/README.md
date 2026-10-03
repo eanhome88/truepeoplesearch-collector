@@ -91,8 +91,23 @@ python scripts\package_windows_full_bundle.py `
 
 需同时停止基础服务时，显式增加 `-StopInfrastructure`。该操作不删除数据卷、队列、日志或备份。
 
-## 采集边界
+## 采集
 
-Windows 完整包会保留采集源码，但当前只启动安全面板：Windows 版进程启停、身份校验和异常恢复尚未完成专项验收，因此不提供解锁采集按钮的参数。不应手动绕过这个边界。
+基础栈默认只启动安全面板，不启动采集。采集是独立的、已评审的操作，需要客户现场先配好代理再手动启动：
 
-在未确认数据授权、目标站规则、当前限流状态、代理配置和小样本成功率前，不应启动 worker。进程存活、端口可连或 HTTP 200 不等于正常入库；验收时必须分开检查数据库计数、队列状态和实际新增速率。
+1. 先完成上面的 1–7 步，`Test-Stack.ps1` 通过；
+2. 把代理填进 `D:\TruePeopleSearch\config\runtime.env`（至少填 `CLOUDBYPASS_PROXY`、`PROXY_TUNNEL`、`PROXY_FILE` 其中一项；可选 `TPS_CONCURRENCY=1-8`，默认 4）。代理凭据只存在客户本机，永远不会进发布包；
+3. 启动采集：
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File D:\TruePeopleSearch\app\deploy\windows-full\Start-Collector.ps1
+   ```
+
+   该脚本会先确认面板与 MySQL/Redis 健康、代理已配置，再以 `customer-collector` 模式启动 supervisor（只带 worker，不重起面板），进程记录落在 `runtime\collector-process.json`；
+4. 停止采集（队列、数据、日志都保留，基础栈继续跑）：
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File D:\TruePeopleSearch\app\deploy\windows-full\Stop-Collector.ps1
+   ```
+
+在未确认数据授权、目标站规则、当前限流状态、代理配置和小样本成功率前，不应启动采集。进程存活、端口可连或 HTTP 200 不等于正常入库；验收时必须分开检查数据库计数、队列状态和实际新增速率。

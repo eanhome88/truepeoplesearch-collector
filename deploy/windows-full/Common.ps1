@@ -14,7 +14,11 @@ $script:AllowedRuntimeKeys = @(
     'TPS_REDIS_PASSWORD',
     'TPS_DASHBOARD_PORT',
     'TPS_TIMEZONE',
-    'PLAYWRIGHT_BROWSERS_PATH'
+    'PLAYWRIGHT_BROWSERS_PATH',
+    'CLOUDBYPASS_PROXY',
+    'PROXY_TUNNEL',
+    'PROXY_FILE',
+    'TPS_CONCURRENCY'
 )
 
 function Get-NormalizedInstallRoot {
