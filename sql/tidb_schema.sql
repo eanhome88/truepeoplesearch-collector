@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS persons (
     INDEX idx_persons_city (current_city, current_state),
     INDEX idx_persons_age (age),
     INDEX idx_persons_phone (primary_phone),
-    INDEX idx_persons_name_id (full_name, person_id)  -- 面板 keyset 翻页
+    INDEX idx_persons_name_id (full_name, person_id),  -- 面板 keyset 翻页
+    INDEX idx_persons_scraped (scraped_at)  -- 面板“最近抓取”排序
 );
 
 -- 2. 别名表（1:N）

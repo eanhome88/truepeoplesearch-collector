@@ -183,6 +183,7 @@ class MigrationFailureTests(unittest.TestCase):
     COLUMNS = ["first_name", "middle_name", "last_name", "gender", "primary_phone",
                "primary_phone_type", "current_address", "address_duration", "all_phones",
                "wireless_phone_1", "wireless_phone_2", "wireless_phone_3"]
+    INDEXES = ["idx_persons_scraped"]
 
     def setUp(self):
         self.stack = ExitStack()
@@ -200,7 +201,8 @@ class MigrationFailureTests(unittest.TestCase):
         self.cursor = self.second.cursor.return_value
         self.cursor.rowcount = 0
         self.cursor.fetchall.side_effect = [
-            [(name,) for name in self.COLUMNS], [(name,) for name in init_db.REQUIRED_TABLES],
+            [(name,) for name in self.COLUMNS], [(name,) for name in self.INDEXES],
+            [(name,) for name in init_db.REQUIRED_TABLES],
         ]
         self.connect = self.stack.enter_context(mock.patch("mysql.connector.connect", side_effect=[self.first, self.second]))
 
@@ -230,13 +232,31 @@ class MigrationFailureTests(unittest.TestCase):
         init_db.run_init()
 
     def test_column_permission_failure_is_not_swallowed(self):
-        self.cursor.fetchall.side_effect = [[], [(name,) for name in init_db.REQUIRED_TABLES]]
+        self.cursor.fetchall.side_effect = [[], [(name,) for name in self.INDEXES],
+                                            [(name,) for name in init_db.REQUIRED_TABLES]]
         self.error_on("ALTER TABLE", 1142)
         self.assert_failed()
 
     def test_duplicate_column_remains_idempotent(self):
-        self.cursor.fetchall.side_effect = [[], [(name,) for name in init_db.REQUIRED_TABLES]]
+        self.cursor.fetchall.side_effect = [[], [(name,) for name in self.INDEXES],
+                                            [(name,) for name in init_db.REQUIRED_TABLES]]
         self.error_on("ALTER TABLE", 1060)
+        init_db.run_init()
+
+    def test_index_permission_failure_is_not_swallowed(self):
+        self.error_on("ALTER TABLE", 1142)
+        self.cursor.fetchall.side_effect = [
+            [(name,) for name in self.COLUMNS], [],
+            [(name,) for name in init_db.REQUIRED_TABLES],
+        ]
+        self.assert_failed()
+
+    def test_duplicate_index_remains_idempotent(self):
+        self.cursor.fetchall.side_effect = [
+            [(name,) for name in self.COLUMNS], [],
+            [(name,) for name in init_db.REQUIRED_TABLES],
+        ]
+        self.error_on("ALTER TABLE", 1061)
         init_db.run_init()
 
     def test_view_failure_is_not_swallowed(self):

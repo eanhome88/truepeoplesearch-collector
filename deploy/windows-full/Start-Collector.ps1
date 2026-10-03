@@ -193,7 +193,8 @@ catch {
                 [IO.Path]::GetFullPath($candidate.Path) -eq $launchedExecutable
             )
             if ($sameProcess) {
-                Stop-Process -InputObject $candidate -Force -ErrorAction Stop
+                # Tree kill: the supervisor may already have spawned workers.
+                & taskkill /PID ([string]$launchedPid) /T /F | Out-Null
             }
         }
         catch [Microsoft.PowerShell.Commands.ProcessCommandException] {

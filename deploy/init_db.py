@@ -156,7 +156,7 @@ def run_init(cleanup_invalid_records: bool = False):
         conn.commit()
         print(f"  ✅ 成功执行 {executed_count} 条 DDL 建表与索引语句！")
 
-        # 3.1 兼容旧表升级：检查并自动补齐缺失的新列与中文视图
+        # 3.1 兼容旧表升级：检查并自动补齐缺失的新列、新索引与中文视图
         cursor.execute("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'persons'", (dbname,))
         current_cols = set(row[0].lower() for row in cursor.fetchall())
         col_defs = [
@@ -181,6 +181,20 @@ def run_init(cleanup_invalid_records: bool = False):
                 except mysql.connector.Error as alter_err:
                     # A concurrent/idempotent upgrade may have added the column.
                     if alter_err.errno != 1060:  # Duplicate column name
+                        raise
+
+        cursor.execute("SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'persons'", (dbname,))
+        current_indexes = set(row[0].lower() for row in cursor.fetchall())
+        for index_name, index_cols in [
+            ("idx_persons_scraped", "(scraped_at)"),  # 面板“最近抓取”排序，免全表 filesort
+        ]:
+            if index_name.lower() not in current_indexes:
+                try:
+                    cursor.execute(f"ALTER TABLE persons ADD INDEX {index_name} {index_cols};")
+                    print(f"  • 自动迁移补齐索引: `persons`.`{index_name}`")
+                except mysql.connector.Error as alter_err:
+                    # A concurrent/idempotent upgrade may have added the index.
+                    if alter_err.errno != 1061:  # Duplicate key name
                         raise
 
         # 3.2 数据删除不属于默认的幂等建表流程。只有管理员显式确认

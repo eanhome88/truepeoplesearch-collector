@@ -36,10 +36,23 @@ try {
         throw 'Collector process identity does not match; refusing to stop it.'
     }
     if ($PSCmdlet.ShouldProcess("PID $($process.Id)", 'Stop the verified collector supervisor and its worker tree')) {
-        Stop-Process -Id $process.Id -ErrorAction Stop
+        # The supervisor owns worker/feeder child processes: stop the whole
+        # tree, or orphaned workers would keep collecting with no record.
+        $supervisorPidPath = Join-Path $appRoot 'data\supervisor.pid'
+        if (Test-Path -LiteralPath $supervisorPidPath -PathType Leaf) {
+            $supervisorPid = 0
+            try { $supervisorPid = [int](Get-Content -LiteralPath $supervisorPidPath -Raw -Encoding UTF8).Trim() } catch { $supervisorPid = 0 }
+            if ($supervisorPid -ne [int]$record.pid) {
+                throw 'Supervisor PID file does not match the verified collector record; refusing to guess a process target.'
+            }
+        }
+        & taskkill /PID ([string]$process.Id) /T /F | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Collector tree could not be stopped; the process record was kept for review.'
+        }
         $process.WaitForExit(30000)
         if (-not $process.HasExited) {
-            throw 'Collector did not stop within 30 seconds.'
+            throw 'Collector did not stop within 30 seconds; the process record was kept for review.'
         }
         $removeRecord = $true
     }

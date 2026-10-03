@@ -14,6 +14,7 @@ import argparse
 import ast
 import base64
 import csv
+import hashlib
 import io
 import json
 import math
@@ -417,6 +418,27 @@ def query_one(sql, params=None):
         return _clean_row(row) if row else None
     finally:
         cur.close()
+
+
+_response_cache = {}
+_response_cache_lock = threading.Lock()
+
+
+def cached_response(key, ttl_seconds, loader):
+    """进程内短 TTL 缓存：聚合统计在高频刷新下只打一次 DB。"""
+    now = time.monotonic()
+    with _response_cache_lock:
+        hit = _response_cache.get(key)
+        if hit is not None and hit[0] > now:
+            return hit[1]
+    value = loader()
+    with _response_cache_lock:
+        _response_cache[key] = (now + max(ttl_seconds, 1), value)
+        if len(_response_cache) > 512:
+            expired = [k for k, (exp, _) in _response_cache.items() if exp <= now]
+            for k in expired:
+                _response_cache.pop(k, None)
+    return value
 
 
 def try_set_tiflash_read():
@@ -954,10 +976,10 @@ def _disable_api_caching(response):
 
 @app.route("/api/stats")
 def api_stats():
-    """概览统计"""
+    """概览统计（15 秒短缓存：聚合是大表全扫，高频刷新只打一次 DB）。"""
     try:
         try_set_tiflash_read()
-        return jsonify(_load_stats())
+        return jsonify(cached_response("stats:overview", 15, _load_stats))
     except Exception:
         return _internal_error()
 
@@ -1127,13 +1149,22 @@ def api_persons():
         else:
             return _internal_error()
 
-    count_row = query_one(f"SELECT COUNT(*) as cnt FROM persons p {where_sql}", params)
-    total = _as_int((count_row or {}).get("cnt"))
+    def _load_person_counts():
+        # 两次 COUNT(*) 合并为一次全表扫描；翻页/切筛高频触发，15 秒短缓存。
+        row = query_one(
+            f"SELECT COUNT(*) AS cnt, "
+            f"COUNT(CASE WHEN {person_has_wireless_sql()} THEN 1 END) AS wireless "
+            f"FROM persons p {where_sql}",
+            params,
+        ) or {}
+        return {"total": _as_int(row.get("cnt")), "with_wireless": _as_int(row.get("wireless"))}
 
-    wireless_where = list(where) + [person_has_wireless_sql()]
-    wireless_where_sql = "WHERE " + " AND ".join(wireless_where)
-    wireless_row = query_one(f"SELECT COUNT(*) as cnt FROM persons p {wireless_where_sql}", params)
-    with_wireless = _as_int((wireless_row or {}).get("cnt"))
+    cache_fingerprint = hashlib.sha256(
+        (where_sql + "\x00" + json.dumps(params, sort_keys=True, default=str)).encode("utf-8")
+    ).hexdigest()
+    counts = cached_response(f"persons:counts:{cache_fingerprint}", 15, _load_person_counts)
+    total = counts["total"]
+    with_wireless = counts["with_wireless"]
 
     return jsonify({
         "data": rows,
@@ -1279,10 +1310,10 @@ def api_person_detail(person_id):
 
 @app.route("/api/cities")
 def api_cities():
-    """Top 城市分布"""
+    """Top 城市分布（60 秒缓存：全表 GROUP BY，分布变化慢）"""
     try:
         try_set_tiflash_read()
-        rows = query(f"""
+        return jsonify(cached_response("dist:cities", 60, lambda: query(f"""
             SELECT current_city as city, current_state as state,
                    COUNT(*) as cnt
             FROM persons p
@@ -1290,18 +1321,17 @@ def api_cities():
             GROUP BY current_city, current_state
             ORDER BY cnt DESC
             LIMIT 20
-        """)
-        return jsonify(rows)
+        """)))
     except Exception:
         return _internal_error()
 
 
 @app.route("/api/age-distribution")
 def api_age_dist():
-    """年龄分布"""
+    """年龄分布（60 秒缓存：全表 GROUP BY，分布变化慢）"""
     try:
         try_set_tiflash_read()
-        rows = query(f"""
+        return jsonify(cached_response("dist:age", 60, lambda: query(f"""
             SELECT
                 CASE
                     WHEN age < 20 THEN '0-19'
@@ -1317,8 +1347,7 @@ def api_age_dist():
             WHERE age IS NOT NULL AND {person_has_phone_sql()}
             GROUP BY age_group
             ORDER BY age_group
-        """)
-        return jsonify(rows)
+        """)))
     except Exception:
         return _internal_error()
 
@@ -1329,6 +1358,10 @@ def api_search():
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify({"persons": [], "phones": [], "emails": []})
+    if len(q) < 2:
+        # 单字符 LIKE '%x%' 会全表扫描，大表上直接拒绝，引导用户多输一位。
+        return jsonify({"persons": [], "phones": [], "emails": [],
+                        "hint": "至少输入 2 个字符再搜索"})
 
     try:
         try:
