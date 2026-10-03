@@ -195,6 +195,27 @@ class WindowsReleasePackagerTests(unittest.TestCase):
         self.addCleanup(archive.close)
         self.assertTrue(manifest["source_dirty"])
 
+    def test_allowlisted_source_with_credentials_is_rejected_before_archive(self) -> None:
+        packager.scan_release_text(
+            "deploy/.env.example", b"TPS_DB_PASSWORD=\nTPS_DB_NAME=people_search\n"
+        )
+        dashboard_source = self.repo / "tools" / "dashboard-app.js"
+        legacy = bytes.fromhex("747073313233343536")
+        leaked_sources = (
+            b"const proxy = 'http://real-user:real-secret@proxy.provider.test:9000';\n",
+            b"const oldDbPassword = '" + legacy + b"';\n",
+        )
+        for index, contents in enumerate(leaked_sources):
+            with self.subTest(index=index):
+                dashboard_source.write_bytes(contents)
+                output = self.output_dir / f"secret-{index}.zip"
+                with self.assertRaisesRegex(packager.ReleaseError, "forbidden"):
+                    packager.create_release(
+                        repo_root=self.repo, output=output, exe_dir=self.exe_dir,
+                        allow_dirty=True,
+                    )
+                self.assertFalse(output.exists())
+
     def test_missing_reviewed_executable_fails_before_creating_archive(self) -> None:
         (self.exe_dir / packager.REQUIRED_WINDOWS_EXECUTABLES[0]).unlink()
         output = self.output_dir / "missing-exe.zip"

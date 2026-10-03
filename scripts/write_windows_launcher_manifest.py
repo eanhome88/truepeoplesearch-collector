@@ -112,7 +112,7 @@ def _validate_windows_amd64_pe(path: Path, filename: str) -> None:
         raise ManifestError(f"Windows executable is not a 64-bit AMD64 PE file: {filename}")
 
 
-def create_manifest(repo_root: Path, exe_dir: Path, *, overwrite: bool = False) -> Path:
+def create_manifest(repo_root: Path, exe_dir: Path, *, overwrite: bool = False, allow_dirty: bool = False) -> Path:
     root = repo_root.resolve()
     directory = exe_dir.resolve()
     if not directory.is_dir():
@@ -120,7 +120,7 @@ def create_manifest(repo_root: Path, exe_dir: Path, *, overwrite: bool = False) 
     _ensure_artifact_directory_is_external(root, directory)
     if _git(root, "rev-parse", "--is-inside-work-tree") != "true":
         raise ManifestError("release source must be a Git working tree")
-    if _git(root, "status", "--porcelain=v1", "--untracked-files=all"):
+    if not allow_dirty and _git(root, "status", "--porcelain=v1", "--untracked-files=all"):
         raise ManifestError("refusing to record launchers from a dirty source tree")
     commit = _git(root, "rev-parse", "HEAD")
     if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit.casefold()):
@@ -143,6 +143,8 @@ def create_manifest(repo_root: Path, exe_dir: Path, *, overwrite: bool = False) 
         "target": "windows-amd64",
         "files": files,
     }
+    if allow_dirty:
+        payload["dirty"] = True
     temporary_path: Optional[Path] = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -171,9 +173,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--allow-dirty", action="store_true")
     args = parser.parse_args(argv)
     try:
-        output = create_manifest(args.repo_root, args.exe_dir, overwrite=args.overwrite)
+        output = create_manifest(args.repo_root, args.exe_dir, overwrite=args.overwrite, allow_dirty=args.allow_dirty)
     except (ManifestError, OSError) as exc:
         print(f"launcher manifest failed: {exc}", file=sys.stderr)
         return 2

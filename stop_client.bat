@@ -7,7 +7,9 @@ echo ============================================================
 
 set "PYTHON_EXE=%~dp0.venv\Scripts\python.exe"
 if not exist "%PYTHON_EXE%" (
-    set "PYTHON_EXE=python"
+    echo [ERROR] The local Python environment is missing. No process was stopped.
+    pause
+    exit /b 1
 )
 
 "%PYTHON_EXE%" "%~dp0scripts\tps_supervisor.py" stop --dashboard-only

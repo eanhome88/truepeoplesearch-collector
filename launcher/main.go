@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -51,6 +52,7 @@ func findPython(rootDir string) string {
 var customerEnvironmentExcluded = map[string]struct{}{
 	"TPS_RELEASE_MODE":         {},
 	"TPS_RELEASE_LAUNCH_TOKEN": {},
+	"TPS_LOCAL_AUTH_REQUIRED":  {},
 	"TPS_ALERT_WEBHOOK":        {},
 	"TPS_UPDATE_CHECK_URL":     {},
 	"PROXY_TUNNEL":             {},
@@ -74,6 +76,7 @@ func customerReleaseEnvironment(parent []string, launchToken string) []string {
 		filtered = append(filtered, entry)
 	}
 	filtered = append(filtered, "TPS_RELEASE_MODE=customer")
+	filtered = append(filtered, "TPS_LOCAL_AUTH_REQUIRED=1")
 	if launchToken != "" {
 		filtered = append(filtered, "TPS_RELEASE_LAUNCH_TOKEN="+launchToken)
 	}
@@ -112,11 +115,25 @@ func customerDashboardIdentityMatches(dashboardURL, launchToken string) bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
 	defer cancel()
+	client := &http.Client{Timeout: 800 * time.Millisecond}
+	unauthenticated, err := http.NewRequestWithContext(ctx, http.MethodGet, dashboardURL+"/api/system/version", nil)
+	if err != nil {
+		return false
+	}
+	denied, err := client.Do(unauthenticated)
+	if err != nil {
+		return false
+	}
+	_ = denied.Body.Close()
+	if denied.StatusCode != http.StatusUnauthorized {
+		return false
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, dashboardURL+"/api/system/version", nil)
 	if err != nil {
 		return false
 	}
-	response, err := (&http.Client{Timeout: 800 * time.Millisecond}).Do(request)
+	request.Header.Set("Authorization", "Bearer "+launchToken)
+	response, err := client.Do(request)
 	if err != nil {
 		return false
 	}
@@ -132,7 +149,11 @@ func customerDashboardIdentityMatches(dashboardURL, launchToken string) bool {
 	if err := json.NewDecoder(io.LimitReader(response.Body, 64*1024)).Decode(&payload); err != nil {
 		return false
 	}
-	return payload.OK && payload.ReleaseMode == "customer" && payload.LaunchToken == launchToken
+	return payload.OK && payload.ReleaseMode == "customer" && payload.LaunchToken == ""
+}
+
+func customerBrowserURL(dashboardURL, launchToken string) string {
+	return dashboardURL + "/#access_token=" + url.QueryEscape(launchToken)
 }
 
 func startDocker(rootDir string) {
@@ -174,18 +195,29 @@ func syncGitUpdate(rootDir string) {
 	}
 }
 
-func openBrowser(url string) {
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.Command("cmd", "/c", "start", url)
-	} else if runtime.GOOS == "darwin" {
-		cmd = exec.Command("open", url)
-	} else {
-		cmd = exec.Command("xdg-open", url)
+func openBrowserWithRunner(platform, targetURL string, run func(string, ...string) error) error {
+	name := "xdg-open"
+	args := []string{targetURL}
+	if platform == "windows" {
+		name = "cmd"
+		args = []string{"/c", "start", "", targetURL}
+	} else if platform == "darwin" {
+		name = "open"
 	}
-	if err := cmd.Start(); err == nil {
-		go func() { _ = cmd.Wait() }()
+	if err := run(name, args...); err != nil {
+		// The launch URL contains a bearer capability. Never wrap a command error
+		// because its text could include that URL and leak the token to logs.
+		return errors.New("默认浏览器未能打开")
 	}
+	return nil
+}
+
+func openBrowser(targetURL string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return openBrowserWithRunner(runtime.GOOS, targetURL, func(name string, args ...string) error {
+		return exec.CommandContext(ctx, name, args...).Run()
+	})
 }
 
 // A platform guard owns only this launcher's child process tree. In particular,
@@ -385,15 +417,20 @@ func main() {
 		return
 	}
 
-	if ready {
-		fmt.Printf("  [3/4] 控制台端口已响应，正在打开: %s\n", dashboardURL)
-		openBrowser(dashboardURL)
-	} else {
-		fmt.Printf("  ⚠️ 控制台尚未就绪，请查看日志；地址: %s\n", dashboardURL)
+	if !ready {
+		fmt.Printf("  ❌ 控制台未就绪；本机地址: %s\n", dashboardURL)
+		fmt.Println("  请检查本地服务日志与端口配置后重新运行启动器；本次进程会关闭。")
+		return
+	}
+	fmt.Printf("  [3/4] 控制台端口已响应，正在打开: %s\n", dashboardURL)
+	if err := openBrowser(customerBrowserURL(dashboardURL, launchToken)); err != nil {
+		fmt.Printf("  ❌ %s；本机地址: %s\n", err, dashboardURL)
+		fmt.Println("  此地址不含授权令牌，不能直接作为登录链接。请修复默认浏览器后重新运行启动器；本次进程会关闭。")
+		return
 	}
 
 	fmt.Println("============================================================")
-	fmt.Println("  本机控制台已启动；此状态不代表数据库、队列或后台作业已验证。")
+	fmt.Println("  本机控制台已打开；此状态不代表数据库、队列或后台作业已验证。")
 	fmt.Printf("  控制台地址: %s\n", dashboardURL)
 	fmt.Println("------------------------------------------------------------")
 	fmt.Println("  提示: 输入 q 并回车 或按 Ctrl+C 可停止本次启动的进程树。")

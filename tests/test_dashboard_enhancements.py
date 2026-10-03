@@ -2,6 +2,8 @@
 """Unit tests for upgraded Dashboard API (multi-dimensional filters, performance metrics, CSV export)."""
 
 import importlib.util
+import csv
+import io
 import os
 from pathlib import Path
 import unittest
@@ -42,11 +44,12 @@ class DashboardEnhancementTests(unittest.TestCase):
         # Verify conditions
         where_joined = " AND ".join(where)
         self.assertIn("p.full_name LIKE %s", where_joined)
-        self.assertIn("p.primary_phone LIKE %s", where_joined)
+        self.assertIn("REPLACE(COALESCE(p.primary_phone, '')", where_joined)
+        self.assertNotIn("p.all_phones LIKE", where_joined)
         self.assertIn("p.current_city = %s", where_joined)
         self.assertIn("p.current_state = %s", where_joined)
-        self.assertIn("p.primary_phone_type = %s", where_joined)
-        self.assertIn("p.wireless_phone_1 IS NOT NULL", where_joined)
+        self.assertIn(api.person_has_phone_type_sql("Wireless"), where_joined)
+        self.assertIn(api.person_has_wireless_sql(), where_joined)
         self.assertIn("p.age >= %s", where_joined)
         self.assertIn("p.age <= %s", where_joined)
         self.assertEqual(order_sql, "ORDER BY p.full_name ASC, p.person_id ASC")
@@ -54,7 +57,8 @@ class DashboardEnhancementTests(unittest.TestCase):
         # Verify state is capitalized to NJ
         self.assertIn("NJ", params)
         # Verify cleaned phone number digits are passed
-        self.assertIn("%2015551234%", params)
+        self.assertIn("2015551234", params)
+        self.assertIn("12015551234", params)
 
     @patch.object(api, "query_one")
     @patch.object(api, "get_redis")
@@ -87,8 +91,12 @@ class DashboardEnhancementTests(unittest.TestCase):
                     "dedup_hit": 300,
                 },
                 "latency": {
-                    "scrape_ms": {"avg": 42.5},
+                    "scrape_ms": {"count": 1500, "sum": 63750.0, "avg": 42.5},
                 },
+                "metrics_available": True,
+                "metrics_quality": {"status": "valid", "issues": []},
+                "success_rate_pct": 1495 / 1500 * 100,
+                "completion_rate_pct": 1495 / 1500 * 100,
             }
             mock_get_metrics.return_value = mock_metrics_inst
             mock_queue_stats.return_value = {"pending": 50, "processing": 32, "total": 1500}
@@ -105,8 +113,9 @@ class DashboardEnhancementTests(unittest.TestCase):
             self.assertEqual(stats["total_tasks_executed"], 1500)
             self.assertEqual(stats["success_tasks"], 1495)
             self.assertGreaterEqual(stats["success_rate_pct"], 99.0)
-            self.assertGreater(stats["traffic_saved_mb"], 3000.0)
-            self.assertGreater(stats["traffic_saved_gb"], 3.0)
+            self.assertIsNone(stats["traffic_saved_mb"])
+            self.assertIsNone(stats["traffic_saved_gb"])
+            self.assertFalse(stats["traffic_measurement_available"])
             self.assertEqual(stats["avg_latency_ms"], 42.5)
             self.assertEqual(stats["current_qps"], 32.5)
 
@@ -154,6 +163,23 @@ class DashboardEnhancementTests(unittest.TestCase):
         self.assertIn("John Michael Doe", lines[1])
         self.assertIn("(201) 555-1234", lines[1])
         self.assertIn("Wireless", lines[1])
+
+    @patch.object(api, "query")
+    def test_export_escapes_spreadsheet_formula_cells(self, mock_query):
+        mock_query.return_value = [{
+            "人物ID": "p1",
+            "全名": "=2+2",
+            "当前地址": "  +CMD()",
+            "电话列表": "\t@malicious",
+            "年龄": 42,
+        }]
+        response = self.app.get("/api/export")
+        self.assertEqual(response.status_code, 200)
+        rows = list(csv.DictReader(io.StringIO(response.data.decode("utf-8-sig"))))
+        self.assertEqual(rows[0]["全名"], "'=2+2")
+        self.assertEqual(rows[0]["当前地址"], "'  +CMD()")
+        self.assertEqual(rows[0]["电话列表"], "'\t@malicious")
+        self.assertEqual(rows[0]["年龄"], "42")
 
 
 if __name__ == "__main__":

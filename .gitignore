@@ -10,6 +10,8 @@ htmlcov/
 # Virtual environments
 .venv/
 venv/
+pydeps/
+python.path
 env/
 ENV/
 
@@ -51,3 +53,9 @@ data/*.png
 data/*.jpg
 data/*.zip
 data/*.exe
+
+# runtime outputs
+data/batch_out/
+data/supervisor.pid.lock
+data/supervisor.pid.mode.json
+*.sha256

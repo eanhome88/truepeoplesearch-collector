@@ -17,6 +17,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -67,6 +68,7 @@ RUNTIME_SOURCE_ALLOWLIST = (
     "deploy/windows/Test-HostReadiness.ps1",
     "deploy/windows/Verify-Release.ps1",
     "scripts/local_logs.py",
+    "scripts/person_visibility.py",
     "scripts/proxy_pool.py",
     "scripts/tps_alert.py",
     "scripts/tps_control.py",
@@ -84,6 +86,15 @@ RUNTIME_SOURCE_ALLOWLIST = (
     "tools/dashboard.html",
     "tools/dashboard_api.py",
 )
+
+# Keep the old dashboard-only packager from repeating an earlier archive leak.
+# The legacy database value is represented only by a digest, never plaintext.
+LEGACY_DB_CREDENTIAL_SHA256 = "f2c650c373692d5cd0e9a95551be2a8beb4b9367ad9bad84e05006b39c280b75"
+SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?m)^[ \t]*(?:PROXY_TUNNEL|TPS_DB_PASSWORD|TPS_MYSQL_ROOT_PASSWORD|TPS_REDIS_PASSWORD)[ \t]*=[ \t]*['\"]?([^'\"\s#]*)"
+)
+CREDENTIAL_URL_RE = re.compile(r"(?i)(?:https?|socks5?)://([^\s:@/]+):([^\s@/]+)@([^\s/'\"<>]+)")
+PLACEHOLDER_CREDENTIALS = {("user", "pass"), ("username", "password"), ("account", "password"), ("账号", "密码")}
 
 # A path must not be allowed to cross into a stateful or secret-bearing tree,
 # even if a future allowlist edit accidentally names it.  `.env.example` is a
@@ -194,6 +205,35 @@ def _resolve_existing_file(root: Path, archive_path: str, *, label: str) -> Path
     except ValueError as exc:
         raise ReleaseError(f"{label} escapes the repository root: {archive_path}") from exc
     return resolved
+
+
+def scan_release_text(path: str, contents: bytes) -> None:
+    """Reject credential-bearing allowlisted source before hashing or packaging."""
+    if b"\0" in contents:
+        raise ReleaseError(f"allowlisted source contains binary data: {path}")
+    try:
+        text = contents.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ReleaseError(f"allowlisted source is not UTF-8: {path}") from exc
+    if "gate.decodo.com" in text.casefold():
+        raise ReleaseError(f"provider-specific proxy material is forbidden: {path}")
+    if any(
+        hashlib.sha256(token.encode("ascii")).hexdigest() == LEGACY_DB_CREDENTIAL_SHA256
+        for token in re.findall(r"[A-Za-z0-9]{8,}", text.casefold())
+    ):
+        raise ReleaseError(f"known literal database credential is forbidden: {path}")
+    for match in SECRET_ASSIGNMENT_RE.finditer(text):
+        if match.group(1).strip().casefold() not in {"generated_locally", ""}:
+            raise ReleaseError(f"literal runtime secret assignment is forbidden: {path}")
+    for match in CREDENTIAL_URL_RE.finditer(text):
+        user, password, host = (part.casefold() for part in match.groups())
+        hostname = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+        placeholder_host = (
+            hostname in {"example.com", "example.net", "example.org"}
+            or hostname.endswith((".example", ".invalid", ".example.com", ".example.net", ".example.org"))
+        )
+        if (user, password) not in PLACEHOLDER_CREDENTIALS and not placeholder_host:
+            raise ReleaseError(f"embedded authenticated URL is forbidden: {path}")
 
 
 def _validate_windows_amd64_pe(path: Path, filename: str) -> None:
@@ -408,6 +448,7 @@ def _build_release_files(root: Path, exe_dir: Path, commit: str) -> tuple[Releas
     files = []
     for relative in paths:
         source = _resolve_existing_file(root, relative.as_posix(), label="allowlisted source file")
+        scan_release_text(relative.as_posix(), source.read_bytes())
         files.append(
             ReleaseFile(
                 archive_path=relative.as_posix(),

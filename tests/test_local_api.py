@@ -1,6 +1,7 @@
 """Local dashboard infrastructure checks; all service connections are mocked."""
 
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import socket
@@ -53,7 +54,22 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(configured.TIDB_CONFIG["database"], "fixture")
         self.assertEqual(configured.TIDB_CONFIG["user"], "local")
         self.assertEqual(configured.REDIS_CONFIG, {"host": "cache.local", "port": 6333})
-        self.assertEqual(vars(configured._build_parser().parse_args([])), {"host": "::1", "port": 5111})
+        self.assertEqual(
+            vars(configured._build_parser().parse_args([])),
+            {"host": "::1", "port": 5111, "strict_port": False},
+        )
+
+    def test_redis_password_is_shared_by_operational_and_readiness_clients(self):
+        configured = api._load_runtime_config({"TPS_REDIS_PASSWORD": "test-cache-secret"})[1]
+        self.assertEqual(configured["password"], "test-cache-secret")
+        client = MagicMock()
+        with patch.object(api, "REDIS_CONFIG", configured), \
+                patch.object(api, "_redis_client", None), \
+                patch("redis.Redis", return_value=client) as redis:
+            self.assertIs(api.get_redis(), client)
+            self.assertTrue(api._redis_ready())
+        self.assertEqual(redis.call_count, 2)
+        self.assertTrue(all(call.kwargs["password"] == "test-cache-secret" for call in redis.call_args_list))
 
     def test_invalid_ports_never_echo_values(self):
         for name in ("TPS_DB_PORT", "TPS_REDIS_PORT", "TPS_DASHBOARD_PORT"):
@@ -94,6 +110,12 @@ class ConfigurationTests(unittest.TestCase):
                 with patch("sys.stderr"):
                     with self.assertRaises(SystemExit):
                         api._build_parser().parse_args(["--host", host])
+
+    def test_strict_port_option_preserves_the_requested_port(self):
+        args = api._build_parser().parse_args(["--host", "127.0.0.1", "--port", "5100", "--strict-port"])
+        self.assertEqual(args.host, "127.0.0.1")
+        self.assertEqual(args.port, 5100)
+        self.assertTrue(args.strict_port)
 
     def test_invalid_import_bind_fails_before_connections(self):
         with patch.dict(os.environ, {"TPS_DASHBOARD_HOST": "0.0.0.0"}, clear=True), \
@@ -273,9 +295,25 @@ class HealthTests(unittest.TestCase):
             connection.cursor.return_value.close.assert_called_once()
             connection.close.assert_called_once()
 
+    def test_readiness_never_tries_alternate_database_credentials_or_ports(self):
+        configured = dict(api.TIDB_CONFIG, port=4333, password="test-only-secret")
+        with patch.object(api, "TIDB_CONFIG", configured), \
+                patch.object(api.mysql.connector, "connect", side_effect=RuntimeError("unavailable")) as connect, \
+                self.assertRaises(RuntimeError):
+            api.check_local_database_ready()
+        connect.assert_called_once()
+        self.assertEqual(connect.call_args.kwargs["port"], 4333)
+        self.assertEqual(connect.call_args.kwargs["password"], "test-only-secret")
+        self.assertEqual(configured["port"], 4333)
+        self.assertEqual(configured["password"], "test-only-secret")
+
 
 class TargetConsistencyTests(unittest.TestCase):
     def setUp(self):
+        # Control safety tests must never fetch a Git remote to check updates.
+        update_check = patch("tps_version.is_force_update_active", return_value=(False, ""))
+        update_check.start()
+        self.addCleanup(update_check.stop)
         self.client = api.app.test_client()
         self.control = SimpleNamespace(
             start_worker=MagicMock(return_value={"ok": True}),
@@ -293,6 +331,7 @@ class TargetConsistencyTests(unittest.TestCase):
 
     def test_default_targets_are_read_from_worker_source_without_importing_it(self):
         with patch.dict(os.environ, {}, clear=True), \
+                patch.object(api, "TIDB_CONFIG", api._load_runtime_config({})[0]), \
                 patch.dict(sys.modules, {"tps_control": self.control}), \
                 patch.object(api, "get_redis", return_value=MagicMock()) as redis, \
                 patch.object(api, "_pipeline_payload", return_value={}):
@@ -319,6 +358,22 @@ class TargetConsistencyTests(unittest.TestCase):
         redis.assert_not_called()
         for name in ("start_worker", "start_discover", "start_cluster"):
             getattr(self.control, name).assert_not_called()
+
+    def test_tps_redis_override_is_the_shared_background_target(self):
+        env = {
+            "TPS_REDIS_HOST": "cache.local",
+            "TPS_REDIS_PORT": "6380",
+            "REDIS_HOST": "127.0.0.1",
+            "REDIS_PORT": "6379",
+            "TPS_REDIS_PASSWORD": "test-secret",
+        }
+        configured = {"host": "cache.local", "port": 6380, "password": "test-secret"}
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(api, "REDIS_CONFIG", configured), \
+                patch.object(api, "TIDB_CONFIG", api._load_runtime_config({})[0]):
+            for role in ("discover", "worker", "cluster"):
+                with self.subTest(role=role):
+                    self.assertEqual(api._background_target_state(role), "match")
 
     def test_mismatched_dashboard_database_blocks_worker_and_cluster_only(self):
         mismatch = dict(api.TIDB_CONFIG, database="another_database")
@@ -396,6 +451,7 @@ class TargetConsistencyTests(unittest.TestCase):
             getattr(self.control, name).return_value = refused
         self.control.cluster_status.return_value = {"running": True}
         with patch.dict(os.environ, {}, clear=True), \
+                patch.object(api, "TIDB_CONFIG", api._load_runtime_config({})[0]), \
                 patch.object(api, "get_redis", return_value=MagicMock()), \
                 patch.object(api, "_pipeline_payload", return_value={"worker": {"running": True}}), \
                 patch.dict(sys.modules, {"tps_control": self.control}):
@@ -412,6 +468,157 @@ class TargetConsistencyTests(unittest.TestCase):
                             self.assertTrue(response.json["running"])
                         else:
                             self.assertEqual(response.json["worker"], {"running": True})
+
+
+class BatchStatusTests(unittest.TestCase):
+    def setUp(self):
+        self.client = api.app.test_client()
+
+    def test_missing_batch_log_is_idle_not_server_error(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(api, "_BATCH100_LOG", Path(directory) / "missing.log"), \
+                patch.object(api, "_batch100_proc", None), \
+                patch.object(api, "_batch100_last_exit_code", None):
+            response = self.client.get("/api/batch100/status")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["job_status"], "idle")
+        self.assertIsNone(response.json["new_rows"])
+
+    def test_batch_counts_only_machine_verified_rows_and_keeps_exit_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "batch.log"
+            log.write_text(
+                '[99/100] claimed success\n'
+                'TPS_BATCH_PROGRESS {"attempted":3,"verified_present":1,"new_rows":1,"target":100}\n'
+                'TPS_BATCH_RESULT {"attempted":4,"verified_present":1,"new_rows":1,"target":100,"status":"rate_limited"}\n',
+                encoding="utf-8",
+            )
+            finished = SimpleNamespace(pid=42, poll=lambda: 2)
+            with patch.object(api, "_BATCH100_LOG", log), \
+                    patch.object(api, "_batch100_proc", finished), \
+                    patch.object(api, "_batch100_last_exit_code", None):
+                response = self.client.get("/api/batch100/status")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["job_status"], "rate_limited")
+        self.assertEqual(response.json["exit_code"], 2)
+        self.assertEqual(response.json["current"], 4)
+        self.assertEqual(response.json["verified_present"], 1)
+        self.assertEqual(response.json["new_rows"], 1)
+
+    def test_unstructured_success_logs_do_not_become_verified_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "batch.log"
+            log.write_text("[99/100] success\n", encoding="utf-8")
+            finished = SimpleNamespace(pid=42, poll=lambda: 1)
+            with patch.object(api, "_BATCH100_LOG", log), \
+                    patch.object(api, "_batch100_proc", finished), \
+                    patch.object(api, "_batch100_last_exit_code", None):
+                response = self.client.get("/api/batch100/status")
+        self.assertEqual(response.json["job_status"], "failed")
+        self.assertEqual(response.json["current"], 0)
+        self.assertIsNone(response.json["new_rows"])
+
+    def test_completed_result_requires_zero_process_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "batch.log"
+            log.write_text(
+                'TPS_BATCH_RESULT {"attempted":2,"verified_present":2,"new_rows":1,"target":2,"status":"completed"}\n',
+                encoding="utf-8",
+            )
+            with patch.object(api, "_BATCH100_LOG", log), \
+                    patch.object(api, "_batch100_proc", SimpleNamespace(pid=42, poll=lambda: 1)), \
+                    patch.object(api, "_batch100_last_exit_code", None):
+                failed = self.client.get("/api/batch100/status")
+            with patch.object(api, "_BATCH100_LOG", log), \
+                    patch.object(api, "_batch100_proc", SimpleNamespace(pid=42, poll=lambda: 0)), \
+                    patch.object(api, "_batch100_last_exit_code", None):
+                succeeded = self.client.get("/api/batch100/status")
+        self.assertEqual(failed.json["job_status"], "failed")
+        self.assertEqual(succeeded.json["job_status"], "completed")
+        self.assertEqual(succeeded.json["new_rows"], 1)
+
+    def test_partial_result_is_not_a_completed_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "batch.log"
+            log.write_text(
+                'TPS_BATCH_RESULT {"attempted":2,"verified_present":1,"new_rows":0,"target":100,"status":"partial"}\n',
+                encoding="utf-8",
+            )
+            with patch.object(api, "_BATCH100_LOG", log), \
+                    patch.object(api, "_batch100_external_process", return_value=("none", None)), \
+                    patch.object(api, "_batch100_proc", SimpleNamespace(pid=42, poll=lambda: 3)), \
+                    patch.object(api, "_batch100_last_exit_code", None):
+                response = self.client.get("/api/batch100/status")
+        self.assertEqual(response.json["job_status"], "partial")
+        self.assertEqual(response.json["exit_code"], 3)
+        self.assertEqual(response.json["new_rows"], 0)
+
+    def test_concurrent_start_spawns_only_one_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "batch.log"
+            proc = SimpleNamespace(pid=77, poll=lambda: None)
+            with patch.object(api, "_BATCH100_LOG", log), \
+                    patch.object(api, "_batch100_external_process", return_value=("none", None)), \
+                    patch.object(api, "_batch100_proc", None), \
+                    patch.object(api, "_batch100_last_exit_code", None), \
+                    patch.object(api.subprocess, "Popen", return_value=proc) as spawn:
+                def request_start(_):
+                    return api.app.test_client().post("/api/batch100/start", json={"count": 2})
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    responses = list(pool.map(request_start, range(2)))
+                log.write_text("keep last run", encoding="utf-8")
+                repeated = self.client.post("/api/batch100/start", json={"count": 2})
+                self.assertEqual(log.read_text(encoding="utf-8"), "keep last run")
+        self.assertTrue(all(response.status_code == 200 for response in responses))
+        self.assertEqual(repeated.status_code, 200)
+        spawn.assert_called_once()
+
+    def test_orphaned_or_unverifiable_process_fails_closed_before_log_truncation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "batch.log"
+            log.write_text("previous result", encoding="utf-8")
+            for state in (("running", 99), ("unverifiable", None)):
+                with self.subTest(state=state), \
+                        patch.object(api, "_BATCH100_LOG", log), \
+                        patch.object(api, "_batch100_external_process", return_value=state), \
+                        patch.object(api, "_batch100_proc", None), \
+                        patch.object(api, "_batch100_last_exit_code", None), \
+                        patch.object(api.subprocess, "Popen") as spawn:
+                    start = self.client.post("/api/batch100/start", json={"count": 2})
+                    status = self.client.get("/api/batch100/status")
+                    stop = self.client.post("/api/batch100/stop")
+                self.assertEqual(start.status_code, 409)
+                self.assertEqual(start.json["code"], "batch100_process_verification_required")
+                self.assertEqual(status.json["job_status"], "verification_required")
+                self.assertEqual(stop.status_code, 409)
+                self.assertEqual(log.read_text(encoding="utf-8"), "previous result")
+                spawn.assert_not_called()
+
+    def test_stop_keeps_real_child_exit_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc = MagicMock(pid=77)
+            proc.poll.return_value = None
+            proc.wait.return_value = -15
+            with patch.object(api, "_BATCH100_LOG", Path(directory) / "missing.log"), \
+                    patch.object(api, "_batch100_external_process", return_value=("none", None)), \
+                    patch.object(api, "_batch100_proc", proc), \
+                    patch.object(api, "_batch100_last_exit_code", None), \
+                    patch.object(api, "_batch100_stop_requested", False):
+                stopped = self.client.post("/api/batch100/stop")
+                status = self.client.get("/api/batch100/status")
+        self.assertEqual(stopped.status_code, 200)
+        self.assertEqual(stopped.json["exit_code"], -15)
+        self.assertEqual(status.json["job_status"], "stopped")
+        self.assertEqual(status.json["exit_code"], -15)
+        proc.terminate.assert_called_once()
+
+
+class PipelineTruthTests(unittest.TestCase):
+    def test_redis_failure_does_not_fabricate_zero_database_people(self):
+        with patch.object(api, "get_redis", return_value=None):
+            payload = api._pipeline_payload(read_only=True)
+        self.assertIsNone(payload["persons"])
+        self.assertIsNone(payload["database_available"])
 
 
 class BrowserBoundaryTests(unittest.TestCase):
@@ -453,7 +660,7 @@ class BrowserBoundaryTests(unittest.TestCase):
         with patch.object(api, "query_one", return_value=None), patch.object(api, "query", return_value=[]):
             detail = self.client.get("/api/person/fixture")
             search = self.client.get("/api/search?q=fixture")
-        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.status_code, 404)
         self.assertEqual(search.status_code, 200)
         self.assertEqual(detail.headers["Cache-Control"], "no-store")
         self.assertEqual(search.headers["Cache-Control"], "no-store")

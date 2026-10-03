@@ -1,0 +1,48 @@
+{
+  "name": "truepeoplesearch-collector-gui",
+  "version": "2.4.0",
+  "description": "TruePeopleSearch 极速数据采集 Electron 原生客户端",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --win nsis",
+    "dist:mac": "electron-builder --mac"
+  },
+  "keywords": [
+    "crawler",
+    "electron",
+    "collector",
+    "truepeoplesearch"
+  ],
+  "author": "Antigravity Engineering",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.tps.collector",
+    "productName": "TPS采集客户端",
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "electron/assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "files": [
+      "electron/**/*",
+      "package.json"
+    ]
+  }
+}

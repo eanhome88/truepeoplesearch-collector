@@ -9,6 +9,10 @@ from pathlib import Path
 import redis
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(ROOT / "scripts"))
+
+from person_visibility import eligible_phone_type_sql, person_has_phone_sql, usable_phone_sql
 
 def load_env():
     for f in (ROOT / ".env", ROOT / "deploy" / ".env"):
@@ -34,18 +38,18 @@ def get_stats():
             host=os.environ.get("TPS_DB_HOST", "127.0.0.1"),
             port=int(os.environ.get("TPS_DB_PORT", 3306)),
             user=os.environ.get("TPS_DB_USER", "root"),
-            password=os.environ.get("TPS_DB_PASSWORD", "tps123456"),
+            password=os.environ.get("TPS_DB_PASSWORD", ""),
             database=os.environ.get("TPS_DB_NAME", "people_search"),
             connection_timeout=3
         )
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM persons WHERE person_id NOT LIKE 'http%' AND person_id NOT LIKE '%resultphone%'")
+        cur.execute(f"SELECT COUNT(*) FROM persons p WHERE p.person_id NOT LIKE 'http%' AND p.person_id NOT LIKE '%resultphone%' AND {person_has_phone_sql()}")
         db_data["total"] = cur.fetchone()[0]
 
-        cur.execute("SELECT COUNT(DISTINCT person_id) FROM phone_numbers")
+        cur.execute(f"SELECT COUNT(DISTINCT ph.person_id) FROM phone_numbers ph JOIN persons p ON p.person_id=ph.person_id WHERE {person_has_phone_sql()} AND {usable_phone_sql('ph.phone_number')} AND {eligible_phone_type_sql('ph.line_type')}")
         db_data["phones"] = cur.fetchone()[0]
 
-        cur.execute("SELECT COUNT(*) FROM phone_numbers WHERE LOWER(line_type)='wireless'")
+        cur.execute(f"SELECT COUNT(*) FROM phone_numbers ph JOIN persons p ON p.person_id=ph.person_id WHERE LOWER(ph.line_type)='wireless' AND {person_has_phone_sql()} AND {usable_phone_sql('ph.phone_number')}")
         db_data["wireless"] = cur.fetchone()[0]
         conn.close()
     except Exception as e:
@@ -60,6 +64,7 @@ def get_stats():
         r = redis.Redis(
             host=os.environ.get("REDIS_HOST", "127.0.0.1"),
             port=int(os.environ.get("REDIS_PORT", 6379)),
+            password=os.environ.get("TPS_REDIS_PASSWORD") or os.environ.get("REDIS_PASSWORD") or None,
             decode_responses=True,
             socket_timeout=3
         )

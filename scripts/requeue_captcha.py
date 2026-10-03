@@ -9,6 +9,7 @@ delete only those ids from the seen set and feed again.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
@@ -145,8 +146,9 @@ def main() -> int:
         conn.close()
     pending = [person_id for person_id in ids if person_id not in stored]
     r = redis.Redis(
-        host="127.0.0.1",
-        port=6379,
+        host=os.environ.get("REDIS_HOST", "127.0.0.1"),
+        port=int(os.environ.get("REDIS_PORT", "6379")),
+        password=os.environ.get("TPS_REDIS_PASSWORD") or os.environ.get("REDIS_PASSWORD") or None,
         decode_responses=True,
         socket_timeout=10,
         socket_connect_timeout=5,

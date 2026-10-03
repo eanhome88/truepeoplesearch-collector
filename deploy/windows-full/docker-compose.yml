@@ -1,0 +1,66 @@
+name: tps-full
+
+services:
+  mysql:
+    image: tps-offline/mysql:8.4.11-amd64
+    platform: linux/amd64
+    pull_policy: never
+    container_name: tps-full-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: "${TPS_MYSQL_ROOT_PASSWORD:?runtime secret is required}"
+      MYSQL_DATABASE: "${TPS_DB_NAME:-people_search}"
+      MYSQL_USER: "${TPS_DB_USER:-tps_app}"
+      MYSQL_PASSWORD: "${TPS_DB_PASSWORD:?runtime secret is required}"
+      TZ: "${TPS_TIMEZONE:-Asia/Shanghai}"
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-flush-log-at-trx-commit=1
+      - --sync-binlog=1
+      - --log-error=/var/lib/mysql/mysql-error.log
+    ports:
+      - "127.0.0.1:${TPS_DB_PORT:-3306}:3306"
+    volumes:
+      - "${TPS_INSTALL_ROOT:?D drive install root is required}/data/mysql:/var/lib/mysql"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root --password=\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    networks:
+      - tps-local
+
+  redis:
+    image: tps-offline/redis:7.4.8-alpine-amd64
+    platform: linux/amd64
+    pull_policy: never
+    container_name: tps-full-redis
+    restart: unless-stopped
+    environment:
+      TPS_REDIS_PASSWORD: "${TPS_REDIS_PASSWORD:?runtime secret is required}"
+    command:
+      - sh
+      - -c
+      - >-
+        exec redis-server --appendonly yes --appendfsync everysec --dir /data
+        --logfile /data/redis.log --protected-mode yes
+        --requirepass "$$TPS_REDIS_PASSWORD"
+    ports:
+      - "127.0.0.1:${TPS_REDIS_PORT:-6379}:6379"
+    volumes:
+      - "${TPS_INSTALL_ROOT:?D drive install root is required}/data/redis:/data"
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$TPS_REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks:
+      - tps-local
+
+networks:
+  tps-local:
+    name: tps-full-local
+    driver: bridge

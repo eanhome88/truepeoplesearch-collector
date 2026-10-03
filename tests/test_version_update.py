@@ -50,7 +50,14 @@ class VersionInfoTests(unittest.TestCase):
         self.assertTrue(git_info["has_git"])
 
     def test_check_for_updates_local(self):
-        res = tps_version.check_for_updates()
+        with patch.object(tps_version, "get_git_status", return_value={"has_git": False}), \
+                patch.object(tps_version, "read_local_version_info", return_value={"version": "1.0.0"}), \
+                patch.dict(os.environ, {"TPS_UPDATE_CHECK_URL": ""}), \
+                patch.object(tps_version.subprocess, "run") as process, \
+                patch("urllib.request.urlopen") as network:
+            res = tps_version.check_for_updates()
+        process.assert_not_called()
+        network.assert_not_called()
         self.assertIsInstance(res, dict)
         self.assertTrue(res.get("ok"))
         self.assertIn("current_version", res)
@@ -73,7 +80,10 @@ class VersionApiTests(unittest.TestCase):
         self.assertIn("git", data)
 
     def test_api_system_check_update(self):
-        resp = self.client.get("/api/system/check-update")
+        with patch.object(tps_version, "check_for_updates", return_value={
+            "ok": True, "has_update": False, "current_version": "1.0.0",
+        }):
+            resp = self.client.get("/api/system/check-update")
         self.assertEqual(resp.status_code, 200)
         data = resp.get_json()
         self.assertTrue(data.get("ok"))

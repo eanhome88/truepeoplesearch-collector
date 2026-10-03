@@ -26,10 +26,12 @@ class CustomerReleaseModeTests(unittest.TestCase):
         self.env_patch = patch.dict(os.environ, {
             "TPS_RELEASE_MODE": "customer",
             "TPS_RELEASE_LAUNCH_TOKEN": self.launch_token,
+            "TPS_LOCAL_AUTH_REQUIRED": "1",
         }, clear=True)
         self.env_patch.start()
         self.api = load_customer_api()
         self.client = self.api.app.test_client()
+        self.headers = {"Authorization": f"Bearer {self.launch_token}"}
 
     def tearDown(self):
         self.env_patch.stop()
@@ -44,13 +46,13 @@ class CustomerReleaseModeTests(unittest.TestCase):
             ("/api/batch100/start", {}, "customer_release_control_surface_disabled"),
         ):
             with self.subTest(path=path), patch.object(self.api, "get_redis") as get_redis:
-                response = self.client.post(path, json=body)
+                response = self.client.post(path, json=body, headers=self.headers)
             self.assertEqual(response.status_code, 403)
             self.assertEqual(response.json["code"], code)
             get_redis.assert_not_called()
 
     def test_customer_mode_never_checks_for_online_updates(self):
-        response = self.client.get("/api/system/check-update")
+        response = self.client.get("/api/system/check-update", headers=self.headers)
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.json["code"], "customer_release_read_only")
 
@@ -63,7 +65,7 @@ class CustomerReleaseModeTests(unittest.TestCase):
             "/api/batch100/status",
         ):
             with self.subTest(path=path), patch.object(self.api, "get_redis") as get_redis:
-                response = self.client.get(path)
+                response = self.client.get(path, headers=self.headers)
             self.assertEqual(response.status_code, 403)
             self.assertEqual(response.json["code"], "customer_release_control_surface_disabled")
             get_redis.assert_not_called()
@@ -76,11 +78,24 @@ class CustomerReleaseModeTests(unittest.TestCase):
         self.assertNotIn(self.launch_token, body)
 
     def test_customer_mode_exposes_local_version_but_labels_the_mode(self):
-        response = self.client.get("/api/system/version")
+        response = self.client.get("/api/system/version", headers=self.headers)
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json["ok"])
         self.assertEqual(response.json["release_mode"], "customer")
-        self.assertEqual(response.json["launch_token"], self.launch_token)
+        self.assertNotIn("launch_token", response.json)
+
+    def test_customer_api_requires_the_non_disclosed_bearer_token(self):
+        for headers in ({}, {"Authorization": "Bearer incorrect-token"}):
+            response = self.client.get("/api/system/version", headers=headers)
+            self.assertEqual(response.status_code, 401)
+            self.assertEqual(response.json["code"], "customer_release_auth_required")
+            self.assertNotIn(self.launch_token, response.get_data(as_text=True))
+
+    def test_customer_auth_cannot_be_disabled_by_omitting_optional_flag(self):
+        with patch.dict(os.environ, {"TPS_LOCAL_AUTH_REQUIRED": "0"}, clear=False):
+            response = self.client.get("/api/system/version")
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json["code"], "customer_release_auth_required")
 
     def test_customer_launch_can_require_the_configured_port(self):
         args = self.api._build_parser().parse_args(
@@ -97,9 +112,12 @@ class CustomerReleaseModeTests(unittest.TestCase):
                 {"TPS_RELEASE_LAUNCH_TOKEN": token},
                 clear=False,
             ):
-                response = self.client.get("/api/system/version")
-            self.assertEqual(response.status_code, 503)
-            self.assertEqual(response.json["code"], "customer_release_launch_token_unavailable")
+                response = self.client.get(
+                    "/api/system/version",
+                    headers={"Authorization": f"Bearer {token}"} if token else {},
+                )
+            self.assertEqual(response.status_code, 401)
+            self.assertEqual(response.json["code"], "customer_release_auth_required")
             if token:
                 self.assertNotIn(token, response.get_data(as_text=True))
 
@@ -107,6 +125,7 @@ class CustomerReleaseModeTests(unittest.TestCase):
         with patch.dict(os.environ, {
             "TPS_RELEASE_MODE": "standard",
             "TPS_RELEASE_LAUNCH_TOKEN": self.launch_token,
+            "TPS_LOCAL_AUTH_REQUIRED": "1",
         }, clear=True):
             standard_api = load_customer_api()
             response = standard_api.app.test_client().get("/api/system/version")

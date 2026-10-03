@@ -15,8 +15,11 @@ import ast
 import base64
 import csv
 import io
+import json
+import math
 import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -51,6 +54,7 @@ load_project_env(
 from flask import Flask, Response, g, jsonify, make_response, request, send_file
 import mysql.connector
 from werkzeug.exceptions import HTTPException
+from person_visibility import eligible_phone_type_sql, person_has_phone_sql, person_has_phone_type_sql, person_has_wireless_sql, qualified_phone_count_sql, usable_phone_sql, visible_person_count_sql, visible_phone_fields_sql
 
 app = Flask(__name__, static_folder=None)
 
@@ -97,6 +101,9 @@ def _load_runtime_config(environ):
         "host": _config_text(environ, "TPS_REDIS_HOST", "127.0.0.1"),
         "port": _config_port(environ, "TPS_REDIS_PORT", 6379),
     }
+    redis_password = environ.get("TPS_REDIS_PASSWORD") or environ.get("REDIS_PASSWORD")
+    if redis_password:
+        redis["password"] = redis_password
     dashboard = {
         "host": _loopback_host(environ.get("TPS_DASHBOARD_HOST", "127.0.0.1"), "TPS_DASHBOARD_HOST"),
         "port": dashboard_port(environ),
@@ -108,8 +115,13 @@ TIDB_CONFIG, REDIS_CONFIG, DASHBOARD_CONFIG = _load_runtime_config(os.environ)
 
 
 def _customer_release_mode() -> bool:
-    """Whether this dashboard was started through the restricted customer path."""
+    """Select the restricted customer mode from the launcher's environment."""
     return _environment_customer_release_mode(os.environ)
+
+
+def _customer_local_auth_required() -> bool:
+    # An editable or omitted flag may not disable customer API protection.
+    return _customer_release_mode()
 
 
 READINESS_TIMEOUT_SEC = 3
@@ -187,7 +199,11 @@ def _as_int(value, default=0):
 
 
 def _background_database_target():
-    """Read the actual worker's literal target without importing the scraper."""
+    """Verify the worker's config expression, then resolve its inherited target.
+
+    Never import the worker here: importing a changed module could perform
+    work as a side effect of an otherwise read-only dashboard request.
+    """
     tree = ast.parse(_BACKGROUND_DB_SOURCE.read_text(encoding="utf-8"))
     assignments = [
         node for node in tree.body
@@ -198,7 +214,18 @@ def _background_database_target():
     ]
     references = [node for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id == "TIDB_CONFIG"]
     getters = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "get_db"]
-    if len(assignments) != 1 or len(references) != 2 or len(getters) != 1:
+    fingerprints = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "db_target_fingerprint"]
+    expected_fingerprint = ast.parse('''def db_target_fingerprint() -> str:
+    """Non-secret identity shared by worker/ingester to prevent split DB targets."""
+    target = {name: TIDB_CONFIG[name] for name in ("host", "port", "user", "database")}
+    return hashlib.sha256(json.dumps(target, sort_keys=True).encode("utf-8")).hexdigest()
+''').body[0]
+    if (
+        len(assignments) != 1 or len(references) != 3 or len(getters) != 1
+        or len(fingerprints) != 1
+        or ast.dump(fingerprints[0], include_attributes=False)
+        != ast.dump(expected_fingerprint, include_attributes=False)
+    ):
         raise ValueError("background database target is not statically verifiable")
     getter_body = getters[0].body
     result = getter_body[-1] if getter_body else None
@@ -222,37 +249,65 @@ def _background_database_target():
         and call.keywords[0].value.id == "TIDB_CONFIG"
     ):
         raise ValueError("background database connection is not statically verifiable")
-    target = ast.literal_eval(assignments[0].value)
-    if not isinstance(target, dict) or any(key not in target for key in _BACKGROUND_DB_KEYS):
-        raise ValueError("background database target is incomplete")
-    if any(not isinstance(target[key], str) for key in ("host", "user", "password", "database")):
+    # Both supported local TiDB and Windows MySQL defaults use this exact
+    # expression. Any worker-side change must be reviewed here explicitly.
+    default_port = None
+    for candidate in (3306, 4000):
+        expected = ast.parse(f'''TIDB_CONFIG = {{
+    "host": os.environ.get("TPS_DB_HOST") or os.environ.get("TIDB_HOST", "127.0.0.1"),
+    "port": int(os.environ.get("TPS_DB_PORT") or os.environ.get("TIDB_PORT", {candidate})),
+    "user": os.environ.get("TPS_DB_USER") or os.environ.get("TIDB_USER", "root"),
+    "password": os.environ.get("TPS_DB_PASSWORD", os.environ.get("TIDB_PASSWORD", "")),
+    "database": os.environ.get("TPS_DB_NAME") or os.environ.get("TIDB_DATABASE", "people_search"),
+    "autocommit": False,
+}}''').body[0].value
+        if ast.dump(assignments[0].value, include_attributes=False) == ast.dump(expected, include_attributes=False):
+            default_port = candidate
+            break
+    if default_port is None:
+        raise ValueError("background database target is not statically verifiable")
+    env = os.environ
+    target = {
+        "host": env.get("TPS_DB_HOST") or env.get("TIDB_HOST", "127.0.0.1"),
+        "port": int(env.get("TPS_DB_PORT") or env.get("TIDB_PORT", default_port)),
+        "user": env.get("TPS_DB_USER") or env.get("TIDB_USER", "root"),
+        "password": env.get("TPS_DB_PASSWORD", env.get("TIDB_PASSWORD", "")),
+        "database": env.get("TPS_DB_NAME") or env.get("TIDB_DATABASE", "people_search"),
+    }
+    if any(not isinstance(target[key], str) or not target[key] for key in ("host", "user", "database")):
         raise ValueError("background database target has an invalid type")
-    if type(target["port"]) is not int or not 1 <= target["port"] <= 65535:
-        raise ValueError("background database port is invalid")
+    if not isinstance(target["password"], str) or not 1 <= target["port"] <= 65535:
+        raise ValueError("background database target is invalid")
     return target
 
 
 def _background_target_state(role):
     """Use the current environment inherited by children; fail closed on uncertainty."""
     try:
+        if role not in ("worker", "discover", "cluster"):
+            return "unverifiable"
         redis_target = {
-            "host": _config_text(os.environ, "REDIS_HOST", "127.0.0.1"),
-            "port": _config_port(os.environ, "REDIS_PORT", 6379),
+            "host": _config_text(
+                {"host": os.environ.get("TPS_REDIS_HOST") or os.environ.get("REDIS_HOST", "127.0.0.1")},
+                "host", "127.0.0.1",
+            ),
+            "port": _config_port(
+                {"port": os.environ.get("TPS_REDIS_PORT") or os.environ.get("REDIS_PORT", 6379)},
+                "port", 6379,
+            ),
+            "password": os.environ.get("TPS_REDIS_PASSWORD") or os.environ.get("REDIS_PASSWORD"),
         }
-        if redis_target != REDIS_CONFIG:
+        configured_redis_target = {
+            "host": REDIS_CONFIG["host"],
+            "port": REDIS_CONFIG["port"],
+            "password": REDIS_CONFIG.get("password"),
+        }
+        if redis_target != configured_redis_target:
             return "mismatch"
         if role in ("worker", "cluster"):
             database_target = _background_database_target()
-            eff_target = dict(database_target)
-            if "TPS_DB_PORT" in os.environ:
-                try:
-                    eff_target["port"] = int(os.environ["TPS_DB_PORT"])
-                except ValueError:
-                    pass
-            if any(eff_target[key] != TIDB_CONFIG[key] for key in _BACKGROUND_DB_KEYS):
+            if any(database_target[key] != TIDB_CONFIG[key] for key in _BACKGROUND_DB_KEYS):
                 return "mismatch"
-        elif role != "discover":
-            return "unverifiable"
         return "match"
     except Exception:
         return "unverifiable"
@@ -303,9 +358,15 @@ def get_db():
             g.pop("db", None)
 
     pool = _get_pool()
+    conn = None
     if pool:
-        conn = pool.get_connection()
-    else:
+        try:
+            conn = pool.get_connection()
+        except Exception:
+            conn = None
+    if conn is None:
+        # A failed pool may fall back to a direct connection, but never to a
+        # different port, credential, or database target.
         conn = mysql.connector.connect(**_operational_mysql_options())
     g.db = conn
     return conn
@@ -394,16 +455,20 @@ def _empty_metrics():
         from tps_metrics import BUCKETS, LATENCY_METRICS
     except Exception:
         BUCKETS = (
-            "success", "empty", "http_4xx", "rate_limit", "cf_fail", "parse_fail",
+            "attempt", "success", "empty", "http_4xx", "rate_limit", "cf_fail", "parse_fail",
             "write_fail", "dedup_hit", "retry", "dlq",
         )
         LATENCY_METRICS = ("scrape_ms", "write_ms", "queue_wait_ms", "cf_solve_ms")
     return {
-        "counters": {bucket: 0 for bucket in BUCKETS},
+        "counters": {bucket: None for bucket in BUCKETS},
         "latency": {
-            metric: {"count": 0, "sum": 0.0, "avg": 0.0}
+            metric: {"count": None, "sum": None, "avg": None}
             for metric in LATENCY_METRICS
         },
+        "success_rate_pct": None,
+        "completion_rate_pct": None,
+        "metrics_available": False,
+        "metrics_quality": {"status": "unavailable", "issues": ["metrics_unavailable"]},
         "ts": int(time.time()),
     }
 
@@ -428,8 +493,7 @@ def get_redis():
             return _redis_client
         try:
             client = redis_lib.Redis(
-                host=REDIS_CONFIG["host"],
-                port=REDIS_CONFIG["port"],
+                **REDIS_CONFIG,
                 socket_connect_timeout=0.4,
                 socket_timeout=0.8,
             )
@@ -441,91 +505,108 @@ def get_redis():
 
 
 def _persons_select_cols(use_counts=True):
+    phones = visible_phone_fields_sql()
     try:
-        return """
+        return f"""
             p.person_id, p.full_name, p.first_name, p.middle_name, p.last_name, p.gender,
-            p.age, p.birth_year, p.primary_phone, p.primary_phone_type,
-            p.current_address, p.address_duration, p.all_phones,
-            p.wireless_phone_1, p.wireless_phone_2, p.wireless_phone_3,
+            p.age, p.birth_year, {phones['primary_phone']} AS primary_phone,
+            {phones['primary_phone_type']} AS primary_phone_type,
+            p.current_address, p.address_duration, {phones['all_phones']} AS all_phones,
+            {phones['wireless_phone_1']} AS wireless_phone_1,
+            {phones['wireless_phone_2']} AS wireless_phone_2,
+            {phones['wireless_phone_3']} AS wireless_phone_3,
             p.current_city, p.current_state, p.marital_status,
-            p.phone_count, p.email_count, p.prev_addr_count, p.scraped_at
+            {qualified_phone_count_sql()} AS phone_count, p.email_count, p.prev_addr_count, p.scraped_at
         """
     except Exception:
-        return """
+        return f"""
             p.person_id, p.full_name, p.age, p.birth_year,
             p.current_city, p.current_state, p.marital_status,
-            p.phone_count, p.email_count, p.prev_addr_count
+            {qualified_phone_count_sql()} AS phone_count, p.email_count, p.prev_addr_count
         """
 
 
 def _load_stats():
-    """库内档案实时计数 + 性能指标 + 流量节约 + 智能号码识别数据"""
+    """Read measured aggregate values; never infer runtime success from DB stock."""
     payload = {
-        "persons": 0, "phones": 0, "emails": 0, "prev_addr": 0, "aliases": 0,
-        "wireless_count": 0, "primary_wireless_count": 0, "smart_fallback_count": 0,
-        "wireless_ratio_pct": 0.0,
+        "persons": None, "phones": None, "emails": None, "prev_addr": None, "aliases": None,
+        "wireless_count": None, "primary_wireless_count": None, "smart_fallback_count": None,
+        "wireless_ratio_pct": None, "database_available": False,
     }
+    legacy_schema = False
     try:
         row = query_one(
-            """
+            f"""
             SELECT
                 COUNT(*) AS persons,
-                COALESCE(SUM(phone_count), 0) AS phones,
                 COALESCE(SUM(email_count), 0) AS emails,
                 COALESCE(SUM(prev_addr_count), 0) AS prev_addr,
                 COALESCE(SUM(alias_count), 0) AS aliases,
-                COUNT(CASE WHEN (wireless_phone_1 IS NOT NULL AND wireless_phone_1 != '') OR primary_phone_type = 'Wireless' THEN 1 END) AS wireless_count,
-                COUNT(CASE WHEN primary_phone_type = 'Wireless' THEN 1 END) AS primary_wireless_count,
-                COUNT(CASE WHEN primary_phone_type = 'Wireless' AND all_phones LIKE '%Landline%' THEN 1 END) AS smart_fallback_count
-            FROM persons
+                COUNT(CASE WHEN {person_has_wireless_sql()} THEN 1 END) AS wireless_count,
+                COUNT(CASE WHEN {usable_phone_sql('p.primary_phone')} AND LOWER(TRIM(p.primary_phone_type)) = 'wireless' THEN 1 END) AS primary_wireless_count,
+                COUNT(CASE WHEN {usable_phone_sql('p.primary_phone')} AND LOWER(TRIM(p.primary_phone_type)) = 'wireless' AND EXISTS (SELECT 1 FROM phone_numbers ph WHERE ph.person_id=p.person_id AND {usable_phone_sql('ph.phone_number')} AND LOWER(TRIM(ph.line_type)) IN ('landline', 'landline/services')) THEN 1 END) AS smart_fallback_count
+            FROM persons p
+            WHERE {person_has_phone_sql()}
             """
         )
         if row:
-            for k in ("persons", "phones", "emails", "prev_addr", "aliases", "wireless_count", "primary_wireless_count", "smart_fallback_count"):
+            for k in ("persons", "emails", "prev_addr", "aliases", "wireless_count", "primary_wireless_count", "smart_fallback_count"):
                 payload[k] = _as_int(row.get(k))
+            payload["database_available"] = True
     except Exception:
         try:
             row = query_one(
-                """
+                f"""
                 SELECT
-                    (SELECT COUNT(*) FROM persons) AS persons,
-                    (SELECT COUNT(*) FROM phone_numbers) AS phones,
-                    (SELECT COUNT(*) FROM email_addresses) AS emails,
-                    (SELECT COUNT(*) FROM previous_addresses) AS prev_addr,
-                    (SELECT COUNT(*) FROM aliases) AS aliases,
-                    (SELECT COUNT(DISTINCT person_id) FROM phone_numbers WHERE line_type='Wireless') AS wireless_count
+                    COUNT(*) AS persons,
+                    COALESCE(SUM((SELECT COUNT(*) FROM email_addresses e WHERE e.person_id=p.person_id)), 0) AS emails,
+                    COALESCE(SUM((SELECT COUNT(*) FROM previous_addresses a WHERE a.person_id=p.person_id)), 0) AS prev_addr,
+                    COALESCE(SUM((SELECT COUNT(*) FROM aliases a WHERE a.person_id=p.person_id)), 0) AS aliases,
+                    COUNT(CASE WHEN EXISTS (SELECT 1 FROM phone_numbers ph WHERE ph.person_id=p.person_id AND LOWER(TRIM(ph.line_type))='wireless' AND {usable_phone_sql('ph.phone_number')}) THEN 1 END) AS wireless_count
+                FROM persons p
+                WHERE {person_has_phone_sql(legacy=True)}
                 """
             )
             if row:
-                for k in ("persons", "phones", "emails", "prev_addr", "aliases", "wireless_count"):
+                for k in ("persons", "emails", "prev_addr", "aliases", "wireless_count"):
                     payload[k] = _as_int(row.get(k))
-                payload["primary_wireless_count"] = payload["wireless_count"]
-                payload["smart_fallback_count"] = 0
+                # The legacy schema cannot measure which wireless number is
+                # primary or whether selection fell back from a landline.
+                payload["database_available"] = True
+                legacy_schema = True
+        except Exception:
+            pass
+
+    # Exact cross-table de-duplication is deliberately bounded. At million-row
+    # scale it needs a materialized counter; never run that expensive query on
+    # every dashboard refresh or publish an incorrect child-only count.
+    if payload["database_available"] and payload["persons"] <= 1000:
+        try:
+            phone_row = query_one(
+                f"SELECT COALESCE(SUM({qualified_phone_count_sql(legacy=legacy_schema)}), 0) AS phones "
+                f"FROM persons p WHERE {person_has_phone_sql(legacy=legacy_schema)}"
+            )
+            if phone_row is not None and phone_row.get("phones") is not None:
+                payload["phones"] = _as_int(phone_row["phones"])
         except Exception:
             pass
 
     p_cnt = payload["persons"]
     w_cnt = payload["wireless_count"]
-    payload["wireless_ratio_pct"] = round((w_cnt / p_cnt * 100.0), 1) if p_cnt else 0.0
+    if payload["database_available"]:
+        payload["wireless_ratio_pct"] = round((w_cnt / p_cnt * 100.0), 1) if p_cnt else 0.0
 
     r = get_redis()
-    attempt = 0
-    success = 0
-    dedup_hit = 0
-    avg_lat = 48.5
-    current_qps = 0.0
+    snap = _empty_metrics()
+    current_qps = None
+    payload["throughput_available"] = False
+    payload["bulk_ingest_qps"] = None
+    payload["bulk_committed_total"] = None
 
     if r is not None:
         try:
             from tps_metrics import get_metrics
             snap = get_metrics(r).snapshot()
-            counters = snap.get("counters", {})
-            attempt = _as_int(counters.get("attempt"))
-            success = _as_int(counters.get("success"))
-            dedup_hit = _as_int(counters.get("dedup_hit"))
-            scrape_lat = snap.get("latency", {}).get("scrape_ms", {})
-            if scrape_lat.get("avg"):
-                avg_lat = round(scrape_lat["avg"], 1)
         except Exception:
             pass
 
@@ -534,17 +615,28 @@ def _load_stats():
             from tps_queue import queue_stats
             payload["coverage"] = coverage_snapshot(r)
             payload["queue"] = queue_stats(r)
-            payload["scale"] = scale_snapshot(r, persons=p_cnt, use_pages=False)
+            payload["scale"] = scale_snapshot(r, persons=p_cnt or 0, use_pages=False)
         except Exception:
             payload["coverage"] = {}
             payload["queue"] = {}
             payload["scale"] = {}
 
         try:
-            from tps_control import _scan_heartbeats
+            from tps_control import _scan_heartbeats, bulk_ingest_status
             workers = _scan_heartbeats(r)
-            if workers:
-                current_qps = round(sum(float(w.get("current_qps", 0.0)) for w in workers), 1)
+            bulk = bulk_ingest_status(r)
+            payload["bulk_ingest_qps"] = bulk["qps"]
+            payload["bulk_committed_total"] = bulk["committed_total"]
+            # direct worker 仅报本进程 DB 提交；bulk 共享速率只加一次。
+            worker_rates = [float(w["current_qps"]) for w in workers]
+            requires_bulk = any(w.get("decoupled_ingest") is True for w in workers)
+            if (not requires_bulk or bulk["rate_available"]) and all(
+                math.isfinite(rate) and rate >= 0 for rate in worker_rates
+            ):
+                total_qps = sum(worker_rates) + (bulk["qps"] or 0.0)
+                if math.isfinite(total_qps):
+                    current_qps = round(total_qps, 1)
+                    payload["throughput_available"] = True
         except Exception:
             pass
     else:
@@ -552,30 +644,25 @@ def _load_stats():
         payload["queue"] = {}
         payload["scale"] = {}
 
-    total_execs = max(attempt, p_cnt, payload.get("queue", {}).get("total", 0))
-    if success == 0 and p_cnt > 0:
-        success = p_cnt
-    if attempt == 0 and p_cnt > 0:
-        total_execs = int(p_cnt * 1.05) + dedup_hit
-
-    if total_execs > 0:
-        succ_rate = round(min(99.9, (success / total_execs) * 100.0 if total_execs else 99.8), 2)
-    else:
-        succ_rate = 99.8
-
-    # 流量节约计算：协议级抓取每个网页仅消耗约 60KB，对比无头浏览器（2.2MB）
-    saved_mb = round(total_execs * 2.14 + dedup_hit * 2.2, 1)
-    saved_gb = round(saved_mb / 1024.0, 2)
-
-    payload["total_tasks_executed"] = total_execs
-    payload["success_tasks"] = success
-    payload["success_rate_pct"] = succ_rate
-    payload["dedup_saved_count"] = dedup_hit
-    payload["traffic_saved_mb"] = saved_mb
-    payload["traffic_saved_gb"] = saved_gb
-    payload["traffic_saved_ratio_pct"] = 96.8
-    payload["avg_latency_ms"] = avg_lat
-    payload["current_qps"] = current_qps if current_qps > 0 else (32.0 if total_execs > 0 else 0.0)
+    counters = snap.get("counters", {})
+    scrape_lat = snap.get("latency", {}).get("scrape_ms", {})
+    payload["metrics_available"] = snap["metrics_available"]
+    payload["metrics_quality"] = snap["metrics_quality"]
+    payload["total_tasks_executed"] = counters.get("attempt")
+    payload["success_tasks"] = counters.get("success")
+    payload["success_tasks_meaning"] = "reported_outcomes_not_new_database_rows"
+    payload["success_rate_pct"] = snap.get("success_rate_pct")
+    payload["completion_rate_pct"] = snap.get("completion_rate_pct")
+    payload["dedup_saved_count"] = counters.get("dedup_hit")
+    # No byte counters or measured browser baseline exist. Do not manufacture
+    # savings from job counts or imply that a proxy traffic quota was consumed.
+    payload["traffic_saved_mb"] = None
+    payload["traffic_saved_gb"] = None
+    payload["traffic_saved_ratio_pct"] = None
+    payload["traffic_measurement_available"] = False
+    payload["avg_latency_ms"] = scrape_lat.get("avg")
+    payload["current_qps"] = current_qps
+    payload["current_qps_meaning"] = "database_persisted_confirmed_per_second"
 
     return payload
 
@@ -819,6 +906,20 @@ def _restrict_customer_release_actions():
     """Keep the customer launcher local and view-only even after the UI loads."""
     if not _customer_release_mode():
         return None
+    if not request.path.startswith("/api/"):
+        return None
+    if _customer_local_auth_required():
+        expected_token = release_launch_token(os.environ)
+        supplied = request.headers.get("Authorization", "")
+        bearer = supplied[7:] if supplied.startswith("Bearer ") else ""
+        if expected_token is None or not secrets.compare_digest(bearer, expected_token):
+            response = jsonify({
+                "ok": False,
+                "code": "customer_release_auth_required",
+                "error": "请通过本机受保护的启动入口打开客户端。",
+            })
+            response.headers["WWW-Authenticate"] = 'Bearer realm="TruePeopleSearch local dashboard"'
+            return response, 401
     customer_control_prefixes = (
         "/api/pipeline",
         "/api/proxy",
@@ -861,6 +962,64 @@ def api_stats():
         return _internal_error()
 
 
+def _person_age_filter(args, name):
+    value = args.get(name, "").strip()
+    if not value:
+        return None
+    if not re.fullmatch(r"[0-9]{1,3}", value) or not 0 <= int(value) <= 120:
+        raise ValueError("年龄筛选必须是 0 至 120 的整数")
+    return int(value)
+
+
+def _phone_filter_digits(value):
+    raw = str(value).strip()
+    if not raw or not re.fullmatch(r"[0-9+().\-\s]+", raw):
+        raise ValueError("电话筛选请输入号码或号码片段")
+    digits = re.sub(r"[^0-9]", "", raw)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if not digits or len(digits) > 10:
+        raise ValueError("电话筛选请输入最多 10 位号码，可带国家码 +1")
+    return digits
+
+
+def _phone_match_sql(column, digits):
+    """Normalize only a short phone column with fixed string operations.
+
+    Never turn user input into a database regular expression. Complete numbers
+    use equality; only partial-number searches need a substring comparison.
+    """
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?", column):
+        raise ValueError("invalid phone column identifier")
+    normalized = f"COALESCE({column}, '')"
+    for separator in ("' '", "'-'", "'.'", "'('", "')'", "'+'", "CHAR(9)", "CHAR(10)", "CHAR(13)"):
+        normalized = f"REPLACE({normalized}, {separator}, '')"
+    if len(digits) == 10:
+        return f"{normalized} IN (%s, %s)", [digits, "1" + digits]
+    return f"{normalized} LIKE %s", [f"%{digits}%"]
+
+
+def _person_phone_search_sql(digits):
+    primary_match, params = _phone_match_sql("p.primary_phone", digits)
+    conditions = [
+        f"({primary_match} AND {usable_phone_sql('p.primary_phone')} "
+        f"AND {eligible_phone_type_sql('p.primary_phone_type')})"
+    ]
+    for field in ("wireless_phone_1", "wireless_phone_2", "wireless_phone_3"):
+        match, values = _phone_match_sql(f"p.{field}", digits)
+        conditions.append(f"({match} AND {usable_phone_sql(f'p.{field}')})")
+        params.extend(values)
+    child_match, values = _phone_match_sql("matched_phone.phone_number", digits)
+    conditions.append(
+        "EXISTS (SELECT 1 FROM phone_numbers matched_phone "
+        f"WHERE matched_phone.person_id = p.person_id AND {child_match} "
+        f"AND {usable_phone_sql('matched_phone.phone_number')} "
+        f"AND {eligible_phone_type_sql('matched_phone.line_type')})"
+    )
+    params.extend(values)
+    return "(" + " OR ".join(conditions) + ")", params
+
+
 def _build_persons_filter(args):
     search = args.get("search", "").strip()
     phone = args.get("phone", "").strip()
@@ -868,11 +1027,13 @@ def _build_persons_filter(args):
     state = args.get("state", "").strip()
     phone_type = args.get("phone_type", "").strip()
     has_wireless = args.get("has_wireless", "").strip()
-    age_min = args.get("age_min", "").strip()
-    age_max = args.get("age_max", "").strip()
+    age_min = _person_age_filter(args, "age_min")
+    age_max = _person_age_filter(args, "age_max")
+    if age_min is not None and age_max is not None and age_min > age_max:
+        raise ValueError("最小年龄不能大于最大年龄")
     sort = args.get("sort", "newest").strip()
 
-    where = []
+    where = [person_has_phone_sql()]
     params = []
 
     if search:
@@ -881,11 +1042,9 @@ def _build_persons_filter(args):
         params.extend([pat, pat, pat])
 
     if phone:
-        cleaned = re.sub(r"\D", "", phone)
-        where.append("(p.primary_phone LIKE %s OR p.wireless_phone_1 LIKE %s OR p.wireless_phone_2 LIKE %s OR p.wireless_phone_3 LIKE %s OR p.all_phones LIKE %s)")
-        pat = f"%{phone}%"
-        pat_clean = f"%{cleaned}%" if cleaned else pat
-        params.extend([pat, pat, pat, pat, pat_clean])
+        phone_sql, phone_params = _person_phone_search_sql(_phone_filter_digits(phone))
+        where.append(phone_sql)
+        params.extend(phone_params)
 
     if city:
         where.append("p.current_city = %s")
@@ -896,25 +1055,18 @@ def _build_persons_filter(args):
         params.append(state.upper())
 
     if phone_type and phone_type.lower() != "all":
-        where.append("p.primary_phone_type = %s")
-        params.append(phone_type)
+        where.append(person_has_phone_type_sql(phone_type))
 
     if has_wireless in ("1", "true", "yes"):
-        where.append("(p.wireless_phone_1 IS NOT NULL AND p.wireless_phone_1 != '')")
+        where.append(person_has_wireless_sql())
 
-    if age_min:
-        try:
-            where.append("p.age >= %s")
-            params.append(int(age_min))
-        except ValueError:
-            pass
+    if age_min is not None:
+        where.append("p.age >= %s")
+        params.append(age_min)
 
-    if age_max:
-        try:
-            where.append("p.age <= %s")
-            params.append(int(age_max))
-        except ValueError:
-            pass
+    if age_max is not None:
+        where.append("p.age <= %s")
+        params.append(age_max)
 
     if sort == "name_asc":
         order_sql = "ORDER BY p.full_name ASC, p.person_id ASC"
@@ -946,7 +1098,10 @@ def api_persons():
     page = max(page, 1)
     size = min(max(size, 1), 200)
 
-    where, params, order_sql = _build_persons_filter(request.args)
+    try:
+        where, params, order_sql = _build_persons_filter(request.args)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
     offset = (page - 1) * size
@@ -954,10 +1109,11 @@ def api_persons():
     def _run(use_counts):
         sql = f"""
             SELECT {_persons_select_cols(use_counts)}
-            FROM persons p
-            {where_sql}
+            FROM (
+                SELECT p.* FROM persons p {where_sql}
+                {order_sql} LIMIT %s OFFSET %s
+            ) p
             {order_sql}
-            LIMIT %s OFFSET %s
         """
         qparams = list(params) + [size, offset]
         return query(sql, qparams)
@@ -974,7 +1130,7 @@ def api_persons():
     count_row = query_one(f"SELECT COUNT(*) as cnt FROM persons p {where_sql}", params)
     total = _as_int((count_row or {}).get("cnt"))
 
-    wireless_where = list(where) + ["(p.wireless_phone_1 IS NOT NULL AND p.wireless_phone_1 != '')"]
+    wireless_where = list(where) + [person_has_wireless_sql()]
     wireless_where_sql = "WHERE " + " AND ".join(wireless_where)
     wireless_row = query_one(f"SELECT COUNT(*) as cnt FROM persons p {wireless_where_sql}", params)
     with_wireless = _as_int((wireless_row or {}).get("cnt"))
@@ -988,6 +1144,15 @@ def api_persons():
     })
 
 
+def _safe_csv_cell(value):
+    """Keep untrusted exported text inert in spreadsheet applications."""
+    text = "" if value is None else str(value)
+    candidate = text.lstrip(" \t\r\n\x00\ufeff\u200b")
+    if text.startswith(("\t", "\r", "\n")) or candidate.startswith(("=", "+", "-", "@")):
+        return "'" + text
+    return text
+
+
 @app.route("/api/export", methods=["GET"])
 @app.route("/api/persons/export", methods=["GET"])
 def api_export_persons():
@@ -996,9 +1161,14 @@ def api_export_persons():
     支持全部多维度筛选参数，不分页，最高导出 50000 条。
     """
     try:
-        limit = min(max(_as_int(request.args.get("limit"), 50000), 1), 100000)
         where, params, order_sql = _build_persons_filter(request.args)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    try:
+        limit = min(max(_as_int(request.args.get("limit"), 50000), 1), 100000)
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        phones = visible_phone_fields_sql()
 
         sql = f"""
             SELECT
@@ -1006,21 +1176,22 @@ def api_export_persons():
                 p.full_name AS `全名`,
                 COALESCE(p.gender, '未知') AS `性别`,
                 p.age AS `年龄`,
-                COALESCE(p.primary_phone, '') AS `当前电话`,
-                COALESCE(p.primary_phone_type, '') AS `当前电话类型`,
+                COALESCE({phones['primary_phone']}, '') AS `当前电话`,
+                COALESCE({phones['primary_phone_type']}, '') AS `当前电话类型`,
                 COALESCE(p.current_address, '') AS `当前地址`,
                 COALESCE(p.address_duration, '') AS `当前地址时长`,
-                COALESCE(p.first_name, '') AS `姓`,
-                COALESCE(p.last_name, '') AS `名`,
+                COALESCE(p.last_name, '') AS `姓`,
+                COALESCE(p.first_name, '') AS `名`,
                 COALESCE(p.middle_name, '') AS `中间名`,
-                COALESCE(p.all_phones, '') AS `电话列表`,
-                COALESCE(p.wireless_phone_1, '') AS `移动号码1`,
-                COALESCE(p.wireless_phone_2, '') AS `移动号码2`,
-                COALESCE(p.wireless_phone_3, '') AS `移动号码3`
-            FROM persons p
-            {where_sql}
+                {phones['all_phones']} AS `电话列表`,
+                COALESCE({phones['wireless_phone_1']}, '') AS `移动号码1`,
+                COALESCE({phones['wireless_phone_2']}, '') AS `移动号码2`,
+                COALESCE({phones['wireless_phone_3']}, '') AS `移动号码3`
+            FROM (
+                SELECT p.* FROM persons p {where_sql}
+                {order_sql} LIMIT %s
+            ) p
             {order_sql}
-            LIMIT %s
         """
         rows = query(sql, params + [limit])
 
@@ -1035,7 +1206,7 @@ def api_export_persons():
 
         for r in rows:
             writer.writerow({
-                h: ("" if r.get(h) is None else str(r.get(h)))
+                h: _safe_csv_cell(r.get(h))
                 for h in headers
             })
 
@@ -1052,15 +1223,31 @@ def api_export_persons():
             }
         )
         return response
-    except Exception as e:
-        return jsonify({"error": f"导出失败: {e}"}), 500
+    except Exception:
+        return _internal_error()
 
 
 @app.route("/api/person/<person_id>")
 def api_person_detail(person_id):
     """人物详情：全部信息"""
     try:
-        person = query_one("SELECT * FROM persons WHERE person_id = %s", (person_id,))
+        person = query_one(
+            f"SELECT p.* FROM persons p WHERE p.person_id = %s AND {person_has_phone_sql()}",
+            (person_id,),
+        )
+        if person is None:
+            return jsonify({"error": "未找到符合条件的人物"}), 404
+        phone_projection = ", ".join(
+            f"{expression} AS {field}" for field, expression in visible_phone_fields_sql().items()
+        )
+        visible_fields = query_one(
+            f"SELECT {phone_projection}, {qualified_phone_count_sql()} AS phone_count "
+            f"FROM persons p WHERE p.person_id = %s AND {person_has_phone_sql()}",
+            (person_id,),
+        )
+        if visible_fields is None:
+            return jsonify({"error": "未找到符合条件的人物"}), 404
+        person.update(visible_fields)
 
         aliases = query(
             "SELECT alias_name FROM aliases WHERE person_id = %s", (person_id,))
@@ -1072,7 +1259,7 @@ def api_person_detail(person_id):
             "SELECT * FROM previous_addresses WHERE person_id = %s", (person_id,))
 
         phones = query(
-            "SELECT * FROM phone_numbers WHERE person_id = %s ORDER BY is_primary DESC",
+            f"SELECT ph.* FROM phone_numbers ph WHERE ph.person_id = %s AND {usable_phone_sql('ph.phone_number')} AND {eligible_phone_type_sql('ph.line_type')} ORDER BY is_primary DESC",
             (person_id,))
 
         emails = query(
@@ -1095,11 +1282,11 @@ def api_cities():
     """Top 城市分布"""
     try:
         try_set_tiflash_read()
-        rows = query("""
+        rows = query(f"""
             SELECT current_city as city, current_state as state,
                    COUNT(*) as cnt
-            FROM persons
-            WHERE current_city IS NOT NULL
+            FROM persons p
+            WHERE current_city IS NOT NULL AND {person_has_phone_sql()}
             GROUP BY current_city, current_state
             ORDER BY cnt DESC
             LIMIT 20
@@ -1114,7 +1301,7 @@ def api_age_dist():
     """年龄分布"""
     try:
         try_set_tiflash_read()
-        rows = query("""
+        rows = query(f"""
             SELECT
                 CASE
                     WHEN age < 20 THEN '0-19'
@@ -1126,8 +1313,8 @@ def api_age_dist():
                     ELSE '70+'
                 END as age_group,
                 COUNT(*) as cnt
-            FROM persons
-            WHERE age IS NOT NULL
+            FROM persons p
+            WHERE age IS NOT NULL AND {person_has_phone_sql()}
             GROUP BY age_group
             ORDER BY age_group
         """)
@@ -1144,35 +1331,42 @@ def api_search():
         return jsonify({"persons": [], "phones": [], "emails": []})
 
     try:
-        persons = query("""
+        try:
+            phone_digits = _phone_filter_digits(q)
+        except ValueError:
+            phone_digits = None
+        person_match = "full_name LIKE %s"
+        person_params = [f"%{q}%"]
+        if phone_digits:
+            phone_person_match, phone_person_params = _person_phone_search_sql(phone_digits)
+            person_match = f"({person_match} OR {phone_person_match})"
+            person_params.extend(phone_person_params)
+        persons = query(f"""
             SELECT person_id, full_name, age, current_city, current_state
-            FROM persons
-            WHERE full_name LIKE %s
+            FROM persons p
+            WHERE {person_match} AND {person_has_phone_sql()}
             LIMIT 20
-        """, ("%{}%".format(q),))
+        """, person_params)
 
-        if q.isdigit():
-            phones = query("""
+        if phone_digits:
+            phone_match, phone_params = _phone_match_sql("ph.phone_number", phone_digits)
+            phones = query(f"""
                 SELECT p.person_id, p.full_name, ph.phone_number, ph.carrier
                 FROM phone_numbers ph
                 JOIN persons p ON ph.person_id = p.person_id
-                WHERE ph.phone_number = %s OR ph.phone_number LIKE %s
+                WHERE {phone_match}
+                  AND {person_has_phone_sql()} AND {usable_phone_sql('ph.phone_number')}
+                  AND {eligible_phone_type_sql('ph.line_type')}
                 LIMIT 20
-            """, (q, q + "%"))
+            """, phone_params)
         else:
-            phones = query("""
-                SELECT p.person_id, p.full_name, ph.phone_number, ph.carrier
-                FROM phone_numbers ph
-                JOIN persons p ON ph.person_id = p.person_id
-                WHERE ph.phone_number LIKE %s
-                LIMIT 20
-            """, ("%{}%".format(q),))
+            phones = []
 
-        emails = query("""
+        emails = query(f"""
             SELECT p.person_id, p.full_name, e.email
             FROM email_addresses e
             JOIN persons p ON e.person_id = p.person_id
-            WHERE e.email LIKE %s
+            WHERE e.email LIKE %s AND {person_has_phone_sql()}
             LIMIT 20
         """, ("%{}%".format(q),))
 
@@ -1187,18 +1381,19 @@ def api_recent():
     try:
         limit = min(max(_as_int(request.args.get("limit"), 15), 1), 100)
         try:
-            rows = query("""
-                SELECT person_id, full_name, first_name, last_name, age, primary_phone, primary_phone_type,
-                       wireless_phone_1, current_city, current_state, current_address,
-                       phone_count, email_count, prev_addr_count, scraped_at
-                FROM persons
-                ORDER BY scraped_at DESC
-                LIMIT %s
+            rows = query(f"""
+                SELECT {_persons_select_cols()}
+                FROM (
+                    SELECT p.* FROM persons p WHERE {person_has_phone_sql()}
+                    ORDER BY p.scraped_at DESC LIMIT %s
+                ) p
+                ORDER BY p.scraped_at DESC
             """, (limit,))
         except Exception:
-            rows = query("""
+            rows = query(f"""
                 SELECT person_id, full_name, age, current_city, current_state, scraped_at
-                FROM persons
+                FROM persons p
+                WHERE {person_has_phone_sql(legacy=True)}
                 ORDER BY scraped_at DESC
                 LIMIT %s
             """, (limit,))
@@ -1209,7 +1404,7 @@ def api_recent():
 
 @app.route("/api/metrics")
 def api_metrics():
-    """Worker 计数快照；Redis 不可用时仍 200 + 空计数。"""
+    """Read-only counters; unavailable/invalid measurements are explicitly marked."""
     r = get_redis()
     if r is None:
         return jsonify(_empty_metrics())
@@ -1260,7 +1455,8 @@ def _pipeline_payload(*, read_only: bool = False):
             "dlq_jobs": [],
             "metrics": _empty_metrics(),
             "logs": {"worker": [], "discover": []},
-            "persons": 0,
+            "persons": None,
+            "database_available": None,
             "recent": [],
             "coverage": {},
             "discover_dirs": {},
@@ -1271,22 +1467,29 @@ def _pipeline_payload(*, read_only: bool = False):
     from tps_control import pipeline_status
     payload = pipeline_status(r, read_only=read_only)
     try:
-        row = query_one("SELECT COUNT(*) AS n FROM persons")
-        payload["persons"] = _as_int((row or {}).get("n"))
+        row = query_one(visible_person_count_sql())
+        if row is None or row.get("n") is None:
+            raise ValueError("database count unavailable")
+        payload["persons"] = _as_int(row["n"])
+        payload["database_available"] = True
     except Exception:
-        payload["persons"] = 0
+        payload["persons"] = None
+        payload["database_available"] = False
     try:
         try:
-            payload["recent"] = query("""
-                SELECT person_id, full_name, age, current_city, current_state, phone_count, email_count, prev_addr_count, scraped_at
-                FROM persons
+            payload["recent"] = query(f"""
+                SELECT person_id, full_name, age, current_city, current_state,
+                       {qualified_phone_count_sql()} AS phone_count,
+                       email_count, prev_addr_count, scraped_at
+                FROM persons p WHERE {person_has_phone_sql()}
                 ORDER BY scraped_at DESC
                 LIMIT 8
             """)
         except Exception:
-            payload["recent"] = query("""
+            payload["recent"] = query(f"""
                 SELECT person_id, full_name, age, current_city, current_state, scraped_at
-                FROM persons
+                FROM persons p
+                WHERE {person_has_phone_sql(legacy=True)}
                 ORDER BY scraped_at DESC
                 LIMIT 8
             """)
@@ -1339,7 +1542,7 @@ def api_pipeline_scale():
     )
     persons = 0
     try:
-        row = query_one("SELECT COUNT(*) AS n FROM persons")
+        row = query_one(visible_person_count_sql())
         persons = _as_int((row or {}).get("n"))
     except Exception:
         persons = 0
@@ -1364,7 +1567,7 @@ def api_pipeline_slice():
     persist_slice(r, cfg)
     persons = 0
     try:
-        row = query_one("SELECT COUNT(*) AS n FROM persons")
+        row = query_one(visible_person_count_sql())
         persons = _as_int((row or {}).get("n"))
     except Exception:
         persons = 0
@@ -1394,7 +1597,7 @@ def api_pipeline_plan():
         cfg = load_plan(r)
     persons = 0
     try:
-        row = query_one("SELECT COUNT(*) AS n FROM persons")
+        row = query_one(visible_person_count_sql())
         persons = _as_int((row or {}).get("n"))
     except Exception:
         persons = 0
@@ -1624,10 +1827,18 @@ def api_proxy_test():
         proxy_url = ""
 
     # 若前端传来的带掩码 :****@，则尝试用已保存的真实密码恢复
-    if ":****@" in proxy_url:
+    if ":****@" in proxy_url or ":******@" in proxy_url:
         saved_cfg = load_proxy_config(r)
-        if saved_cfg.get("tunnel"):
-            proxy_url = saved_cfg.get("tunnel")
+        recovered = saved_cfg.get("tunnel") or ""
+        if recovered and ":****@" not in recovered and ":******@" not in recovered:
+            proxy_url = recovered
+        else:
+            return jsonify({
+                "ok": False,
+                "success": False,
+                "error": "代理密码处于掩码状态且尚未保存有效明文，请先输入密码并点击保存后再测试",
+                "message": "密码未保存，无法执行连通性测试",
+            }), 400
 
     # 发起请求测试
     from protocol_fetcher import DEFAULT_HEADERS, check_cloudflare_blocked
@@ -1665,7 +1876,7 @@ def api_proxy_test():
                     "latency_ms": elapsed_ms,
                     "cf_blocked": True,
                     "bytes": len(content),
-                    "message": "Cloudflare 5秒盾拦截（该代理 IP 指纹被标记）",
+                    "message": "Cloudflare 防护拦截（HTTP 403/503 或检测到挑战盾，未能通过纯协议穿透）",
                 })
             elif status == 200:
                 return jsonify({
@@ -1675,7 +1886,7 @@ def api_proxy_test():
                     "latency_ms": elapsed_ms,
                     "cf_blocked": False,
                     "bytes": len(content),
-                    "message": "连接成功！TLS 指纹通过，Cloudflare 顺利穿透",
+                    "message": "单次探测通过（HTTP 200 OK，TLS 指纹顺利连通）",
                 })
             else:
                 return jsonify({
@@ -1801,8 +2012,6 @@ def system_version():
             "git": git_info,
             "release_mode": "customer" if customer_release else "standard",
         }
-        if launch_token is not None:
-            payload["launch_token"] = launch_token
         return jsonify(payload)
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
@@ -1837,89 +2046,231 @@ def system_apply_update():
 # 批量 100 条验证采集任务 API
 # ============================================================
 _batch100_proc = None
+_batch100_last_exit_code = None
+_batch100_stop_requested = False
+_batch100_lock = threading.Lock()
 _BATCH100_LOG = _REPO_ROOT / "data" / "logs" / "batch100.log"
+
+
+def _batch100_external_process():
+    """Conservatively detect an orphaned sample job after a dashboard restart.
+
+    Only this dashboard's exact script path counts. We never take ownership of
+    or terminate a process found by scanning; uncertain inspection blocks a
+    second launch and asks the operator to verify the host.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return "unverifiable", None
+
+    target = os.path.normcase(os.path.normpath(str(_REPO_ROOT / "tools" / "batch_collector_100.py")))
+    try:
+        for process in psutil.process_iter(attrs=["pid", "name", "cmdline"], ad_value=None):
+            name = str(process.info.get("name") or "").lower()
+            args = process.info.get("cmdline")
+            if args is None:
+                if "python" in name:
+                    return "unverifiable", None
+                continue
+            if any(
+                isinstance(arg, str) and os.path.isabs(arg)
+                and os.path.normcase(os.path.normpath(arg)) == target
+                for arg in args
+            ):
+                try:
+                    if process.status() == psutil.STATUS_ZOMBIE:
+                        continue
+                except psutil.NoSuchProcess:
+                    continue
+                return "running", process.info["pid"]
+    except (psutil.Error, OSError):
+        return "unverifiable", None
+    return "none", None
+
+
+def _batch100_log_marker(line, kind):
+    prefix = f"TPS_BATCH_{kind} "
+    if not line.startswith(prefix):
+        return None
+    try:
+        payload = json.loads(line[len(prefix):])
+        if not isinstance(payload, dict):
+            return None
+        counts = {}
+        for key in ("attempted", "verified_present", "new_rows", "target"):
+            value = payload.get(key)
+            if type(value) is not int or value < 0:
+                return None
+            counts[key] = value
+        if not (counts["new_rows"] <= counts["verified_present"] <= counts["attempted"]):
+            return None
+        if kind == "RESULT":
+            status = payload.get("status")
+            if status not in ("completed", "partial", "rate_limited", "failed"):
+                return None
+            counts["status"] = status
+        return counts
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 @app.route("/api/batch100/status", methods=["GET"])
 def api_batch100_status():
-    global _batch100_proc
-    running = False
-    pid = None
-    if _batch100_proc is not None:
-        if _batch100_proc.poll() is None:
-            running = True
-            pid = _batch100_proc.pid
+    global _batch100_proc, _batch100_last_exit_code
+    with _batch100_lock:
+        running = False
+        pid = None
+        external_state = "none"
+        if _batch100_proc is not None:
+            exit_code = _batch100_proc.poll()
+            if exit_code is None:
+                running = True
+                pid = _batch100_proc.pid
+            else:
+                _batch100_last_exit_code = exit_code
+                _batch100_proc = None
+        if _batch100_proc is None:
+            external_state, external_pid = _batch100_external_process()
+            if external_state == "running":
+                running = True
+                pid = external_pid
+
+        logs = []
+        lines = []
+        if _BATCH100_LOG.exists():
+            try:
+                lines = _BATCH100_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+                logs = lines[-120:]
+            except Exception:
+                pass
+
+        progress = result = None
+        for line in reversed(lines):
+            if result is None:
+                result = _batch100_log_marker(line, "RESULT")
+            if progress is None:
+                progress = _batch100_log_marker(line, "PROGRESS")
+            if result is not None and progress is not None:
+                break
+        latest = result if result is not None and not running else progress
+        if latest is None:
+            latest = result
+        if external_state != "none":
+            job_status = "verification_required"
+        elif running:
+            job_status = "running"
+        elif _batch100_stop_requested:
+            job_status = "stopped"
+        elif _batch100_last_exit_code == 0 and result is not None and result["status"] == "completed":
+            job_status = "completed"
+        elif _batch100_last_exit_code is not None or result is not None:
+            job_status = result["status"] if result is not None and result["status"] != "completed" else "failed"
         else:
-            _batch100_proc = None
+            job_status = "idle"
 
-    logs = []
-    if _BATCH100_LOG.exists():
-        try:
-            lines = _BATCH100_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
-            logs = lines[-120:]
-        except Exception:
-            pass
-
-    current = 0
-    total = 100
-    for line in reversed(logs):
-        m = re.search(r"\[(\d+)/(\d+)\]", line)
-        if m:
-            current = int(m.group(1))
-            total = int(m.group(2))
-            break
-
-    return jsonify({
-        "ok": True,
-        "running": running,
-        "pid": pid,
-        "current": current,
-        "total": total,
-        "logs": logs,
-    })
+        return jsonify({
+            "ok": True,
+            "running": running,
+            "pid": pid,
+            "job_status": job_status,
+            "exit_code": _batch100_last_exit_code,
+            "current": latest["attempted"] if latest else 0,
+            "total": latest["target"] if latest else 100,
+            "verified_present": latest["verified_present"] if latest else None,
+            "new_rows": latest["new_rows"] if latest else None,
+            "logs": logs,
+        })
 
 
 @app.route("/api/batch100/start", methods=["POST"])
 def api_batch100_start():
-    global _batch100_proc
-    if _batch100_proc is not None and _batch100_proc.poll() is None:
-        return jsonify({"ok": True, "running": True, "pid": _batch100_proc.pid, "message": "任务已在运行中"})
+    global _batch100_proc, _batch100_last_exit_code, _batch100_stop_requested
 
     body = request.get_json(silent=True) or {}
-    count = int(body.get("count", 100))
+    try:
+        count = int(body.get("count", 100))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "任务数量无效"}), 400
+    if not 1 <= count <= 100:
+        return jsonify({"ok": False, "error": "任务数量须为 1 至 100"}), 400
 
-    _BATCH100_LOG.parent.mkdir(parents=True, exist_ok=True)
-    log_file = open(_BATCH100_LOG, "w", encoding="utf-8")
+    with _batch100_lock:
+        if _batch100_proc is not None:
+            exit_code = _batch100_proc.poll()
+            if exit_code is None:
+                return jsonify({"ok": True, "running": True, "pid": _batch100_proc.pid, "message": "任务已在运行中"})
+            _batch100_last_exit_code = exit_code
+            _batch100_proc = None
 
-    env = os.environ.copy()
-    env["TPS_DB_PORT"] = str(TIDB_CONFIG.get("port", 3306))
-    env["TPS_DB_PASSWORD"] = str(TIDB_CONFIG.get("password", ""))
+        external_state, _ = _batch100_external_process()
+        if external_state != "none":
+            return jsonify({
+                "ok": False,
+                "code": "batch100_process_verification_required",
+                "error": "检测到其他样本进程或无法核实进程状态；请先在本机核查，已拒绝重复启动。",
+            }), 409
 
-    cmd = [sys.executable, "-u", str(_REPO_ROOT / "tools" / "batch_collector_100.py"), str(count)]
-    _batch100_proc = subprocess.Popen(
-        cmd,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        env=env,
-        cwd=str(_REPO_ROOT),
-    )
-    return jsonify({"ok": True, "running": True, "pid": _batch100_proc.pid})
+        _BATCH100_LOG.parent.mkdir(parents=True, exist_ok=True)
+        log_file = open(_BATCH100_LOG, "w", encoding="utf-8")
+
+        env = os.environ.copy()
+        env["TPS_DB_HOST"] = str(TIDB_CONFIG["host"])
+        env["TPS_DB_PORT"] = str(TIDB_CONFIG["port"])
+        env["TPS_DB_USER"] = str(TIDB_CONFIG["user"])
+        env["TPS_DB_PASSWORD"] = str(TIDB_CONFIG["password"])
+        env["TPS_DB_NAME"] = str(TIDB_CONFIG["database"])
+
+        cmd = [sys.executable, "-u", str(_REPO_ROOT / "tools" / "batch_collector_100.py"), str(count)]
+        try:
+            _batch100_proc = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                env=env,
+                cwd=str(_REPO_ROOT),
+            )
+        finally:
+            log_file.close()
+        _batch100_last_exit_code = None
+        _batch100_stop_requested = False
+        return jsonify({"ok": True, "running": True, "job_status": "running", "new_rows": None, "pid": _batch100_proc.pid})
 
 
 @app.route("/api/batch100/stop", methods=["POST"])
 def api_batch100_stop():
-    global _batch100_proc
-    if _batch100_proc is not None:
-        try:
-            _batch100_proc.terminate()
-            _batch100_proc.wait(timeout=3)
-        except Exception:
+    global _batch100_proc, _batch100_last_exit_code, _batch100_stop_requested
+    with _batch100_lock:
+        if _batch100_proc is None:
+            external_state, _ = _batch100_external_process()
+            if external_state != "none":
+                return jsonify({
+                    "ok": False,
+                    "code": "batch100_process_verification_required",
+                    "error": "无法确认样本进程归属；未终止任何进程，请在本机核查。",
+                }), 409
+            return jsonify({"ok": True, "running": False, "exit_code": _batch100_last_exit_code})
+
+        proc = _batch100_proc
+        exit_code = proc.poll()
+        if exit_code is None:
+            _batch100_stop_requested = True
             try:
-                _batch100_proc.kill()
+                proc.terminate()
+                exit_code = proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    exit_code = proc.wait(timeout=3)
+                except Exception:
+                    exit_code = proc.poll()
             except Exception:
-                pass
+                exit_code = proc.poll()
+        if exit_code is None:
+            return jsonify({"ok": False, "running": True, "error": "样本进程未确认停止"}), 409
+        _batch100_last_exit_code = exit_code
         _batch100_proc = None
-    return jsonify({"ok": True, "running": False})
+        return jsonify({"ok": True, "running": False, "exit_code": exit_code, "job_status": "stopped" if _batch100_stop_requested else "finished"})
 
 
 # ============================================================

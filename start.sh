@@ -130,7 +130,7 @@ inspect_container() {
 }
 
 ensure_service() {
-    local name="$1" host="$2" running deadline docker_endpoint
+    local name="$1" host="$2" container="$3" running deadline docker_endpoint
     echo "检查 $name..."
     if probe_service "$name"; then
         echo "  $name 检查通过。"
@@ -151,15 +151,15 @@ ensure_service() {
     case "$docker_endpoint" in unix://*|npipe://*) ;; *)
         echo "错误: Docker 使用非本机套接字上下文；不自动恢复容器。" >&2; return 1 ;;
     esac
-    if ! running=$(docker_cli container inspect --format '{{.State.Running}}' "$name"); then
-        echo "错误: 无法确认现有 $name 容器；不会创建容器或下载镜像。请先配置已有服务。" >&2
+    if ! running=$(docker_cli container inspect --format '{{.State.Running}}' "$container"); then
+        echo "错误: 无法确认现有 $name 容器 ($container)；不会创建容器或下载镜像。请先配置已有服务。" >&2
         return 1
     fi
     case "$running" in
         false)
-            echo "  恢复已有 $name 容器..."
-            docker_cli start "$name" || { echo "错误: $name 容器恢复失败。" >&2; return 1; } ;;
-        true) echo "  现有 $name 容器正在运行，等待就绪..." ;;
+            echo "  恢复已有 $name 容器 ($container)..."
+            docker_cli start "$container" || { echo "错误: $name 容器恢复失败。" >&2; return 1; } ;;
+        true) echo "  现有 $name 容器 ($container) 正在运行，等待就绪..." ;;
         *) echo "错误: 无法识别 $name 容器状态。" >&2; return 1 ;;
     esac
     deadline=$((SECONDS + WAIT_SECONDS))
@@ -176,11 +176,13 @@ ensure_service() {
 
 echo "本地面板环境检查"
 FAILED=0
-ensure_service tidb "${TPS_DB_HOST:-127.0.0.1}" || FAILED=1
-ensure_service redis "${TPS_REDIS_HOST:-127.0.0.1}" || FAILED=1
+TIDB_CONTAINER="${TPS_TIDB_CONTAINER:-tps-tidb}"
+REDIS_CONTAINER="${TPS_REDIS_CONTAINER:-tps-redis}"
+ensure_service tidb "${TPS_DB_HOST:-127.0.0.1}" "$TIDB_CONTAINER" || FAILED=1
+ensure_service redis "${TPS_REDIS_HOST:-127.0.0.1}" "$REDIS_CONTAINER" || FAILED=1
 echo "现有容器版本与挂载信息（只读）:"
-inspect_container tidb
-inspect_container redis
+inspect_container "$TIDB_CONTAINER"
+inspect_container "$REDIS_CONTAINER"
 [ "$FAILED" -eq 0 ] || fail "依赖服务尚未就绪；面板未启动。"
 
 if [ "$CHECK_ONLY" -eq 1 ]; then

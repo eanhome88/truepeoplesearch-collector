@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Redis 可靠队列（BLMOVE + 租约 + 死信）。
+Redis 可靠队列（原子领取 + 租约 + 死信）。
 
 供 distributed_worker.py 与测试直接 import。不连接 TiDB，不含抓取逻辑。
 r 为 redis.Redis；decode_responses 建议 True，但对 bytes/str 都容错。
@@ -16,6 +16,8 @@ import time
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
 from urllib.parse import urlparse, urlunparse
+
+from redis.exceptions import WatchError
 
 LEASE_SEC = 90
 MAX_ATTEMPTS = 3
@@ -38,6 +40,7 @@ RECOVER_LOCK_KEY = "tps:recover_lock"
 LEGACY_URLS_KEY = "tps_urls"
 
 _PERSON_RE = re.compile(r"/person/(\w+)")
+_PHONE_RE = re.compile(r"/find/phone/(\d{10})(?:\D|$)")
 
 UrlLike = Union[str, bytes]
 
@@ -125,9 +128,14 @@ def _iter_urls(urls: Any) -> Iterable[Any]:
 
 
 def extract_person_id(url: str) -> str:
-    """从 URL 提取 TruePeopleSearch person_id：/person/(\\w+)。"""
-    match = _PERSON_RE.search(_as_str(url))
-    return match.group(1) if match else ""
+    """从 URL 提取 TruePeopleSearch person_id：/person/(\\w+)。
+    电话反查 URL 取 10 位号码作去重 ID（同一号码只查一次）。"""
+    text = _as_str(url)
+    match = _PERSON_RE.search(text)
+    if match:
+        return match.group(1)
+    pmatch = _PHONE_RE.search(text)
+    return pmatch.group(1) if pmatch else ""
 
 
 def normalize_url(url: str) -> str:
@@ -191,7 +199,7 @@ def _person_id_of(job: Any) -> str:
     return extract_person_id(_as_str(job.get("url") or job.get(b"url")))
 
 
-def feed(r: Any, urls: Any, seen_check: bool = True) -> dict:
+def feed(r: Any, urls: Any, seen_check: bool = True, front: bool = False) -> dict:
     """灌入 pending。去重看 seen（已入库）和 queued（在飞）。成功 ack 才写 seen。"""
     enqueued = 0
     deduped = 0
@@ -252,7 +260,10 @@ def feed(r: Any, urls: Any, seen_check: bool = True) -> dict:
             job["enqueued_at"] = now
             job_id = job["id"]
             pipe.set(_job_key(job_id), _dumps(job))
-            pipe.lpush(PENDING_KEY, job_id)
+            if front:
+                pipe.rpush(PENDING_KEY, job_id)
+            else:
+                pipe.lpush(PENDING_KEY, job_id)
             enqueued += 1
         try:
             pipe.execute()
@@ -264,60 +275,61 @@ def feed(r: Any, urls: Any, seen_check: bool = True) -> dict:
     return {"enqueued": enqueued, "deduped": deduped, "invalid": invalid}
 
 
-def _move_pending_to_processing(r: Any, timeout: float = CLAIM_TIMEOUT_SEC):
-    try:
-        return r.blmove(
-            PENDING_KEY, PROCESSING_KEY, timeout, src="RIGHT", dest="LEFT"
-        )
-    except TypeError:
-        return r.blmove(PENDING_KEY, PROCESSING_KEY, timeout, "RIGHT", "LEFT")
-    except Exception as exc:
-        msg = _as_str(exc).lower()
-        if "unknown command" in msg or "blmove" in msg:
-            return r.brpoplpush(PENDING_KEY, PROCESSING_KEY, timeout)
-        raise
-
-
-def _orphan_claim(r: Any, job_id: str) -> None:
-    pipe = r.pipeline(transaction=True)
-    pipe.lrem(PROCESSING_KEY, 1, job_id)
-    pipe.zrem(LEASES_KEY, job_id)
-    pipe.execute()
-
-
 def claim(r: Any, worker_id: str, lease_sec: int = LEASE_SEC) -> Optional[dict]:
-    """BLMOVE pending→processing（RIGHTLEFT，timeout 2s），写入租约后返回 job。"""
-    raw_id = _move_pending_to_processing(r, CLAIM_TIMEOUT_SEC)
-    if not raw_id:
-        return None
-    job_id = _as_str(raw_id)
-    if not job_id:
-        return None
+    """原子移出 FIFO 队尾并登记租约；空队列/竞争时最多等待 2 秒。
 
-    raw = r.get(_job_key(job_id))
-    try:
-        job = _parse_job(raw)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        _orphan_claim(r, job_id)
-        return None
-    if job is None:
-        _orphan_claim(r, job_id)
-        return None
+    不能先 BLMOVE 再写租约：两条命令之间崩溃会留下永不被恢复的
+    processing 孤儿。WATCH 保证读取的仍是同一队尾和 payload，EXEC
+    同时提交移队与租约；即使提交后连接断开，recover_expired 仍能回收。
+    """
+    lease_duration = float(lease_sec)
+    deadline = time.monotonic() + CLAIM_TIMEOUT_SEC
+    while True:
+        retry_delay = 0.05
+        with r.pipeline(transaction=True) as pipe:
+            try:
+                pipe.watch(PENDING_KEY)
+                raw_id = pipe.lindex(PENDING_KEY, -1)
+                if raw_id is not None:
+                    job_id = _as_str(raw_id)
+                    job_key = _job_key(job_id)
+                    pipe.watch(job_key)
+                    try:
+                        job = _parse_job(pipe.get(job_key)) if job_id else None
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        job = None
 
-    now = time.time()
-    lease_until = now + float(lease_sec)
-    job["id"] = job_id
-    job["claimed_at"] = now
-    job["lease_until"] = lease_until
-    wid = _as_str(worker_id)
-    if wid:
-        job["worker_id"] = wid
+                    if job is None:
+                        # 无法解析的旧任务保持原有丢弃语义，但不先放入 processing。
+                        pipe.multi()
+                        pipe.rpop(PENDING_KEY)
+                        pipe.execute()
+                        return None
 
-    pipe = r.pipeline(transaction=True)
-    pipe.zadd(LEASES_KEY, {job_id: lease_until})
-    pipe.set(_job_key(job_id), _dumps(job))
-    pipe.execute()
-    return job
+                    now = time.time()
+                    lease_until = now + lease_duration
+                    job["id"] = job_id
+                    job["claimed_at"] = now
+                    job["lease_until"] = lease_until
+                    wid = _as_str(worker_id)
+                    if wid:
+                        job["worker_id"] = wid
+
+                    pipe.multi()
+                    pipe.rpop(PENDING_KEY)
+                    pipe.lpush(PROCESSING_KEY, job_id)
+                    pipe.zadd(LEASES_KEY, {job_id: lease_until})
+                    pipe.set(job_key, _dumps(job))
+                    pipe.execute()
+                    return job
+            except WatchError:
+                # 其他领取者/入队者先提交时，重新读取队尾，不返回旧 job。
+                retry_delay = 0.005
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(retry_delay, remaining))
 
 
 def heartbeat(r: Any, job: dict, lease_sec: int = LEASE_SEC) -> bool:
@@ -421,6 +433,69 @@ def _is_rate_limit_hold(error: Any) -> bool:
     return "429" in text or "captcha" in text
 
 
+def _recover_one_expired(r: Any, job_id: str) -> bool:
+    """复核所有权后原子恢复，避免与持久入库缓冲的 handoff 竞态。"""
+    job_key = _job_key(job_id)
+    for _ in range(3):
+        with r.pipeline() as pipe:
+            try:
+                pipe.watch(job_key, LEASES_KEY, PROCESSING_KEY)
+                lease_until = pipe.zscore(LEASES_KEY, job_id)
+                if lease_until is None or float(lease_until) > time.time():
+                    return False
+                try:
+                    in_processing = pipe.lpos(PROCESSING_KEY, job_id) is not None
+                except Exception:
+                    in_processing = job_id in {
+                        _as_str(value) for value in pipe.lrange(PROCESSING_KEY, 0, -1)
+                    }
+                if not in_processing:
+                    # 孤儿租约只清理索引，不能制造一个新的抓取任务。
+                    pipe.multi()
+                    pipe.zrem(LEASES_KEY, job_id)
+                    pipe.execute()
+                    return False
+
+                raw = pipe.get(job_key)
+                try:
+                    job = _parse_job(raw)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    job = None
+                if job is None:
+                    job = {
+                        "id": job_id, "person_id": "", "url": "", "attempts": 0,
+                        "enqueued_at": time.time(), "lease_until": 0, "last_error": None,
+                    }
+                error = _as_str(job.get("last_error"))
+                job["lease_until"] = 0
+                if _is_rate_limit_hold(error):
+                    job["last_error"] = error
+                    destination = PENDING_KEY
+                    terminal = False
+                else:
+                    attempts = _as_int(job.get("attempts"), 0) + 1
+                    job["attempts"] = attempts
+                    job["last_error"] = "lease_expired"
+                    terminal = attempts >= MAX_ATTEMPTS
+                    destination = DLQ_KEY if terminal else PENDING_KEY
+
+                pipe.multi()
+                pipe.set(job_key, _dumps(job))
+                pipe.zrem(LEASES_KEY, job_id)
+                pipe.lrem(PROCESSING_KEY, 1, job_id)
+                pipe.lpush(destination, job_id)
+                if terminal:
+                    person_id = _person_id_of(job)
+                    if person_id:
+                        pipe.srem(QUEUED_KEY, person_id)
+                        pipe.sadd(FAILED_KEY, person_id)
+                pipe.execute()
+                return True
+            except WatchError:
+                continue
+    return False
+
+
 def recover_expired(r: Any) -> int:
     """SET tps:recover_lock NX EX 30。429/captcha 过期租约 release（不增加 attempts）；其余 nack(retry=True)。"""
     token = uuid.uuid4().hex
@@ -434,36 +509,15 @@ def recover_expired(r: Any) -> int:
         expired = r.zrangebyscore(LEASES_KEY, 0, now) or []
         for raw_id in expired:
             job_id = _as_str(raw_id)
-            if not job_id:
-                continue
-            raw = r.get(_job_key(job_id))
-            try:
-                job = _parse_job(raw)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                job = None
-            if job is None:
-                job = {
-                    "id": job_id,
-                    "person_id": "",
-                    "url": "",
-                    "attempts": 0,
-                    "enqueued_at": now,
-                    "lease_until": 0,
-                    "last_error": None,
-                }
-            error = _as_str(job.get("last_error"))
-            if _is_rate_limit_hold(error):
-                release(r, job, error)
-            else:
-                nack(r, job, "lease_expired", retry=True)
-            recovered += 1
+            if job_id and _recover_one_expired(r, job_id):
+                recovered += 1
         return recovered
     finally:
         _release_recover_lock(r, token)
 
 
 def _peek_oldest_pending_id(r: Any) -> Any:
-    """LPUSH + BLMOVE RIGHT：最老任务在列表右端。无 lindex 时退回 lrange。"""
+    """LPUSH + 原子 RPOP：最老任务在列表右端。无 lindex 时退回 lrange。"""
     lindex = getattr(r, "lindex", None)
     if callable(lindex):
         try:

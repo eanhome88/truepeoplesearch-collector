@@ -44,10 +44,17 @@ load_project_env(
 import tps_alert
 
 PYTHON = sys.executable
-for _candidate in (
-    ROOT / ".venv" / "bin" / "python3",
-    ROOT / ".venv" / "Scripts" / "python.exe",
-):
+if os.name == "nt":
+    _candidates = (
+        ROOT / ".venv" / "Scripts" / "python.exe",
+        ROOT / ".venv" / "bin" / "python3",
+    )
+else:
+    _candidates = (
+        ROOT / ".venv" / "bin" / "python3",
+        ROOT / ".venv" / "Scripts" / "python.exe",
+    )
+for _candidate in _candidates:
     if _candidate.exists():
         PYTHON = str(_candidate)
         break
@@ -60,6 +67,12 @@ class SupervisorAlreadyRunning(RuntimeError):
 def _pid_is_running(pid: int) -> bool:
     if pid <= 0:
         return False
+    try:
+        import psutil
+        p = psutil.Process(pid)
+        return p.is_running() and "python" in p.name().lower()
+    except Exception:
+        pass
     if os.name == "nt":
         # os.kill(pid, 0) is not a portable liveness probe on Windows.
         import ctypes
@@ -74,12 +87,11 @@ def _pid_is_running(pid: int) -> bool:
         kernel32.CloseHandle.restype = wintypes.BOOL
         handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
         if not handle:
-            # Invalid PID means gone; access-denied/unknown failures fail closed.
-            return ctypes.get_last_error() != 87
+            return False
         try:
             exit_code = wintypes.DWORD()
             if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                return True
+                return False
             return exit_code.value == 259  # STILL_ACTIVE
         finally:
             kernel32.CloseHandle(handle)
@@ -318,6 +330,10 @@ class ProcessSpec:
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        if "TPS_DB_PORT" not in env:
+            env["TPS_DB_PORT"] = "4000"
         env.update(self.env_overrides)
         with open(self.log_file, "a", encoding="utf-8") as out:
             self.proc = subprocess.Popen(
@@ -374,9 +390,14 @@ class Supervisor:
 
     def _init_specs(self) -> None:
         if self.with_worker:
+            worker_mode = os.environ.get("TPS_WORKER_MODE", "browser").lower()
+            if worker_mode == "browser" and (SCRIPTS / "distributed_worker.py").exists():
+                worker_script = SCRIPTS / "distributed_worker.py"
+            else:
+                raise ValueError("Supervisor 不再支持独立协议 Worker；请使用带可靠入库守护进程的协议集群")
             worker_cmd = [
                 PYTHON,
-                str(SCRIPTS / "distributed_worker.py"),
+                str(worker_script),
                 "--mode", "worker",
                 "--concurrency", str(self.concurrency),
             ]
@@ -495,10 +516,12 @@ def cmd_status() -> None:
         return
     try:
         pid = int(PID_FILE.read_text().strip())
-        os.kill(pid, 0)
-        print(f"Supervisor 状态: 运行中 (PID={pid})")
-    except (ValueError, OSError):
-        print("Supervisor 状态: 未运行 (存在残留 PID 文件)")
+        if _pid_is_running(pid):
+            print(f"Supervisor 状态: 运行中 (PID={pid})")
+        else:
+            print("Supervisor 状态: 未运行 (存在残留 PID 文件)")
+    except Exception:
+        print("Supervisor 状态: 未运行")
 
 
 def _dashboard_only_record_matches_process(pid: int, record: Optional[dict]) -> bool:
@@ -536,20 +559,23 @@ def cmd_stop(*, dashboard_only: bool = False) -> bool:
                 print("拒绝停止：未确认本次客户控制台的进程身份。")
                 return False
         print(f"正在停止 Supervisor (PID={pid})...")
-        if dashboard_only and os.name == "nt":
-            if _stop_windows_dashboard_tree(pid):
-                print("客户控制台进程树已成功停止。")
-                return True
-            print("客户控制台进程树停止失败。")
-            return False
+        if os.name == "nt":
+            if not _stop_windows_dashboard_tree(pid):
+                print("停止失败：目标进程仍可能运行；保留进程记录以便复核。")
+                return False
+            try:
+                PID_FILE.unlink(missing_ok=True)
+                PID_FILE.with_name(PID_FILE.name + ".lock").unlink(missing_ok=True)
+            except Exception:
+                pass
+            print("Supervisor 已成功停止。")
+            return True
         sig_term = getattr(signal, "SIGTERM", 15)
         sig_kill = getattr(signal, "SIGKILL", sig_term)
         os.kill(pid, sig_term)
         for _ in range(15):
             time.sleep(1)
-            try:
-                os.kill(pid, 0)
-            except OSError:
+            if not _pid_is_running(pid):
                 print("Supervisor 已成功停止。")
                 return True
         print("停止超时，发送强退信号...")

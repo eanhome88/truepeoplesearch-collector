@@ -1,0 +1,14 @@
+# These are top-level constraints for building a reviewed Windows x64
+# wheelhouse.  Customer installation must use --no-index and the wheelhouse
+# included in the verified bundle; it must never resolve packages online.
+Flask==3.1.3
+click==8.5.0
+mysql-connector-python==26.7.0
+redis==8.1.0
+psutil==7.2.2
+tabulate==0.10.0
+scrapling[fetchers]==0.4.15
+playwright==1.63.0
+patchright==1.63.0
+curl_cffi==0.16.3
+httpx==0.28.1

@@ -31,6 +31,7 @@ from scrape_to_tidb import (
     compute_content_hash,
     ensure_db,
     get_db,
+    has_usable_phone,
     insert_person,
 )
 
@@ -51,7 +52,9 @@ class BatchIngester:
         self.on_failure = on_failure
 
         self._queue: asyncio.Queue[Tuple[dict, Any]] = asyncio.Queue()
+        self._flush_lock = asyncio.Lock()
         self._flush_task: Optional[asyncio.Task] = None
+        self._pending_flush_tasks: Set[asyncio.Task] = set()
         self._stopped = False
         self._cached_cols: Optional[Set[str]] = None
         self._db = None
@@ -73,6 +76,9 @@ class BatchIngester:
                 pass
             self._flush_task = None
 
+        if self._pending_flush_tasks:
+            await asyncio.gather(*tuple(self._pending_flush_tasks), return_exceptions=True)
+
         # 刷空剩余数据
         await self._flush_all()
         if self._db:
@@ -87,34 +93,42 @@ class BatchIngester:
         await self._queue.put((data, job))
         if self._queue.qsize() >= self.batch_size:
             # 队列达到批量上限，立即唤醒刷盘
-            asyncio.create_task(self.flush())
+            task = asyncio.create_task(self.flush())
+            self._pending_flush_tasks.add(task)
+            task.add_done_callback(self._pending_flush_tasks.discard)
 
     async def flush(self) -> None:
         """异步执行一次缓冲区刷盘"""
-        items: List[Tuple[dict, Any]] = []
-        while not self._queue.empty() and len(items) < self.batch_size * 2:
-            try:
-                item = self._queue.get_nowait()
-                items.append(item)
-            except asyncio.QueueEmpty:
-                break
+        async with self._flush_lock:
+            items: List[Tuple[dict, Any]] = []
+            while not self._queue.empty() and len(items) < self.batch_size * 2:
+                try:
+                    items.append(self._queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            if items:
+                await self._run_sync_flush(items)
 
-        if not items:
-            return
-
-        # 在线程池中执行同步数据库 I/O，不阻塞 async 事件循环
-        await asyncio.to_thread(self._flush_sync, items)
+    async def _run_sync_flush(self, items: List[Tuple[dict, Any]]) -> None:
+        # 取消后台任务时仍等待已启动的数据库事务完成，不能提前关闭共享连接。
+        worker = asyncio.create_task(asyncio.to_thread(self._flush_sync, items))
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            await worker
+            raise
 
     async def _flush_all(self) -> None:
         """同步刷尽所有剩余队列"""
-        items: List[Tuple[dict, Any]] = []
-        while not self._queue.empty():
-            try:
-                items.append(self._queue.get_nowait())
-            except asyncio.QueueEmpty:
-                break
-        if items:
-            await asyncio.to_thread(self._flush_sync, items)
+        async with self._flush_lock:
+            items: List[Tuple[dict, Any]] = []
+            while not self._queue.empty():
+                try:
+                    items.append(self._queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            if items:
+                await self._run_sync_flush(items)
 
     async def _flusher_loop(self) -> None:
         """定期定时刷写循环"""
@@ -136,8 +150,14 @@ class BatchIngester:
         if not items:
             return
 
-        db = self._get_active_db()
-        cursor = db.cursor()
+        try:
+            db = self._get_active_db()
+            cursor = db.cursor()
+        except Exception as exc:
+            for _, job in items:
+                if self.on_failure and job is not None:
+                    self.on_failure(job, exc)
+            return
 
         try:
             if self._cached_cols is None:
@@ -151,16 +171,26 @@ class BatchIngester:
             prev_addr_rows = []
             phones_rows = []
             emails_rows = []
+            valid_items: List[Tuple[dict, Any]] = []
+            invalid_items: List[Tuple[Any, Exception]] = []
 
-            for data, _ in items:
+            for data, job in items:
                 person_id = data.get("person_id")
                 if not person_id or not data.get("full_name"):
+                    invalid_items.append((job, ValueError("invalid_person")))
                     continue
+                if not has_usable_phone(data):
+                    invalid_items.append((job, ValueError("no_phone")))
+                    continue
+                valid_items.append((data, job))
 
                 content_hash = compute_content_hash(data)
                 counts = _child_counts(data)
 
-                row_dict = {f: data.get(f) for f in _PERSON_CORE_FIELDS if not cols or f in cols}
+                row_dict = {
+                    f: data.get("current_address_text") if f == "current_address" else data.get(f)
+                    for f in _PERSON_CORE_FIELDS if not cols or f in cols
+                }
                 if "content_hash" in cols:
                     row_dict["content_hash"] = content_hash
                 for c in _COUNT_FIELDS:
@@ -283,11 +313,15 @@ class BatchIngester:
 
             db.commit()
 
-            # 成功回调
+            # 只有确实在事务中持久化的任务才能 ACK / 计 success。
             if self.on_success:
-                jobs = [job for _, job in items if job is not None]
+                jobs = [job for _, job in valid_items if job is not None]
                 if jobs:
                     self.on_success(jobs)
+            if self.on_failure:
+                for job, reason in invalid_items:
+                    if job is not None:
+                        self.on_failure(job, reason)
 
         except Exception as exc:
             db.rollback()
@@ -295,7 +329,13 @@ class BatchIngester:
             # 降级：逐条写入以隔离失败项
             for data, job in items:
                 try:
-                    insert_person(db, data)
+                    persisted = insert_person(db, data)
+                    if not persisted:
+                        if not data.get("person_id") or not data.get("full_name"):
+                            reason = "invalid_person"
+                        else:
+                            reason = "no_phone" if not has_usable_phone(data) else "not_persisted"
+                        raise ValueError(reason)
                     if self.on_success and job is not None:
                         self.on_success([job])
                 except Exception as single_exc:

@@ -28,10 +28,12 @@ class DashboardReleaseBundleTests(unittest.TestCase):
             release_root.mkdir()
             for relative in packager.RUNTIME_SOURCE_ALLOWLIST:
                 source = ROOT / relative
+                packager.scan_release_text(relative, source.read_bytes())
                 target = release_root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
 
+            self.assertTrue((release_root / "scripts" / "person_visibility.py").is_file())
             self.assertFalse((release_root / "scripts" / "distributed_worker.py").exists())
             self.assertFalse((release_root / "scripts" / "protocol_worker.py").exists())
             probe = r'''
@@ -43,15 +45,17 @@ spec = importlib.util.spec_from_file_location("release_bundle_dashboard", path)
 api = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(api)
 client = api.app.test_client()
-assert client.get("/api/health").status_code == 200
-assert client.get("/api/system/version").get_json()["release_mode"] == "customer"
-response = client.post("/api/cluster/control", json={"action": "start"})
+headers = {"Authorization": "Bearer bundle_launch_token_123456"}
+assert client.get("/api/health", headers=headers).status_code == 200
+assert client.get("/api/system/version", headers=headers).get_json()["release_mode"] == "customer"
+response = client.post("/api/cluster/control", json={"action": "start"}, headers=headers)
 assert response.status_code == 403
 assert response.get_json()["code"] == "customer_release_control_surface_disabled"
 '''
             environment = dict(os.environ)
             environment["TPS_RELEASE_MODE"] = "customer"
             environment["TPS_RELEASE_LAUNCH_TOKEN"] = "bundle_launch_token_123456"
+            environment["TPS_LOCAL_AUTH_REQUIRED"] = "1"
             completed = subprocess.run(
                 [sys.executable, "-B", "-c", probe],
                 cwd=release_root,

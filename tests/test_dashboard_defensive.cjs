@@ -30,6 +30,7 @@ test('initial cluster logs remain literal text in rendered markup', () => {
         render: value => { html = value; },
         bindProxyClusterEvents() {},
     });
+    vm.runInContext(section('function metricValue(', 'async function loadOverview()'), ctx);
     vm.runInContext(section('function renderProxyClusterView(', 'function bindProxyClusterEvents('), ctx);
     ctx.renderProxyClusterView({ mode: 'direct' }, {
         running: false, logs: ['<img src=x onerror=alert(1)>', '& local status'],
@@ -143,6 +144,7 @@ test('failed status refresh marks controls unavailable and successful refresh re
         fmt: n => String(n || 0),
         isCancelledRequest: () => false,
     });
+    vm.runInContext(section('function metricValue(', 'async function loadOverview()'), ctx);
     vm.runInContext(section('function showClusterStatusUnavailable()', 'function route()'), ctx);
     assert.equal(await ctx.refreshClusterLiveStatus(), false);
     assert.equal(elements.get('clusterLiveStatus').textContent, '状态暂不可用');
@@ -196,6 +198,7 @@ test('a control action reads fresh status and a late pre-action poll cannot over
         fmt: value => String(value || 0),
         alert: message => { throw new Error(message); },
     });
+    vm.runInContext(section('function metricValue(', 'async function loadOverview()'), ctx);
     vm.runInContext(section('function bindProxyClusterEvents(', 'function showClusterStatusUnavailable()'), ctx);
     vm.runInContext(section('function showClusterStatusUnavailable()', 'function route()'), ctx);
     try {

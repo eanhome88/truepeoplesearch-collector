@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"strings"
@@ -142,11 +145,12 @@ func TestCustomerReleaseEnvironmentDropsOutboundAndCollectionControls(t *testing
 		"PROXY_TUNNEL=socks5://example.invalid:1080",
 		"TPS_ALLOW_CLUSTER=1",
 		"TPS_RELEASE_MODE=standard",
+		"TPS_LOCAL_AUTH_REQUIRED=0",
 	}, "token-1234567890123456")
 	joined := "\n" + strings.Join(env, "\n") + "\n"
 	for _, forbidden := range []string{
 		"TPS_ALERT_WEBHOOK=", "TPS_UPDATE_CHECK_URL=", "PROXY_TUNNEL=",
-		"TPS_ALLOW_CLUSTER=", "TPS_RELEASE_MODE=standard",
+		"TPS_ALLOW_CLUSTER=", "TPS_RELEASE_MODE=standard", "TPS_LOCAL_AUTH_REQUIRED=0",
 	} {
 		if strings.Contains(joined, "\n"+forbidden) {
 			t.Fatalf("customer environment retained %q: %s", forbidden, joined)
@@ -154,8 +158,31 @@ func TestCustomerReleaseEnvironmentDropsOutboundAndCollectionControls(t *testing
 	}
 	if !strings.Contains(joined, "\nTPS_DB_HOST=127.0.0.1\n") ||
 		!strings.Contains(joined, "\nTPS_RELEASE_MODE=customer\n") ||
+		!strings.Contains(joined, "\nTPS_LOCAL_AUTH_REQUIRED=1\n") ||
 		!strings.Contains(joined, "\nTPS_RELEASE_LAUNCH_TOKEN=token-1234567890123456\n") {
 		t.Fatalf("customer environment lost required local settings: %s", joined)
+	}
+}
+
+func TestCustomerDashboardIdentityRequiresBearerAndNoEcho(t *testing.T) {
+	const token = "token-1234567890123456"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"ok":true,"release_mode":"customer"}`)
+	}))
+	defer server.Close()
+	if !customerDashboardIdentityMatches(server.URL, token) {
+		t.Fatal("protected customer dashboard was not recognized")
+	}
+	if customerDashboardIdentityMatches(server.URL, "wrong-token") {
+		t.Fatal("wrong bearer token passed readiness")
+	}
+	if got := customerBrowserURL("http://127.0.0.1:5123", token); got != "http://127.0.0.1:5123/#access_token="+token {
+		t.Fatalf("browser URL lacks local fragment token: %s", got)
 	}
 }
 
@@ -171,5 +198,25 @@ func TestCustomerLaunchTokenIsLongURLSafeHex(t *testing.T) {
 		if !strings.ContainsRune("0123456789abcdef", character) {
 			t.Fatalf("token is not URL-safe hex: %q", token)
 		}
+	}
+}
+
+func TestBrowserOpenFailureDoesNotExposeLaunchToken(t *testing.T) {
+	const target = "http://127.0.0.1:5123/#access_token=private-test-token"
+	var command string
+	var arguments []string
+	err := openBrowserWithRunner("windows", target, func(name string, args ...string) error {
+		command = name
+		arguments = args
+		return errors.New("failed to open " + target)
+	})
+	if err == nil || strings.Contains(err.Error(), "private-test-token") || strings.Contains(err.Error(), "access_token") {
+		t.Fatalf("browser failure must be visible without echoing its token: %v", err)
+	}
+	if command != "cmd" || len(arguments) != 4 || arguments[0] != "/c" || arguments[1] != "start" || arguments[2] != "" || arguments[3] != target {
+		t.Fatalf("Windows browser command must pass an explicit empty title: %q %q", command, arguments)
+	}
+	if err := openBrowserWithRunner("windows", target, func(string, ...string) error { return nil }); err != nil {
+		t.Fatalf("a successful browser launch was rejected: %v", err)
 	}
 }

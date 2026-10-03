@@ -49,6 +49,12 @@ _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 _SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
+_ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(_ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(_ROOT_DIR))
+
+from tps_env import load_project_env
+load_project_env(_ROOT_DIR, customer_safe=False)
 
 import redis
 try:
@@ -96,22 +102,38 @@ except ImportError:
             return raw
         parts = urlparse(raw if "://" in raw else "http://" + raw)
         user = parts.username or ""
-        if "-region-" not in user.lower():
+        host = (parts.hostname or "").lower()
+        is_res = (
+            "-region-" in user.lower()
+            or "-res_" in user.lower()
+            or "-res-" in user.lower()
+            or "res_us" in user.lower()
+            or "cloudbypass" in host
+            or "gw-res" in host
+        )
+        if not is_res:
             return raw
-        user = re.sub(r"(?i)-sid-[A-Za-z0-9]+-t-\d+", "", user)
+        user_clean = re.sub(r"(?i)-sid-[A-Za-z0-9]+-t-\d+", "", user)
+        user_clean = re.sub(r"(?i)-session_[A-Za-z0-9]+", "", user_clean)
+        user_clean = re.sub(r"(?i)-session-[A-Za-z0-9]+", "", user_clean)
         hold = max(1, min(int(minutes), 120))
         alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
         sid = "".join(secrets.choice(alphabet) for _ in range(8))
-        username = f"{user}-sid-{sid}-t-{hold}"
+        if "-region-" in user.lower():
+            username = f"{user_clean}-sid-{sid}-t-{hold}"
+        elif "-session" in user.lower():
+            username = f"{user_clean}-session_{sid}"
+        else:
+            username = user
         password = parts.password or ""
         auth = quote(username, safe="")
         if password:
             auth += ":" + quote(password, safe="")
-        host = parts.hostname or ""
+        host_str = parts.hostname or ""
         port = f":{parts.port}" if parts.port else ""
         return urlunparse((
             parts.scheme or "http",
-            f"{auth}@{host}{port}",
+            f"{auth}@{host_str}{port}",
             parts.path or "",
             "",
             "",
@@ -133,6 +155,7 @@ from tps_scale import (
 )
 from scrape_to_tidb import (
     ensure_db,
+    fetch_cloudbypass_v2,
     fetch_document,
     fetch_in_async_session,
     ingest_response,
@@ -145,22 +168,23 @@ HttpError = getattr(_scrape_mod, "HttpError", None)
 EmptyPageError = getattr(_scrape_mod, "EmptyPageError", None)
 ScrapeError = getattr(_scrape_mod, "ScrapeError", None)
 
-REDIS_HOST = os.environ.get("REDIS_HOST", "127.0.0.1")
-REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+REDIS_HOST = os.environ.get("TPS_REDIS_HOST") or os.environ.get("REDIS_HOST", "127.0.0.1")
+REDIS_PORT = int(os.environ.get("TPS_REDIS_PORT") or os.environ.get("REDIS_PORT", "6379"))
+REDIS_PASSWORD = os.environ.get("TPS_REDIS_PASSWORD") or os.environ.get("REDIS_PASSWORD") or None
 
 HB_INTERVAL_SEC = 20
 RECOVER_INTERVAL_SEC = 15
 IDLE_LOG_SEC = 30
 SESSION_RECYCLE_PAGES = 120
 SHUTDOWN_WAIT_SEC = 6
-# 同一条出口上的 429：先停 5 分钟，恢复后仍被限流则 15 分钟，之后 45 分钟封顶。
+# 目标站返回 429 后全局暂停领取：5 / 15 / 45 分钟。切换出口不得缩短暂停。
 RATE_LIMIT_PAUSE_STEPS_SEC = (300, 900, 2700)
 _SESSION_RETRY_BUCKETS = frozenset({"cf_fail", "retry", "empty"})
 
 _ACK_BUCKETS = frozenset({"success", "empty"})
 _KNOWN_BUCKETS = frozenset({
     "success", "empty", "http_4xx", "rate_limit", "cf_fail", "parse_fail",
-    "write_fail", "dedup_hit", "retry", "dlq",
+    "write_fail", "dedup_hit", "retry", "dlq", "no_phone",
 })
 
 
@@ -168,6 +192,7 @@ def connect_redis() -> redis.Redis:
     return redis.Redis(
         host=REDIS_HOST,
         port=REDIS_PORT,
+        password=REDIS_PASSWORD,
         decode_responses=True,
     )
 
@@ -230,7 +255,15 @@ def plan_chrome_groups(page_count: int, lane_count: int, tabs_per_chrome: int = 
 
 
 def rate_limit_pause_sec(streak: int) -> int:
-    """第 1 次 429 停 5 分钟，第 2 次 15 分钟，之后 45 分钟。"""
+    """第 1 次 429 停 5 分钟，第 2 次 15 分钟，之后 45 分钟。若指定无冷却则返回 0。"""
+    override = os.environ.get("RATE_LIMIT_PAUSE_SEC")
+    if override is not None:
+        try:
+            return max(0, int(override))
+        except ValueError:
+            pass
+    if os.environ.get("NO_RATE_LIMIT_COOLDOWN") == "1" or os.environ.get("TPS_NO_COOLDOWN") == "1":
+        return 0
     steps = RATE_LIMIT_PAUSE_STEPS_SEC
     idx = min(max(int(streak), 1), len(steps)) - 1
     return steps[idx]
@@ -244,6 +277,23 @@ def _proxy_username(proxy: str) -> str:
         return urlparse(raw if "://" in raw else "http://" + raw).username or ""
     except Exception:
         return ""
+
+
+def is_dynamic_proxy(proxy: str) -> bool:
+    """检查是否为动态住宅代理（如穿云、Decodo等轮换IP），或环境变量已声明无冷却。"""
+    if os.environ.get("NO_RATE_LIMIT_COOLDOWN") == "1" or os.environ.get("TPS_NO_COOLDOWN") == "1":
+        return True
+    if os.environ.get("RATE_LIMIT_PAUSE_SEC", "").strip() in ("0", "none", "false"):
+        return True
+    raw = (proxy or "").lower()
+    if not raw:
+        return False
+    if "cloudbypass" in raw or "gw-res" in raw:
+        return True
+    user = _proxy_username(proxy).lower()
+    if "-res_" in user or "-res-" in user or "res_us" in user or "-region-" in user:
+        return True
+    return False
 
 
 def _is_http_429(exc: BaseException) -> bool:
@@ -689,21 +739,32 @@ async def _tab_job(slot: int, box: _ChromeBox, job: dict) -> dict:
                 break
             if last_bucket not in _SESSION_RETRY_BUCKETS or attempt == 2:
                 break
-            print(f"[BROWSER] slot={slot} retry after {last_bucket}: {last_error}", flush=True)
+            print(f"[BROWSER] slot={slot} retry after {last_bucket}", flush=True)
     return done(last_bucket, last_error, False, page)
 
 
 async def _fetch_page(box: _ChromeBox, url: str):
-    """过完校验后走协议取正文；校验页或失败再退回整页渲染。"""
+    """优先走穿云 V2 API 网关抓取；失败或不可用时退回本地协议与浏览器渲染。"""
+    if os.environ.get("USE_CLOUDBYPASS", "1") == "1":
+        try:
+            page = await fetch_cloudbypass_v2(url)
+            if page is not None and getattr(page, "status", None) == 200:
+                box.warm = True
+                return page
+        except HttpError:
+            raise
+        except Exception as e:
+            print(f"[CLOUDBYPASS] fallback: {e}", flush=True)
+
     if box.warm and box.session is not None:
         try:
             page = await fetch_document(box.session, url)
-        except Exception as exc:
-            print(f"[PROTO] fallback {url}: {exc}", flush=True)
+        except Exception:
+            print("[PROTO] protocol fetch failed; using rendered page", flush=True)
             page = None
         if page is not None:
             return page
-        print(f"[PROTO] render {url}", flush=True)
+        print("[PROTO] rendering page", flush=True)
         return await fetch_in_async_session(box.session, url)
     async with box.gate:
         session = await box.ensure_session()
@@ -940,7 +1001,7 @@ class LeaseWorker:
         elif kind == "done":
             self._on_done(slot, msg)
         elif kind == "fatal":
-            print(f"[BROWSER] slot={slot.slot} fatal: {msg.get('error')}", file=sys.stderr)
+            print(f"[BROWSER] slot={slot.slot} fatal", file=sys.stderr)
 
     def _on_done(self, slot: _BrowserSlot, msg: dict) -> None:
         jid = str(msg.get("id") or slot.jid or "")
@@ -968,6 +1029,10 @@ class LeaseWorker:
         if bucket == "rate_limit":
             self._on_rate_limit(slot, job, msg, error, person, url)
             return
+        if bucket == "no_phone":
+            self._finish(job, "parse_fail", error="no_phone", retry=False)
+            print(f"  [quality_fail] job={jid} reason=no_phone moved to DLQ")
+            return
         if scrape_ms:
             _observe(self.m, "scrape_ms", scrape_ms)
         if bucket == "success":
@@ -975,10 +1040,10 @@ class LeaseWorker:
         if bucket in _ACK_BUCKETS:
             self._group_of(slot.slot).consecutive_rate_limits = 0
             self._finish(job, bucket)
-            print(f"  [{bucket}] person={person} scrape={scrape_ms:.0f}ms {url}")
+            print(f"  [{bucket}] job={jid} scrape={scrape_ms:.0f}ms")
             return
-        self._finish(job, bucket, error=error, retry=True)
-        print(f"  [{bucket}] person={person} scrape={scrape_ms:.0f}ms {url} err={error}")
+        self._finish(job, bucket, error=(error if isinstance(error, str) and error else bucket), retry=True)
+        print(f"  [{bucket}] job={jid} scrape={scrape_ms:.0f}ms")
 
     def _pause_remaining_sec(self) -> int:
         return max(0, int(self._claim_after - time.monotonic()))
@@ -990,8 +1055,24 @@ class LeaseWorker:
             return "paused"
         return "running"
 
-    def _note_rate_limit(self) -> int:
-        """同一轮限流里后续 429 不加大暂停。恢复后再遇到才升级。"""
+    def _is_dynamic_group(self, group: Optional[_ChromeGroup] = None) -> bool:
+        """判断当前槽位或环境是否使用动态住宅代理（每次请求不同IP），若是则不需要任何冷却。"""
+        if os.environ.get("NO_RATE_LIMIT_COOLDOWN") == "1" or os.environ.get("TPS_NO_COOLDOWN") == "1":
+            return True
+        if os.environ.get("RATE_LIMIT_PAUSE_SEC", "").strip() in ("0", "none", "false"):
+            return True
+        target = group if group is not None else (self.groups[0] if self.groups else None)
+        proxy = target.proxy if target else None
+        if proxy:
+            return is_dynamic_proxy(proxy)
+        return False
+
+    def _note_rate_limit(self, group: Optional[_ChromeGroup] = None) -> int:
+        """同一轮限流里后续 429 不加大暂停。动态代理模式直接返回 0。"""
+        if self._is_dynamic_group(group):
+            self._claim_after = 0.0
+            self._rate_limit_streak = 0
+            return 0
         now = time.monotonic()
         if now < self._claim_after:
             return self._pause_remaining_sec()
@@ -1023,60 +1104,31 @@ class LeaseWorker:
         stale = generation is not None and int(generation) != group.generation
         switched = False
         if not stale:
-            # Region sid rotates here, before the 70-minute claim pause.
             switched = self._rotate_region_gateway(group)
-            if not switched:
-                switched = self._switch_ip(group, region_checked=True)
-        if switched:
-            group.consecutive_rate_limits = getattr(group, "consecutive_rate_limits", 0) + 1
-            backoff_steps = (2, 5, 15, 30, 60)
-            step_idx = min(group.consecutive_rate_limits, len(backoff_steps)) - 1
-            pause = backoff_steps[step_idx]
-            group.claim_after = time.monotonic() + pause
-            if group.consecutive_rate_limits >= 3:
-                print(
-                    f"[CIRCUIT_BREAKER] chrome={group.gid} consecutive_fails={group.consecutive_rate_limits} "
-                    f"proxy backoff={pause}s to protect upstream pool",
-                    flush=True,
-                )
-            if group.consecutive_rate_limits >= 6:
-                try:
-                    import tps_alert
-                    tps_alert.send_alert(
-                        "代理风控/熔断预警",
-                        f"Worker={self.worker_id} chrome={group.gid} 连续 {group.consecutive_rate_limits} 次触发验证码，上游代理池质量严重下降，已自动实施退避降频。",
-                        level="WARNING",
-                    )
-                except Exception:
-                    pass
-        elif self.lanes is not None and not stale:
-            # refresh_sticky_url returned the same string: keep today's pause.
-            wait = max(1, int(self.lanes.holder_rest(str(group.gid))))
-            group.claim_after = time.monotonic() + wait
-            self.idle.discard(slot.slot)
-            pause = wait
-        elif stale:
-            pause = self._pause_remaining_sec()
+
+        is_dynamic = self._is_dynamic_group(group)
+
+        if switched or is_dynamic:
+            # 动态住宅代理（每次请求不同IP）：无需任何停顿，0秒冷却直接以新IP恢复抓取！
+            group.claim_after = 0.0
+            pause = 0.0
+            self._claim_after = 0.0
+            self._rate_limit_streak = 0
+            label = ProxyManager._mask_proxy(group.proxy) if group.proxy else "dynamic"
+            print(
+                f"  [rate_limit] 槽位 chrome={group.gid} 遇到风控 -> ⚡ 动态住宅代理(每次请求不同IP): {label}，零冷却立即重试！",
+                flush=True,
+            )
         else:
-            pause = self._note_rate_limit()
+            # 仅在无法轮换的固定 IP 模式下执行阶梯退避
+            pause = self._note_rate_limit(group)
+            print(f"  [rate_limit] job={jid} pause={pause}s returned to pending (固定IP冷却)", flush=True)
+
         try:
-            release(self.r, job, error or "HTTP 429")
+            release(self.r, job, "rate_limited")
             _incr(self.m, "rate_limit")
         except Exception as exc:
             print(f"[QUEUE] release {jid}: {exc}", file=sys.stderr)
-        if switched:
-            label = ProxyManager._mask_proxy(group.proxy) if group.proxy else "direct"
-            print(
-                f"  [rate_limit] person={person} {url} "
-                f"switched proxy={label} returned to pending err={error}",
-                flush=True,
-            )
-        else:
-            print(
-                f"  [rate_limit] person={person} {url} "
-                f"pause={pause}s returned to pending err={error}",
-                flush=True,
-            )
         self._proc_heartbeat()
 
     def _arm_proxy(self, group: _ChromeGroup, proxy: str) -> None:
@@ -1088,15 +1140,24 @@ class LeaseWorker:
             self._signal_proc(group.proc, signal.SIGTERM)
 
     def _rotate_region_gateway(self, group: _ChromeGroup) -> bool:
-        """region 网关换 sid 即换出口，不把同一条 sid 停约 70 分钟。"""
+        """动态代理换 sid 或穿云动态网关换出口。"""
         current = group.proxy or ""
-        if "-region-" not in _proxy_username(current).lower():
+        if not current:
             return False
-        refreshed = refresh_sticky_url(current)
-        if not refreshed or refreshed == current:
-            return False
-        self._arm_proxy(group, refreshed)
-        return True
+        user = _proxy_username(current).lower()
+        host = (urlparse(current if "://" in current else "http://" + current).hostname or "").lower()
+        if "cloudbypass" in host or "gw-res" in host or "-res_" in user or "res_us" in user:
+            refreshed = refresh_sticky_url(current)
+            if refreshed and refreshed != current:
+                self._arm_proxy(group, refreshed)
+            return True
+        if "-region-" in user:
+            refreshed = refresh_sticky_url(current)
+            if not refreshed or refreshed == current:
+                return False
+            self._arm_proxy(group, refreshed)
+            return True
+        return False
 
     def _switch_ip(self, group: _ChromeGroup, region_checked: bool = False) -> bool:
         if not region_checked and self._rotate_region_gateway(group):
@@ -1112,6 +1173,12 @@ class LeaseWorker:
     def _claim_one(self) -> None:
         if self.stop.is_set() or not self.idle:
             return
+        if (_ROOT_DIR / "data" / "client.pause").exists():
+            if not getattr(self, "_client_pause_logged", False):
+                print("[PAUSE] 客户端已暂停，不领取新任务", flush=True)
+                self._client_pause_logged = True
+            return
+        self._client_pause_logged = False
         if self._pause_remaining_sec() > 0:
             self._log_idle()
             return
@@ -1176,7 +1243,7 @@ class LeaseWorker:
                 self.in_flight.pop(jid, None)
             slot.job = None
             slot.jid = ""
-            self._finish(job, "retry", error=f"dispatch failed: {exc}", retry=True)
+            self._finish(job, "retry", error="dispatch_failed", retry=True)
             self.idle.add(slot_id)
             return
         self._proc_heartbeat()
@@ -1185,7 +1252,7 @@ class LeaseWorker:
         try:
             nack(self.r, job, "worker shutdown", retry=True)
             _incr(self.m, "retry")
-            print(f"  [nack/shutdown] {job_url(job)}")
+            print(f"  [nack/shutdown] job={job_id(job)}")
         except Exception as exc:
             print(f"[NACK] {exc}", file=sys.stderr)
 
@@ -1326,7 +1393,7 @@ class LeaseWorker:
 
             _incr(self.m, bucket)
             attempts = int(job.get("attempts") or 0)
-            if attempts + 1 >= int(MAX_ATTEMPTS):
+            if not retry or attempts + 1 >= int(MAX_ATTEMPTS):
                 _incr(self.m, "dlq")
             elif bucket != "retry":
                 _incr(self.m, "retry")
@@ -1400,7 +1467,7 @@ class LeaseWorker:
             try:
                 nack(self.r, job, "worker shutdown", retry=True)
                 _incr(self.m, "retry")
-                print(f"  [nack/shutdown] {job_url(job)}")
+                print(f"  [nack/shutdown] job={job_id(job)}")
             except Exception as exc:
                 print(f"[NACK] shutdown {job_id(job)}: {exc}", file=sys.stderr)
 
@@ -1468,12 +1535,22 @@ def run_stats() -> None:
     print("[STATS] metrics " + json.dumps(snap, ensure_ascii=False, default=str))
 
 
-def load_worker_lanes(proxy_file: str = None, concurrency: int = 2):
+def load_worker_lanes(proxy_file: str = None, concurrency: int = 2, proxy_tunnel: str = None):
     """粘性 IP 来自代理文件或隧道网关拆分。"""
     if proxy_file:
         lanes = StickyLanes.from_file(proxy_file)
         print(f"[PROXY] sticky file lanes={lanes.count} rest={int(lanes.rest_sec)}s", flush=True)
         return lanes
+    tunnel = proxy_tunnel or os.environ.get("PROXY_TUNNEL")
+    if tunnel:
+        lane_count = max(2, int(concurrency or 2))
+        lanes = tunnel_sticky_lanes(tunnel, count=lane_count)
+        if lanes is not None:
+            print(
+                f"[PROXY] sticky tunnel lanes={lanes.count} rest={int(lanes.rest_sec)}s",
+                flush=True,
+            )
+            return lanes
     try:
         cfg = load_proxy_config()
     except Exception as exc:
@@ -1495,14 +1572,14 @@ def load_worker_lanes(proxy_file: str = None, concurrency: int = 2):
     return lanes
 
 
-def run_worker(concurrency: int, target_per_day: int, page_sec: float, proxy_file: str = None) -> None:
+def run_worker(concurrency: int, target_per_day: int, page_sec: float, proxy_file: str = None, proxy_tunnel: str = None) -> None:
     r = connect_redis()
     LeaseWorker(
         r,
         concurrency,
         target_per_day,
         page_sec,
-        lanes=load_worker_lanes(proxy_file, concurrency=concurrency),
+        lanes=load_worker_lanes(proxy_file, concurrency=concurrency, proxy_tunnel=proxy_tunnel),
     ).run()
 
 
@@ -1539,6 +1616,11 @@ def main() -> None:
         default=os.environ.get("PROXY_FILE"),
         help="sticky proxy list, one URL per line; each Chrome keeps one IP until HTTP 429",
     )
+    parser.add_argument(
+        "--proxy-tunnel",
+        default=os.environ.get("PROXY_TUNNEL"),
+        help="residential tunnel gateway, e.g. http://username:password@proxy.example.invalid:8080",
+    )
     args = parser.parse_args()
 
     if args.mode == "feed":
@@ -1558,7 +1640,13 @@ def main() -> None:
                 f"[SCALE] --concurrency {args.concurrency} clamped to {plan['browsers']}",
                 file=sys.stderr,
             )
-        run_worker(plan["browsers"], plan["per_day_target"], plan["page_sec"], args.proxy_file)
+        run_worker(
+            plan["browsers"],
+            plan["per_day_target"],
+            plan["page_sec"],
+            args.proxy_file,
+            proxy_tunnel=args.proxy_tunnel,
+        )
 
 
 if __name__ == "__main__":

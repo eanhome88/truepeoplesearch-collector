@@ -354,10 +354,9 @@ python3 deploy/init_db.py
 
 ### 2. Windows 客户一键安装与启动向导
 
-针对使用 Windows 电脑的客户，提供了开箱即用的批处理脚本：
-* **全新安装**：双击运行 `deploy/install.bat`，脚本将自动配置 Python 虚拟环境、拉起本地 TiDB 与 Redis 并初始化建表；
-* **一键启动**：双击根目录 `start_client.bat`，自动在后台拉起 Supervisor 集群与可视化面板，并自动在浏览器打开控制台 `http://127.0.0.1:5001`；
-* **平稳关闭**：双击根目录 `stop_client.bat`，平稳释放所有爬虫进程与数据库连接。
+Windows 客户启动分为两条明确路径：
+* **只读本机面板**：运行根目录 `start_client.bat`。它只启动受令牌保护的本机面板，不启动采集进程、代理测试或集群；`stop_client.bat` 只停止该面板。
+* **完整离线运行包**：按 `deploy/windows-full/README.md` 的验收顺序安装到 `D:\TruePeopleSearch`，再运行 `Start-Stack.ps1`。该脚本启动数据库、Redis 和只读面板，不自动启动采集任务。
 
 ### 3. Linux / macOS 客户一键安装与启动向导
 
@@ -408,5 +407,4 @@ git push -u origin main
 * **命令行离线备用更新**：
   * Windows 客户双击 `deploy/update.bat`；
   * Linux/macOS 客户执行 `./deploy/update.sh`。
-
 
