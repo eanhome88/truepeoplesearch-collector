@@ -19,6 +19,10 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(ROOT / "scripts"))
+
+from person_visibility import person_has_phone_sql, person_has_wireless_sql, visible_phone_fields_sql
 
 def load_env():
     for f in (ROOT / ".env", ROOT / "deploy" / ".env"):
@@ -41,7 +45,7 @@ def get_db():
         host=os.environ.get("TPS_DB_HOST", "127.0.0.1"),
         port=int(os.environ.get("TPS_DB_PORT", 3306)),
         user=os.environ.get("TPS_DB_USER", "root"),
-        password=os.environ.get("TPS_DB_PASSWORD", "tps123456"),
+        password=os.environ.get("TPS_DB_PASSWORD", ""),
         database=os.environ.get("TPS_DB_NAME", "people_search"),
         connection_timeout=10,
     )
@@ -60,12 +64,16 @@ def export_leads(output_path: str, limit: int = None, only_wireless: bool = Fals
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
 
-    where_clauses = ["person_id NOT LIKE 'http%'", "person_id NOT LIKE '%resultphone%'"]
+    where_clauses = [
+        "p.person_id NOT LIKE 'http%'", "p.person_id NOT LIKE '%resultphone%'",
+        person_has_phone_sql(),
+    ]
     if only_wireless:
-        where_clauses.append("(primary_phone_type = 'Wireless' OR wireless_phone_1 IS NOT NULL)")
+        where_clauses.append(person_has_wireless_sql())
 
     where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
     limit_sql = f"LIMIT {limit}" if limit else ""
+    phones = visible_phone_fields_sql()
 
     query_sql = f"""
     SELECT
@@ -73,21 +81,22 @@ def export_leads(output_path: str, limit: int = None, only_wireless: bool = Fals
         full_name          AS `全名`,
         IFNULL(gender, '未知') AS `性别`,
         age                AS `年龄`,
-        primary_phone      AS `当前电话`,
-        primary_phone_type AS `当前电话类型`,
+        {phones['primary_phone']} AS `当前电话`,
+        {phones['primary_phone_type']} AS `当前电话类型`,
         current_address    AS `当前地址`,
         address_duration   AS `当前地址时长`,
         last_name          AS `姓`,
         first_name         AS `名`,
         middle_name        AS `中间名`,
-        all_phones         AS `电话列表`,
-        wireless_phone_1   AS `移动号码1`,
-        wireless_phone_2   AS `移动号码2`,
-        wireless_phone_3   AS `移动号码3`
-    FROM persons
-    {where_sql}
-    ORDER BY scraped_at DESC
-    {limit_sql};
+        {phones['all_phones']} AS `电话列表`,
+        {phones['wireless_phone_1']} AS `移动号码1`,
+        {phones['wireless_phone_2']} AS `移动号码2`,
+        {phones['wireless_phone_3']} AS `移动号码3`
+    FROM (
+        SELECT p.* FROM persons p {where_sql}
+        ORDER BY p.scraped_at DESC {limit_sql}
+    ) p
+    ORDER BY p.scraped_at DESC;
     """
 
     print(f"  • 正在从数据库提取客户数据 (条件: {where_sql or '全量'})...")

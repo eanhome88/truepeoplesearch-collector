@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "target": "windows-amd64",
+  "files": [
+    {
+      "path": "python/python-3.12.10-amd64.exe",
+      "role": "python-installer",
+      "sha256": "REPLACE_WITH_64_HEX_SHA256",
+      "size": 0,
+      "authenticode_thumbprint": "REPLACE_WITH_40_HEX_SIGNER_THUMBPRINT"
+    },
+    {
+      "path": "docker/DockerDesktopInstaller.exe",
+      "role": "docker-desktop-installer",
+      "sha256": "REPLACE_WITH_64_HEX_SHA256",
+      "size": 0,
+      "authenticode_thumbprint": "REPLACE_WITH_40_HEX_SIGNER_THUMBPRINT",
+      "component_versions": {
+        "desktop_product_version": "REPLACE_WITH_DOCKER_DESKTOP_PRODUCT_VERSION",
+        "docker_cli_version": "REPLACE_WITH_DOCKER_CLI_VERSION",
+        "compose_version": "REPLACE_WITH_DOCKER_COMPOSE_VERSION",
+        "engine_version": "REPLACE_WITH_DOCKER_ENGINE_VERSION"
+      }
+    },
+    {
+      "path": "browser/chromium-1243.zip",
+      "role": "chromium-archive",
+      "sha256": "REPLACE_WITH_64_HEX_SHA256",
+      "size": 0
+    },
+    {
+      "path": "images/mysql-8.4.11-linux-amd64.tar",
+      "role": "mysql-image",
+      "sha256": "REPLACE_WITH_64_HEX_SHA256",
+      "size": 0
+    },
+    {
+      "path": "images/redis-7.4.8-alpine-linux-amd64.tar",
+      "role": "redis-image",
+      "sha256": "REPLACE_WITH_64_HEX_SHA256",
+      "size": 0
+    },
+    {
+      "path": "wheelhouse/example-1.0.0-py3-none-any.whl",
+      "role": "python-wheel",
+      "sha256": "REPLACE_WITH_64_HEX_SHA256",
+      "size": 0
+    }
+  ]
+}

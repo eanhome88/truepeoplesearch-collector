@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-3000万级多进程高并发调度器 (Multi-Process Worker Runner)
+协议采集多进程调度器 (Multi-Process Worker Runner)
 
-解决核心问题：
-单进程受限于 Python GIL 与单核 CPU 算力（约在 150~200 QPS 遭遇瓶颈）。
-本调度器在单机上自动拉起 N 个独立 Python Worker 进程（充分利用多核 CPU），
-结合解耦式入库守护进程，使单机稳健吃满 350 ~ 500 QPS（即 3000 万条/日）。
+只有入库守护进程确认数据库可用、且与 Worker 的目标一致时才启动抓取进程。
+实际吞吐取决于目标站点许可、限速、代理质量和数据库状态，不预设日采集量。
 
 使用示例：
   # 代理可由本地 Redis 配置或进程环境提供，避免把凭据放进命令行。
@@ -25,6 +23,13 @@ from typing import List, Optional
 
 _ROOT = str(Path(__file__).resolve().parent.parent)
 _SCRIPTS = str(Path(__file__).resolve().parent)
+if _SCRIPTS not in sys.path:
+    sys.path.insert(0, _SCRIPTS)
+from tps_env import load_project_env
+load_project_env(Path(_ROOT), customer_safe=False)
+from scrape_to_tidb import db_target_fingerprint
+from tps_control import bulk_ingest_status
+import redis
 
 
 class MultiWorkerManager:
@@ -50,6 +55,37 @@ class MultiWorkerManager:
         self.ingester_process: Optional[subprocess.Popen] = None
         self.stopping = False
         self._term_sent = set()
+
+    def _wait_for_ingester_ready(self, timeout_sec: float = 12.0) -> None:
+        """Never launch fetchers before a live ingester confirms this DB target."""
+        r = redis.Redis(
+            host=os.environ.get("TPS_REDIS_HOST") or os.environ.get("REDIS_HOST", "127.0.0.1"),
+            port=int(os.environ.get("TPS_REDIS_PORT") or os.environ.get("REDIS_PORT", "6379")),
+            password=os.environ.get("TPS_REDIS_PASSWORD") or os.environ.get("REDIS_PASSWORD") or None,
+            decode_responses=True,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+        )
+        deadline = time.monotonic() + timeout_sec
+        while not self.stopping and time.monotonic() < deadline:
+            if self.ingester_process and self.ingester_process.poll() is not None:
+                raise RuntimeError("入库守护进程提前退出；抓取 Worker 未启动")
+            try:
+                status = bulk_ingest_status(r)
+                if status.get("db_target") and status["db_target"] != db_target_fingerprint():
+                    raise RuntimeError("入库守护进程与抓取 Worker 的数据库目标不一致")
+                expected_pid = self.ingester_process.pid if self.ingester_process else None
+                if (
+                    status.get("rate_available") and status.get("db_target")
+                    and (expected_pid is None or status.get("pid") == expected_pid)
+                ):
+                    return
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+            time.sleep(0.25)
+        raise RuntimeError("入库守护进程或数据库未就绪；抓取 Worker 未启动")
 
     def _build_worker_cmd(self, worker_idx: int) -> List[str]:
         cmd = [
@@ -137,6 +173,8 @@ class MultiWorkerManager:
                 pass
 
     def start(self):
+        if not self.decoupled_ingest:
+            raise RuntimeError("直接内存批量写库模式已禁用；需使用可靠缓冲入库")
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
 
@@ -147,7 +185,7 @@ class MultiWorkerManager:
         print(f"  • 工作子进程数: {self.num_workers} 个")
         print(f"  • 单进程协程数: {self.concurrency} 个")
         print(f"  • 全机总连接数: {total_concurrency} 并发连接")
-        print(f"  • 目标设计吞吐: 350 ~ 500 QPS (约 3,000 万 ~ 4,300 万条/天)")
+        print("  • 实际吞吐: 以确认入库指标为准；429 时暂停领取任务")
         proxy_mode = "tunnel" if self.proxy_tunnel else "file" if self.proxy_file else "api" if self.proxy_api else "local config"
         print(f"  • 代理模式配置: {proxy_mode}")
         print(f"  • 解耦高速入库: {'启用 (Redis Buffer 解耦)' if self.decoupled_ingest else '禁用 (直写 TiDB)'}")
@@ -162,6 +200,9 @@ class MultiWorkerManager:
                     self._build_ingester_cmd(),
                     stdin=subprocess.DEVNULL,
                 )
+
+            if not self.stopping:
+                self._wait_for_ingester_ready()
 
             for i in range(self.num_workers):
                 if self.stopping:
@@ -220,13 +261,16 @@ def main():
     parser.add_argument("--workers", type=int, default=default_workers, help=f"工作子进程数量 (默认依据核心数: {default_workers})")
     parser.add_argument("--concurrency", type=int, default=80, help="每个子进程内协程并发数 (默认 80)")
     parser.add_argument("--proxy-file", type=str, default=os.environ.get("PROXY_FILE"), help="本地代理列表文件路径")
-    parser.add_argument("--no-decoupled", action="store_true", help="禁用解耦缓冲，直接在 Worker 中批量写入 TiDB")
+    parser.add_argument("--no-decoupled", action="store_true", help="已禁用；直写模式不可安全恢复数据库故障")
     parser.add_argument("--no-ingester", action="store_true", help="不自动拉起批量入库守护进程 (需在其他地方单独拉起)")
 
     for option, environment in (("--proxy-tunnel", "PROXY_TUNNEL"), ("--proxy-api", "PROXY_API")):
         if any(arg == option or arg.startswith(option + "=") for arg in sys.argv[1:]):
             parser.error(f"{option} 已停用；请通过 {environment} 环境变量或本地代理配置提供地址")
     args = parser.parse_args()
+
+    if args.no_decoupled:
+        parser.error("--no-decoupled 已禁用；直接内存批量写库在 DB 故障时可能丢失已抓结果")
 
     if os.environ.get("TPS_ALLOW_CLUSTER") != "1":
         print(

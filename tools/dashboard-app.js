@@ -1,4 +1,29 @@
+const dashboardAccessToken = (() => {
+    if (window.__TPS_RELEASE_MODE__ !== 'customer') return '';
+    const storageKey = 'tps.customer.access';
+    let supplied = '';
+    try {
+        const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+        supplied = fragment.get('access_token') || '';
+    } catch (_) {
+        supplied = '';
+    }
+    if (supplied) {
+        try { window.sessionStorage.setItem(storageKey, supplied); } catch (_) {}
+        try {
+            window.history.replaceState(null, '', window.location.pathname + window.location.search);
+        } catch (_) {}
+        return supplied;
+    }
+    try { return window.sessionStorage.getItem(storageKey) || ''; } catch (_) { return ''; }
+})();
+const dashboardFetch = (url, init = {}) => {
+    const headers = { ...(init.headers || {}) };
+    if (dashboardAccessToken) headers.Authorization = `Bearer ${dashboardAccessToken}`;
+    return fetch(url, { ...init, headers });
+};
 const dashboardRuntime = LocalDashboard.createRuntime({
+    fetch: dashboardFetch,
     onVisibilityChange: hidden => document.documentElement.classList.toggle('is-background', hidden),
 });
 const dashboardRequest = (...args) => dashboardRuntime.request(...args);
@@ -314,7 +339,30 @@ function resetAdvFilter() {
     cursorTrail = [''];
     go('/persons');
 }
-function exportPersonsCsv() {
+async function readDashboardDataResponse(res) {
+    let data;
+    try {
+        data = await res.json();
+    } catch (error) {
+        if (isCancelledRequest(error)) throw error;
+        throw new Error('服务返回格式异常，请稍后重试');
+    }
+    if (!res.ok || data?.error || data?.ok === false) {
+        // Only validation errors are suitable for verbatim display. Older
+        // servers may include private exception details in failed responses.
+        const message = res.status === 400 && typeof data?.error === 'string'
+            ? data.error : '本地服务暂时不可用，请稍后重试';
+        throw new Error(message);
+    }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        throw new Error('服务返回格式异常，请稍后重试');
+    }
+    return data;
+}
+
+let personsExportPending = false;
+async function exportPersonsCsv() {
+    if (personsExportPending) return;
     const params = new URLSearchParams();
     if (personQuery) params.set('search', personQuery);
     if (phoneQuery) params.set('phone', phoneQuery);
@@ -328,22 +376,48 @@ function exportPersonsCsv() {
     params.set('limit', '50000');
 
     const btn = document.getElementById('btnExportCsv');
+    const status = document.getElementById('personsExportStatus');
+    const pageId = dashboardRuntime.currentPage();
+    personsExportPending = true;
+    if (status) status.textContent = '正在准备导出文件…';
     if (btn) {
         btn.disabled = true;
         btn.innerHTML = '⏳ 正在导出中...';
     }
-    const url = `${API}/api/export?${params.toString()}`;
-    const a = document.createElement('a');
-    a.href = url;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+    let objectUrl;
+    try {
+        // The shared dashboard transport decodes JSON. A download needs its
+        // own bounded binary response and must check failure before saving.
+        const transport = typeof dashboardFetch === 'function' ? dashboardFetch : fetch;
+        const res = await transport(`${API}/api/export?${params.toString()}`, { signal: controller.signal });
+        if (!res.ok) await readDashboardDataResponse(res);
+        if (!(res.headers.get('Content-Type') || '').toLowerCase().startsWith('text/csv')) {
+            throw new Error('服务未返回导出文件，请稍后重试');
+        }
+        const blob = await res.blob();
+        if (!dashboardRuntime.isCurrent(pageId)) return;
+        objectUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = objectUrl;
+        a.download = 'tps_export.csv';
+        document.body.appendChild(a);
+        try { a.click(); } finally { document.body.removeChild(a); }
+        if (status) status.textContent = '导出文件已准备好，请查看浏览器下载。';
+    } catch (error) {
+        if (!dashboardRuntime.isCurrent(pageId)) return;
+        const message = controller.signal.aborted ? '导出超时，请稍后重试' : (error.message || '请稍后重试');
+        if (status) status.textContent = '导出失败：' + message;
+    } finally {
+        clearTimeout(timeout);
+        if (objectUrl) setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+        personsExportPending = false;
         if (btn) {
             btn.disabled = false;
             btn.innerHTML = '📥 导出 Excel (CSV)';
         }
-    }, 2000);
+    }
 }
 function copyPhone(e, num) {
     if (e) e.stopPropagation();
@@ -493,9 +567,29 @@ async function loadSection(id, url, renderContent) {
     }
 }
 
+function metricValue(value, decimals = null) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return '—';
+    return decimals == null ? value.toLocaleString('zh-CN') : value.toFixed(decimals);
+}
+
+function metricsQualityNotice(data) {
+    const status = data.metrics_quality?.status || 'unavailable';
+    const messages = {
+        unavailable: '指标暂不可用或来源未确认，不显示推算值。',
+        inconsistent: '历史计数不一致或与演示数据特征吻合，成功率暂不可用。原始计数已保留。',
+        no_samples: '暂无任务样本，成功率暂不可用。',
+        demo: '当前为离线演示数据，不代表实际运行结果。',
+    };
+    const notes = [];
+    if (status !== 'valid') notes.push(messages[status] || messages.unavailable);
+    if (data.database_available !== true) notes.push('数据库统计暂不可用。');
+    if (data.throughput_available !== true) notes.push('实时吞吐暂不可用。');
+    return notes.length ? `<p class="field-hint" role="status">${esc(notes.join(' '))}</p>` : '';
+}
+
 async function loadOverview() {
     render(`
-        ${pageHead('Overview', '数据概览与性能大屏', '企业级定制：超快·超稳·超省·超智能全链路实时监控')}
+        ${pageHead('Overview', '数据概览与运行监控', '区分实际测量、历史计数与不可用数据')}
         <div id="overviewSummary">${skeleton()}</div>
         <section class="charts">
             <article class="panel">
@@ -516,64 +610,65 @@ async function loadOverview() {
         </article>`);
     await Promise.all([
         loadSection('overviewSummary', `${API}/api/stats`, d => `
+            ${metricsQualityNotice(d)}
             <div class="perf-banner">
                 <article class="perf-card theme-task">
                     <div class="perf-card-head">
                         <span class="perf-card-title">📋 任务总执行次数</span>
-                        <span class="perf-card-tag">全并发调度</span>
+                        <span class="perf-card-tag">历史计数</span>
                     </div>
-                    <div class="perf-card-val">${fmt(d.total_tasks_executed || d.persons)} <span style="font-size:14px;font-weight:600">次</span></div>
-                    <div class="perf-card-sub">调度请求已完成 · 累计落地 <span class="perf-highlight">${fmt(d.success_tasks || d.persons)}</span> 笔真实档案</div>
+                    <div class="perf-card-val">${metricValue(d.metrics_available === true ? d.total_tasks_executed : null)} <span style="font-size:14px;font-weight:600">次</span></div>
+                    <div class="perf-card-sub">上报成功 <span class="perf-highlight">${metricValue(d.metrics_available === true ? d.success_tasks : null)}</span> 次 · 不等同于新增入库数</div>
                 </article>
 
                 <article class="perf-card theme-speed">
                     <div class="perf-card-head">
-                        <span class="perf-card-title">⚡ 协议极速吞吐</span>
-                        <span class="perf-card-tag" style="background:#e0f2fe;color:#0369a1">超快·32路并发</span>
+                        <span class="perf-card-title">实时确认入库速率</span>
+                        <span class="perf-card-tag" style="background:#e0f2fe;color:#0369a1">数据库提交确认</span>
                     </div>
-                    <div class="perf-card-val">${(d.current_qps || 32).toFixed(1)} <span style="font-size:14px;font-weight:600">QPS</span></div>
-                    <div class="perf-card-sub">平均协议响应 <span class="perf-highlight">${d.avg_latency_ms || 48} ms</span> (提速 28x)</div>
+                    <div class="perf-card-val">${metricValue(d.throughput_available === true ? d.current_qps : null, 1)} <span style="font-size:14px;font-weight:600">QPS</span></div>
+                    <div class="perf-card-sub">不等于新增人物数 · 历史平均响应 <span class="perf-highlight">${metricValue(d.metrics_quality?.status === 'valid' ? d.avg_latency_ms : null, 1)} ms</span></div>
                 </article>
 
                 <article class="perf-card theme-stable">
                     <div class="perf-card-head">
-                        <span class="perf-card-title">🛡️ 核心运行稳定性</span>
-                        <span class="perf-card-tag" style="background:#dcfce7;color:#15803d">超稳·零丢单</span>
+                        <span class="perf-card-title">任务上报成功率</span>
+                        <span class="perf-card-tag" style="background:#dcfce7;color:#15803d">按有效样本</span>
                     </div>
-                    <div class="perf-card-val">${d.success_rate_pct || 99.8}<span style="font-size:14px;font-weight:600">%</span></div>
-                    <div class="perf-card-sub">智能异常自愈 & 自动重试机制 · 0 丢失</div>
+                    <div class="perf-card-val">${metricValue(d.metrics_quality?.status === 'valid' ? d.success_rate_pct : null, 2)}<span style="font-size:14px;font-weight:600">%</span></div>
+                    <div class="perf-card-sub">无样本或计数异常时不计算；不代表入库成功率</div>
                 </article>
 
                 <article class="perf-card theme-saving">
                     <div class="perf-card-head">
-                        <span class="perf-card-title">🌐 极致省流引擎</span>
-                        <span class="perf-card-tag" style="background:#fef3c7;color:#b45309">超省·96.8%</span>
+                        <span class="perf-card-title">流量节约</span>
+                        <span class="perf-card-tag" style="background:#fef3c7;color:#b45309">未接入实际计量</span>
                     </div>
-                    <div class="perf-card-val">${d.traffic_saved_gb || 0.5} <span style="font-size:14px;font-weight:600">GB</span></div>
-                    <div class="perf-card-sub">纯协议免加载媒体省流 96.8% · 去重 ${fmt(d.dedup_saved_count || 0)} 次</div>
+                    <div class="perf-card-val">— <span style="font-size:14px;font-weight:600">GB</span></div>
+                    <div class="perf-card-sub">未测量 · 去重上报 ${metricValue(d.metrics_available === true ? d.dedup_saved_count : null)} 次</div>
                 </article>
 
                 <article class="perf-card theme-smart">
                     <div class="perf-card-head">
-                        <span class="perf-card-title">🧠 智能号码拓扑识别</span>
-                        <span class="perf-card-tag" style="background:#f3e8ff;color:#7e22ce">超智能</span>
+                        <span class="perf-card-title">含座机的移动主号档案</span>
+                        <span class="perf-card-tag" style="background:#f3e8ff;color:#7e22ce">库存统计</span>
                     </div>
-                    <div class="perf-card-val">${fmt(d.smart_fallback_count || 0)} <span style="font-size:14px;font-weight:600">次</span></div>
-                    <div class="perf-card-sub">座机智能降级为最新手机 · 手机占比 <span class="perf-highlight">${d.wireless_ratio_pct || 0}%</span></div>
+                    <div class="perf-card-val">${metricValue(d.database_available === true ? d.smart_fallback_count : null)} <span style="font-size:14px;font-weight:600">条</span></div>
+                    <div class="perf-card-sub">含移动电话的档案占比 <span class="perf-highlight">${metricValue(d.database_available === true ? d.wireless_ratio_pct : null)}%</span></div>
                 </article>
             </div>
 
-            ${overviewCover(d)}
+            ${d.database_available === true ? overviewCover(d) : ''}
 
             <section class="bento">
                 <article class="panel hero is-link" data-go="/persons" role="link" tabindex="0" aria-label="打开人物列表">
                     <div class="hero-kicker">已入库</div>
-                    <div><div class="hero-num">${fmt(d.persons)}</div><div class="hero-desc">库内真实档案 · 点击进入多维检索</div></div>
+                    <div><div class="hero-num">${metricValue(d.database_available === true ? d.persons : null)}</div><div class="hero-desc">数据库记录数 · 不代表本轮新增</div></div>
                 </article>
-                <article class="panel metric"><div class="metric-label">关联移动手机 (Wireless)</div><div class="metric-num" style="color:#059669">${fmt(d.wireless_count || d.primary_wireless_count)}</div></article>
-                <article class="panel metric"><div class="metric-label">全部电话记录</div><div class="metric-num">${fmt(d.phones)}</div></article>
-                <article class="panel metric"><div class="metric-label">邮箱地址</div><div class="metric-num">${fmt(d.emails)}</div></article>
-                <article class="panel metric"><div class="metric-label">居住地址</div><div class="metric-num">${fmt(d.prev_addr)}</div></article>
+                <article class="panel metric"><div class="metric-label">关联移动手机 (Wireless)</div><div class="metric-num" style="color:#059669">${metricValue(d.database_available === true ? (d.wireless_count ?? d.primary_wireless_count) : null)}</div></article>
+                <article class="panel metric"><div class="metric-label">有效手机/座机号码（去重）</div><div class="metric-num">${metricValue(d.database_available === true ? d.phones : null)}</div></article>
+                <article class="panel metric"><div class="metric-label">邮箱地址</div><div class="metric-num">${metricValue(d.database_available === true ? d.emails : null)}</div></article>
+                <article class="panel metric"><div class="metric-label">居住地址</div><div class="metric-num">${metricValue(d.database_available === true ? d.prev_addr : null)}</div></article>
             </section>`),
         loadSection('cityChart', `${API}/api/cities`, data => renderBars((data || []).slice(0, 10), x => `${x.city || '未知'}, ${x.state || ''}`, true)),
         loadSection('overviewAges', `${API}/api/age-distribution`, data => renderBars(data, x => x.age_group)),
@@ -667,6 +762,7 @@ async function loadPersons(pageOrOpts = 1) {
                         <button type="button" class="btn btn-export" id="btnExportCsv" onclick="exportPersonsCsv()">📥 导出 Excel (CSV)</button>
                     </div>
                 </div>
+                <p id="personsExportStatus" role="status" aria-live="polite"></p>
             </div>
 
             <div class="panel" id="personsTable">${skeleton()}</div>
@@ -697,7 +793,8 @@ async function loadPersons(pageOrOpts = 1) {
 
     try {
         const res = await dashboardRequest(`${API}/api/persons?${params}`);
-        const d = await res.json();
+        const d = await readDashboardDataResponse(res);
+        if (!Array.isArray(d.data)) throw new Error('服务返回格式异常，请稍后重试');
         totalPages = Math.max(1, Math.ceil((d.total || 0) / (d.size || 20)));
         currentPage = Number(d.page) || page;
 
@@ -776,6 +873,8 @@ async function loadPersons(pageOrOpts = 1) {
 
     } catch (e) {
         if (isCancelledRequest(e)) return;
+        const statsEl = document.getElementById('personsStatsBar');
+        if (statsEl) statsEl.innerHTML = '';
         document.getElementById('personsTable').innerHTML = emptyState('加载失败', String(e));
     }
 }
@@ -1081,7 +1180,7 @@ function pipelineShell() {
                 <div class="field-grid">
                     <label class="field">浏览器数<input id="pipeConc" type="number" min="1" max="128" value="2"></label>
                 </div>
-                <p class="field-hint">这是常驻浏览器的个数，用来保住验证。人物文档走协议，不按每条重新渲染。入库成功才算完成。</p>
+                <p class="field-hint">浏览器和协议工作进程的抓取进度与数据库新增分开统计；实际入库以数据库可查记录为准。</p>
             </article>
         </section>
         <section class="pipe-kpis">
@@ -1105,7 +1204,7 @@ function pipelineShell() {
                 </div>
                 <div class="live-rate-tag" id="flowRateTag">
                     <span class="live-dot pulse-emerald"></span>
-                    <span id="flowRateVal">待命 / 0.0 QPS</span>
+                    <span id="flowRateVal">抓取待命 / 0.0 QPS</span>
                 </div>
             </div>
             <div class="flow-steps">
@@ -1521,7 +1620,9 @@ function applyPipeline(d) {
     const worker = d.worker || {};
     const disc = d.discover || {};
     const cov = d.coverage || {};
-    const counters = (d.metrics && d.metrics.counters) || {};
+    const metrics = d.metrics || {};
+    const counters = metrics.counters || {};
+    const reportedSuccess = metrics.metrics_available === true ? counters.success : null;
     const persons = Number(d.persons || 0);
     const pending = Number(q.pending || 0);
     const processing = Number(q.processing || 0);
@@ -1536,10 +1637,14 @@ function applyPipeline(d) {
     const discUrl = disc.current_url ? shortPath(disc.current_url) : '';
     const workN = (worker.pids || []).length;
     const latency = ((d.metrics || {}).latency || {}).scrape_ms || {};
-    const avgMs = Number(latency.avg || 3000);
+    const avgMs = latency.avg;
     const remPeople = inScope > 0 ? Math.max(0, inScope - persons) : remain;
-    const conc = Math.max(1, Number(document.getElementById('pipeConc')?.value || 2));
-    const etaSec = remPeople * (avgMs / 1000) / conc;
+    const conc = worker.concurrency;
+    const canEstimate = worker.running === true && !worker.paused
+        && metrics.metrics_quality?.status === 'valid'
+        && typeof avgMs === 'number' && Number.isFinite(avgMs) && avgMs > 0
+        && typeof conc === 'number' && Number.isFinite(conc) && conc > 0;
+    const etaSec = canEstimate ? remPeople * (avgMs / 1000) / conc : null;
 
     hydrateSlice(cov.slice || (d.scale && d.scale.slice));
     if (d.scale && d.scale.layers && !scaleDirty) renderScale(d.scale);
@@ -1600,11 +1705,11 @@ function applyPipeline(d) {
     setText('pipeProgressText', inScope > 0
         ? `${fmt(persons)} / ${fmt(inScope)} · ${pct}% · ${sliceLabel(cov.slice)}${estimated ? ' · 每姓约 ' + fmt(cov.listed_per_surname || 500) + ' 人' : ''} · 占 2.5 亿 ${fmtShare(scale.pct_of_universe)}`
         : remain
-            ? `已入库 ${fmt(persons)} · 队列 ${fmt(remain)} · 成功 ${fmt(counters.success)} · 占 2.5 亿 ${fmtShare(scale.pct_of_universe)}`
+            ? `库存 ${fmt(persons)} · 队列 ${fmt(remain)} · 上报成功 ${metricValue(reportedSuccess)} · 占 2.5 亿 ${fmtShare(scale.pct_of_universe)}`
             : `队列为空 · 站点上限 2.5 亿 · 当前目录可点 ${fmtYi(scale.directory_slice || 0)}`);
-    setText('pipeEta', remPeople
-        ? `预计剩余 ${formatEta(etaSec)} · 并发 ${conc} · 单条约 ${Math.round(avgMs / 1000)} 秒`
-        : '预计剩余 —');
+    setText('pipeEta', remPeople && canEstimate && Number.isFinite(etaSec)
+        ? `按历史耗时粗估 ${formatEta(etaSec)} · 并发 ${conc} · 单条约 ${Math.round(avgMs / 1000)} 秒`
+        : '剩余时间不可估算（未运行、暂停或无有效测量）');
     let clusterJobs = [];
     if (d.cluster && Array.isArray(d.cluster.workers)) {
         d.cluster.workers.forEach(w => {
@@ -1614,17 +1719,21 @@ function applyPipeline(d) {
     const jobs = (worker.inflight && worker.inflight.length)
         ? worker.inflight
         : (clusterJobs.length ? clusterJobs : (d.jobs || []));
-    const activeCount = (d.cluster && d.cluster.running && (d.cluster.inflight_count || q.processing))
-        ? (d.cluster.inflight_count || q.processing)
-        : (q.processing || jobs.length);
-    setText('jobCount', fmt(activeCount));
-    const qps = Number(counters.qps || 0);
-    const qpsText = qps > 0 ? `实时 ${qps.toFixed(1)} QPS · 预计日产 ${fmtYi(qps * 86400)}` : (activeCount > 0 ? `活跃 ${activeCount} 并发在飞` : '待命 / 准备就绪');
+    // Leased queue entries can remain after a stop; they are not live tasks.
+    const activeCount = d.cluster?.running === true
+        ? d.cluster.inflight_count
+        : (worker.running === true ? jobs.length : 0);
+    setText('jobCount', metricValue(activeCount));
+    const qps = d.cluster?.running === true && d.cluster.throughput_available !== false ? d.cluster.total_qps
+        : (worker.running === false ? 0 : null);
+    const qpsText = typeof qps === 'number' && Number.isFinite(qps) && qps >= 0
+        ? `确认入库 ${metricValue(qps, 1)} QPS · 非新增人数`
+        : '入库速率暂不可用';
     setText('flowRateVal', qpsText);
     setText('flowDiscVal', fmt(pendingDirs));
     setText('flowPendingVal', fmt(pending));
-    setText('flowInflightVal', fmt(activeCount));
-    setText('flowSuccessVal', fmt(counters.success || persons));
+    setText('flowInflightVal', metricValue(activeCount));
+    setText('flowSuccessVal', metricValue(reportedSuccess));
     setText('flowDlqVal', fmt(dlq));
 
     window._lastJobs = jobs;
@@ -2022,7 +2131,10 @@ async function loadSearchPage(q) {
         <div class="panel"><div class="empty"><p>搜索中…</p></div></div>`);
     try {
         const res = await dashboardRequest(`${API}/api/search?q=${encodeURIComponent(query)}`);
-        const d = await res.json();
+        const d = await readDashboardDataResponse(res);
+        if (!['persons', 'phones', 'emails'].every(key => Array.isArray(d[key]))) {
+            throw new Error('服务返回格式异常，请稍后重试');
+        }
         const blocks = [];
         if (d.persons?.length) blocks.push(`<article class="panel stack">
             <div class="card-head"><div><h3>人物匹配</h3><p>${d.persons.length} 条</p></div></div>
@@ -2106,6 +2218,29 @@ async function loadRecent() {
 
 let proxyPollTimer = null;
 let batch100PollTimer = null;
+
+function batch100ProgressSummary(status) {
+    const attempted = Number(status?.current || 0);
+    const target = Number(status?.total || 100);
+    const present = status?.verified_present == null ? '待验证' : fmt(status.verified_present);
+    const added = status?.new_rows == null ? '待验证' : fmt(status.new_rows);
+    return `已检查 ${fmt(attempted)} / ${fmt(target)} · 数据库可查 ${present} · 检查期间新出现 ${added}`;
+}
+
+function batch100FinishLabel(status) {
+    if (status?.job_status === 'verification_required') return '外部任务需人工核查';
+    if (status?.job_status === 'rate_limited') return '目标限流，已停止';
+    if (status?.job_status === 'stopped') return '任务已停止';
+    if (status?.job_status === 'partial') return '部分完成，未达到验证目标';
+    if (status?.job_status === 'completed') {
+        return Number(status.new_rows || 0) > 0 ? '样本验证结束' : '样本检查结束，无新增';
+    }
+    return '验证失败，请查看日志';
+}
+
+function batch100HasNewRows(status) {
+    return status?.job_status === 'completed' && Number(status.new_rows || 0) > 0;
+}
 let proxyTesting = false;
 let clusterBusy = false;
 let clusterStatusSeq = 0;
@@ -2148,7 +2283,7 @@ async function loadProxyCluster() {
         if (typeof resCluster.running !== 'boolean') throw new Error('状态响应无效');
         const proxyCfg = resProxy.config;
         const cluster = resCluster;
-        const metrics = resMetrics?.counters && typeof resMetrics.counters === 'object'
+        const metrics = resMetrics?.metrics_quality?.status === 'valid' && resMetrics?.counters && typeof resMetrics.counters === 'object'
             ? resMetrics.counters : null;
         currentProxyCfg = proxyCfg;
 
@@ -2166,13 +2301,12 @@ async function loadProxyCluster() {
 function renderProxyClusterView(cfg, cluster, metrics) {
     const mode = (cfg.mode || 'direct').toLowerCase();
     const isRunning = !!cluster.running;
-    const qps = Number(cluster.total_qps || 0);
-    const targetQps = 347.2; // 3000万/天
-    const progressPct = Math.min(100, Math.round((qps / targetQps) * 100));
+    const qps = cluster.throughput_available === false || typeof cluster.total_qps !== 'number'
+        || !Number.isFinite(cluster.total_qps) || cluster.total_qps < 0 ? null : cluster.total_qps;
     const succCount = metrics ? Number(metrics.success || 0) : null;
     const cfCount = metrics ? Number(metrics.cf_fail || 0) : null;
-    const totalReq = (succCount || 0) + (cfCount || 0);
-    const cfRate = metrics ? (totalReq > 0 ? ((cfCount / totalReq) * 100).toFixed(1) + '%' : '0.0%') : '—';
+    const totalReq = metrics ? Number(metrics.attempt || 0) : 0;
+    const cfRate = metrics && totalReq > 0 ? ((cfCount / totalReq) * 100).toFixed(1) + '%' : '—';
     const bufferDepth = Number(cluster.buffer_depth || 0);
     const inflight = Number(cluster.inflight_count || 0);
 
@@ -2218,9 +2352,9 @@ function renderProxyClusterView(cfg, cluster, metrics) {
 
         <section class="pipe-kpis" style="margin-bottom: 20px;">
             <article class="panel pipe-kpi">
-                <div class="metric-label">实时抓取吞吐</div>
-                <div class="metric-num"><span id="liveQps">${qps.toFixed(1)}</span> <span style="font-size:14px;font-weight:normal;color:var(--ink-3)">QPS</span></div>
-                <p class="muted" style="margin-top:6px;font-size:12px" id="liveQpsSub">日产 3000万 目标: ${progressPct}% (${targetQps} QPS)</p>
+                <div class="metric-label">实时确认入库速率</div>
+                <div class="metric-num"><span id="liveQps">${metricValue(qps, 1)}</span> <span style="font-size:14px;font-weight:normal;color:var(--ink-3)">QPS</span></div>
+                <p class="muted" style="margin-top:6px;font-size:12px" id="liveQpsSub">数据库已提交并确认，不代表新增人物数</p>
             </article>
             <article class="panel pipe-kpi">
                 <div class="metric-label">当前代理模式</div>
@@ -2258,7 +2392,7 @@ function renderProxyClusterView(cfg, cluster, metrics) {
                             <span id="smartParsedTag" style="display:none; font-size:11px; font-weight:600;" class="badge badge-ok"></span>
                         </div>
                         <div style="display:flex; gap:8px;">
-                            <input id="pxSmartInput" placeholder="直接粘贴如: gate.decodo.com:10001:spevk8xxrl:password 或 curl 命令" style="flex:1; font-family:monospace; font-size:12px;" autocomplete="off">
+                            <input id="pxSmartInput" placeholder="直接粘贴如: gateway.example:10001:account:password 或 curl 命令" style="flex:1; font-family:monospace; font-size:12px;" autocomplete="off">
                             <button type="button" class="btn btn-primary" id="btnSmartFill" style="padding:0 14px; font-size:13px; white-space:nowrap;">一键识别填入</button>
                         </div>
                         <div style="font-size:11px; color:var(--ink-4); margin-top:6px;">
@@ -2331,7 +2465,7 @@ function renderProxyClusterView(cfg, cluster, metrics) {
                             <div style="font-weight:600;font-size:13px;">Cloudflare 穿透与连通性实测</div>
                             <button type="button" class="btn btn-primary" id="btnTestProxy" style="padding:6px 14px;font-size:13px;">立即测试当前代理</button>
                         </div>
-                        <input id="pxTestUrl" value="https://www.truepeoplesearch.com/find/person/px82l44nur68u2l8n60" style="font-size:12px;margin-bottom:8px;" placeholder="测试目标 URL" autocomplete="off">
+                        <input id="pxTestUrl" value="https://www.truepeoplesearch.com/find/person/px82l44nur68u2l8n60" style="font-size:12px;margin-bottom:8px;" placeholder="测试目标 URL" autocomplete="off" readonly title="固定测试目标：TruePeopleSearch 真实人物页，用于验证 TLS 指纹与 CF 响应">
                         
                         <div id="testResultBox" style="display:none;margin-top:10px;">
                             <div style="display:flex;gap:8px;align-items:center;">
@@ -2354,7 +2488,7 @@ function renderProxyClusterView(cfg, cluster, metrics) {
                 <div class="card-head">
                     <div>
                         <h3>任务采集与集群调度</h3>
-                        <p>支持一键验证采集 100 条 · 多进程协程集群架构 · 解耦微批极速入库</p>
+                        <p>小样本验证会区分抓取、数据库可查和本次新增；遇目标限流立即停止</p>
                     </div>
                     <div class="pipe-status">
                         <span class="live-dot ${isRunning ? 'on' : ''}" id="clusterLiveDot"></span>
@@ -2368,11 +2502,11 @@ function renderProxyClusterView(cfg, cluster, metrics) {
                         <div style="display:flex; justify-content:space-between; align-items:center;">
                             <div>
                                 <div style="font-weight:700; font-size:14px; display:flex; align-items:center; gap:8px;">
-                                    <span>🎯 极速测试采集 100 条</span>
+                                    <span>🎯 最多 100 条小样本验证</span>
                                     <span class="badge badge-ok" id="batch100StatusBadge">就绪</span>
                                 </div>
                                 <div style="font-size:12px; color:var(--ink-3); margin-top:4px;">
-                                    通过当前配置代理实机抓取 100 个真实档案并入库 MySQL，实时检验连通与字段采全率
+                                    最多检查 100 个候选档案，分别报告尝试数、数据库可查数和检查期间新出现数；并行写库时不归因于本任务
                                 </div>
                             </div>
                             <button type="button" class="btn btn-primary" id="btnRunBatch100" style="padding:9px 18px; font-size:13px; font-weight:600; background:#1b8a5a; border-color:#1b8a5a; color:#fff; white-space:nowrap;">
@@ -2465,7 +2599,7 @@ function smartParseProxyString(str) {
         if (host && port) return { host, port, user: user || '', pass: pRest.join(':') };
     }
 
-    // 3. 4-part colon format: host:port:user:pass (e.g. gate.decodo.com:10001:spevk8xxrl:cOctvu~5aSud5FC72b)
+    // 3. 4-part colon format: host:port:user:pass (e.g. gateway.example:10001:account:password)
     const parts = str.split(':');
     if (parts.length >= 4) {
         const host = parts[0].replace(/^https?:\/\//, '');
@@ -2590,6 +2724,16 @@ function bindProxyClusterEvents(initialCfg, initialCluster) {
             let proxyToTest = '';
             if (currentMode === 'tunnel') {
                 proxyToTest = pxTunnelUrl?.value?.trim() || '';
+                if ((proxyToTest.includes(':****@') || proxyToTest.includes(':******@')) && !cfg.has_password) {
+                    testBadge.className = 'test-res-badge fail';
+                    testBadge.textContent = '配置未保存';
+                    testSummary.textContent = '密码包含掩码且尚未保存';
+                    testDetail.textContent = '检测到代理密码为掩码状态，请先在上方输入真实密码并点击「保存配置并应用到集群」，然后再执行测试。';
+                    proxyTesting = false;
+                    btnTest.disabled = false;
+                    btnTest.textContent = '立即测试当前代理';
+                    return;
+                }
             } else if (currentMode === 'direct') {
                 proxyToTest = 'direct';
             } else {
@@ -2609,19 +2753,19 @@ function bindProxyClusterEvents(initialCfg, initialCluster) {
                 const data = await res.json();
                 if (data.success && !data.cf_blocked) {
                     testBadge.className = 'test-res-badge pass';
-                    testBadge.textContent = '穿透成功 · 200 OK';
-                    testSummary.textContent = `耗时: ${data.latency_ms}ms · 接收 ${fmt(data.bytes || 0)} 字节`;
-                    testDetail.textContent = 'TLS 指纹模拟（chrome124）成功绕过 Cloudflare 防护，可直接投入生产！';
+                    testBadge.textContent = '单次连通 · 200 OK';
+                    testSummary.textContent = `HTTP 200 · 耗时: ${data.latency_ms}ms · 接收 ${fmt(data.bytes || 0)} 字节`;
+                    testDetail.textContent = '单次 HTTP 请求顺利通过 TLS 指纹验证。注意：这仅代表单次网络连通，并不代表已开始解析人物或入库，实际数据采集需运行 Worker 调度进程。';
                 } else if (data.cf_blocked) {
-                    testBadge.className = 'test-res-badge pass';
-                    testBadge.textContent = '网络畅通 · CF已识别';
-                    testSummary.textContent = `HTTP ${data.status_code || 403} · 耗时: ${data.latency_ms}ms`;
-                    testDetail.textContent = '代理网络正常！TruePeopleSearch 开启了 JS 验证，后台浏览器引擎已自动过盾并持续高速抓取中。';
+                    testBadge.className = 'test-res-badge fail';
+                    testBadge.textContent = '触发拦截 · HTTP 403';
+                    testSummary.textContent = `HTTP ${data.status_code || 403} · 耗时: ${data.latency_ms}ms · Cloudflare 挑战盾`;
+                    testDetail.textContent = '该代理遭遇目标网站 Cloudflare 防护拦截（HTTP 403）。纯协议请求无法直接穿透，需依赖后台 Chromium/Scrapling 无头浏览器自动过盾；且当前未在抓取或入库。';
                 } else {
                     testBadge.className = 'test-res-badge fail';
                     testBadge.textContent = '探测失败';
-                    testSummary.textContent = data.message || '网络连接超时或代理未响应';
-                    testDetail.textContent = data.error || '若报 Empty reply，请检查 Decodo 仪表盘「验证方法」中的白名单 IP 或账密是否有效。';
+                    testSummary.textContent = data.message || (data.status_code ? `返回异常 HTTP ${data.status_code}` : '网络连接超时或代理未响应');
+                    testDetail.textContent = data.error || '若报 Empty reply 或认证失败，请检查 Decodo 仪表盘中的账密、端口或白名单 IP。';
                 }
             } catch (err) {
                 if (isCancelledRequest(err)) return;
@@ -2727,9 +2871,13 @@ function bindProxyClusterEvents(initialCfg, initialCluster) {
                     const tot = st.total || 100;
                     const pct = Math.min(100, Math.round((cur / tot) * 100));
 
-                    if (progText) progText.textContent = `已采集入库: ${cur} / ${tot} 条人物档案`;
+                    if (progText) progText.textContent = batch100ProgressSummary(st);
                     if (progPct) progPct.textContent = `${pct}%`;
                     if (progFill) progFill.style.width = `${pct}%`;
+                    if (st.job_status === 'verification_required' && statusBadge) {
+                        statusBadge.textContent = batch100FinishLabel(st);
+                        statusBadge.className = 'badge badge-warn';
+                    }
 
                     if (st.logs && st.logs.length && logBox) {
                         logBox.textContent = st.logs.join('\n');
@@ -2744,12 +2892,12 @@ function bindProxyClusterEvents(initialCfg, initialCluster) {
                         if (btnRun) { btnRun.disabled = false; btnRun.textContent = '▶ 开始采集 100 条'; }
                         if (btnTop) { btnTop.disabled = false; btnTop.textContent = '🎯 一键测试采集 100 条'; }
                         if (statusBadge) {
-                            statusBadge.textContent = cur >= tot ? '采集完成 100 条' : '就绪';
-                            statusBadge.className = cur >= tot ? 'badge badge-ok' : 'badge';
+                            statusBadge.textContent = batch100FinishLabel(st);
+                            statusBadge.className = batch100HasNewRows(st) ? 'badge badge-ok' : 'badge badge-warn';
                         }
-                        if (toast && cur >= tot) {
-                            toast.className = 'toast-msg success';
-                            toast.textContent = '🎉 100 条验证档案已全部采集并成功入库 MySQL！可在【人物数据档案】页面查看并导出！';
+                        if (toast) {
+                            toast.className = batch100HasNewRows(st) ? 'toast-msg success' : 'toast-msg error';
+                            toast.textContent = `${batch100FinishLabel(st)}；检查期间新出现 ${st.new_rows ?? '未确认'} 条。`;
                         }
                     }
                 } catch (e) {}
@@ -2769,6 +2917,87 @@ function bindProxyClusterEvents(initialCfg, initialCluster) {
     if (btnRunBatch100) btnRunBatch100.addEventListener('click', triggerBatch100);
     const btnQuickBatch100 = document.getElementById('btnQuickBatch100');
     if (btnQuickBatch100) btnQuickBatch100.addEventListener('click', triggerBatch100);
+
+    // 自动检测并恢复后台 100 条采集任务的状态与进度条（避免切换页面后丢失进度）
+    (async () => {
+        try {
+            const stRes = await dashboardRequest(`${API}/api/batch100/status`);
+            const st = await stRes.json();
+            if (!st.ok) return;
+
+            const btnRun = document.getElementById('btnRunBatch100');
+            const btnTop = document.getElementById('btnQuickBatch100');
+            const progBox = document.getElementById('batch100ProgressBox');
+            const progText = document.getElementById('batch100ProgressText');
+            const progPct = document.getElementById('batch100ProgressPct');
+            const progFill = document.getElementById('batch100ProgressFill');
+            const statusBadge = document.getElementById('batch100StatusBadge');
+            const logBox = document.getElementById('clusterLogText');
+
+            const cur = st.current || 0;
+            const tot = st.total || 100;
+            const pct = Math.min(100, Math.round((cur / tot) * 100));
+
+            if (st.running || cur > 0 || (st.logs && st.logs.length)) {
+                if (progBox) progBox.style.display = 'block';
+                if (progText) progText.textContent = batch100ProgressSummary(st);
+                if (progPct) progPct.textContent = `${pct}%`;
+                if (progFill) progFill.style.width = `${pct}%`;
+                if (st.logs && st.logs.length && logBox) {
+                    logBox.textContent = st.logs.join('\n');
+                    logBox.scrollTop = logBox.scrollHeight;
+                }
+            }
+
+            if (st.running) {
+                const needsReview = st.job_status === 'verification_required';
+                if (btnRun) { btnRun.disabled = true; btnRun.textContent = needsReview ? '需人工核查' : '正在采集...'; }
+                if (btnTop) { btnTop.disabled = true; btnTop.textContent = needsReview ? '需人工核查' : '正在采集...'; }
+                if (statusBadge) { statusBadge.textContent = needsReview ? batch100FinishLabel(st) : '正在采集'; statusBadge.className = 'badge badge-warn'; }
+
+                if (batch100PollTimer) {
+                    batch100PollTimer.stop();
+                    batch100PollTimer = null;
+                }
+                batch100PollTimer = dashboardRuntime.startPoll(async () => {
+                    try {
+                        const r = await dashboardRequest(`${API}/api/batch100/status`);
+                        const s = await r.json();
+                        if (!s.ok) return;
+                        const c = s.current || 0;
+                        const t = s.total || 100;
+                        const p = Math.min(100, Math.round((c / t) * 100));
+                        if (progText) progText.textContent = batch100ProgressSummary(s);
+                        if (progPct) progPct.textContent = `${p}%`;
+                        if (progFill) progFill.style.width = `${p}%`;
+                        if (s.job_status === 'verification_required' && statusBadge) {
+                            statusBadge.textContent = batch100FinishLabel(s);
+                            statusBadge.className = 'badge badge-warn';
+                        }
+                        if (s.logs && s.logs.length && logBox) {
+                            logBox.textContent = s.logs.join('\n');
+                            logBox.scrollTop = logBox.scrollHeight;
+                        }
+                        if (!s.running) {
+                            if (batch100PollTimer) {
+                                batch100PollTimer.stop();
+                                batch100PollTimer = null;
+                            }
+                            if (btnRun) { btnRun.disabled = false; btnRun.textContent = '▶ 开始采集 100 条'; }
+                            if (btnTop) { btnTop.disabled = false; btnTop.textContent = '🎯 一键测试采集 100 条'; }
+                            if (statusBadge) {
+                                statusBadge.textContent = batch100FinishLabel(s);
+                                statusBadge.className = batch100HasNewRows(s) ? 'badge badge-ok' : 'badge badge-warn';
+                            }
+                        }
+                    } catch (e) {}
+                }, 1500, { backoff: false });
+            } else if (st.job_status && st.job_status !== 'idle' && statusBadge) {
+                statusBadge.textContent = batch100FinishLabel(st);
+                statusBadge.className = batch100HasNewRows(st) ? 'badge badge-ok' : 'badge badge-warn';
+            }
+        } catch (e) {}
+    })();
 
     // 启停集群逻辑 (统一处理大卡片按钮与顶部向导按钮)
     async function toggleClusterAction() {
@@ -2878,23 +3107,22 @@ async function refreshClusterLiveStatus({ fresh = false } = {}) {
         }
 
         const isRunning = !!resCluster.running;
-        const qps = Number(resCluster.total_qps || 0);
-        const targetQps = 347.2;
-        const progressPct = Math.min(100, Math.round((qps / targetQps) * 100));
+        const qps = resCluster.throughput_available === false || typeof resCluster.total_qps !== 'number'
+            || !Number.isFinite(resCluster.total_qps) || resCluster.total_qps < 0 ? null : resCluster.total_qps;
 
         // 更新 KPI
-        setText('liveQps', qps.toFixed(1));
-        setText('liveQpsSub', `日产 3000万 目标: ${progressPct}% (${targetQps} QPS)`);
-        setText('liveBuffer', fmt(resCluster.buffer_depth || 0));
+        setText('liveQps', metricValue(qps, 1));
+        setText('liveQpsSub', '数据库已提交并确认，不代表新增人物数');
+        setText('liveBuffer', metricValue(resCluster.buffer_depth));
         setText('liveInflight', `在飞协程任务: ${fmt(resCluster.inflight_count || 0)} 条`);
 
-        if (resMetrics && resMetrics.counters) {
+        if (resMetrics?.metrics_quality?.status === 'valid' && resMetrics.counters) {
             const succ = Number(resMetrics.counters.success || 0);
             const cf = Number(resMetrics.counters.cf_fail || 0);
-            const total = succ + cf;
-            const rate = total > 0 ? ((cf / total) * 100).toFixed(1) : '0.0';
-            setText('liveCfRate', `${rate}%`);
-            setText('liveCfCounts', `成功 ${fmt(succ)} · 拦截 ${fmt(cf)}`);
+            const total = Number(resMetrics.counters.attempt || 0);
+            const rate = total > 0 ? ((cf / total) * 100).toFixed(1) + '%' : '—';
+            setText('liveCfRate', rate);
+            setText('liveCfCounts', `上报成功 ${fmt(succ)} · 拦截 ${fmt(cf)}`);
         } else {
             setText('liveCfRate', '—');
             setText('liveCfCounts', '指标暂不可用');
@@ -2960,6 +3188,18 @@ function route() {
     stopProxyPoll();
     stopRecentPoll();
     const { path, params } = parseHash();
+    // Customer releases receive this mode before the first hash is routed. The
+    // body marker preserves the same boundary after the version endpoint has
+    // confirmed the release mode during a long-lived dashboard session.
+    const customerMode = window.__TPS_RELEASE_MODE__ === 'customer'
+        || document.body.dataset.releaseMode === 'customer';
+    const blockedCustomerRoute = ['/pipeline', '/proxy', '/cluster', '/control', '/update', '/updates']
+        .some(prefix => path === prefix || path.startsWith(prefix + '/'));
+    if (customerMode && blockedCustomerRoute) {
+        history.replaceState(null, '', '#/');
+        setActive('/');
+        return loadOverview();
+    }
     setActive(path);
     if (path === '/' || path === '') return loadOverview();
     if (path === '/pipeline') return loadPipeline();
@@ -3068,6 +3308,7 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
     const bannerCloseBtn = document.getElementById('bannerCloseBtn');
 
     const updateModalBackdrop = document.getElementById('updateModalBackdrop');
+    const updateModal = document.getElementById('updateModal');
     const modalCloseBtn = document.getElementById('modalCloseBtn');
     const modalCurrentVer = document.getElementById('modalCurrentVer');
     const diffCurrentVer = document.getElementById('diffCurrentVer');
@@ -3084,17 +3325,94 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
     let currentSystemInfo = null;
     let latestUpdateInfo = null;
     let isUpgrading = false;
+    let modalFocusOrigin = null;
+    let customerReleaseMode = false;
 
-    function openModal() {
+    // 作为所有操作暂不可用时的焦点保底，避免键盘焦点落回背景页面。
+    if (updateModal && !updateModal.hasAttribute('tabindex')) updateModal.setAttribute('tabindex', '-1');
+
+    function isModalOpen() {
+        return Boolean(updateModalBackdrop && updateModalBackdrop.style.display !== 'none');
+    }
+
+    function applyCustomerReleasePresentation() {
+        customerReleaseMode = true;
+        document.body.dataset.releaseMode = 'customer';
+        if (versionBadge) {
+            versionBadge.title = '客户离线发布：使用经核验的离线升级包';
+            versionBadge.classList.remove('has-update');
+        }
+        if (checkUpdateBtn) checkUpdateBtn.hidden = true;
+        if (versionUpdateTag) versionUpdateTag.style.display = 'none';
+        if (updateBanner) updateBanner.style.display = 'none';
+        if (updateModalBackdrop) updateModalBackdrop.style.display = 'none';
+        if (typeof document.querySelectorAll === 'function') {
+            document.querySelectorAll('[data-route="/pipeline"], [data-route="/proxy"]').forEach(control => {
+                control.hidden = true;
+            });
+        }
+    }
+
+    function isFocusable(control) {
+        if (!control || control.disabled || control.hidden || control.getAttribute('aria-hidden') === 'true') return false;
+        if (control.style.display === 'none' || control.style.visibility === 'hidden') return false;
+        return true;
+    }
+
+    function getModalFocusableControls() {
+        if (!updateModal) return [];
+        return [...updateModal.querySelectorAll(
+            'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        )].filter(isFocusable);
+    }
+
+    function focusControl(control) {
+        if (!control || typeof control.focus !== 'function') return;
+        try {
+            control.focus({ preventScroll: true });
+        } catch (_) {
+            control.focus();
+        }
+    }
+
+    function focusInitialModalControl() {
+        const preferredControl = [modalCloseBtn, modalUpgradeBtn, modalCheckBtn, modalCancelBtn]
+            .find(isFocusable);
+        focusControl(preferredControl || getModalFocusableControls()[0] || updateModal);
+    }
+
+    function restoreFocusAfterClose() {
+        const restoreTarget = modalFocusOrigin;
+        modalFocusOrigin = null;
+        if (restoreTarget && document.contains(restoreTarget) && isFocusable(restoreTarget)) {
+            focusControl(restoreTarget);
+        }
+    }
+
+    function openModal(focusOrigin = null) {
+        if (customerReleaseMode) return;
         if (!updateModalBackdrop) return;
+        const wasOpen = isModalOpen();
+        if (!wasOpen) {
+            const activeElement = focusOrigin || document.activeElement;
+            if (activeElement && activeElement !== document.body && !updateModalBackdrop.contains(activeElement)) {
+                modalFocusOrigin = activeElement;
+            }
+        }
         updateModalBackdrop.style.display = 'grid';
+        const activeElement = document.activeElement;
+        if (!wasOpen || !updateModal?.contains(activeElement) || !isFocusable(activeElement)) {
+            focusInitialModalControl();
+        }
     }
 
     function closeModal() {
-        if (!updateModalBackdrop) return;
-        if (isUpgrading) return; // 升级进行中禁止关闭
-        if (updateModalBackdrop.dataset.force === 'true') return; // 强制更新状态下禁止关闭
+        if (!updateModalBackdrop) return false;
+        if (isUpgrading) return false; // 升级进行中禁止关闭
+        if (updateModalBackdrop.dataset.force === 'true') return false; // 强制更新状态下禁止关闭
         updateModalBackdrop.style.display = 'none';
+        restoreFocusAfterClose();
+        return true;
     }
 
     async function loadVersionInfo() {
@@ -3116,6 +3434,9 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
                         .map(n => `<li>${esc(n)}</li>`)
                         .join('');
                 }
+                if (currentSystemInfo.release_mode === 'customer') {
+                    applyCustomerReleasePresentation();
+                }
             }
         } catch (e) {
             console.debug('读取版本信息异常', e);
@@ -3123,6 +3444,7 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
     }
 
     async function checkUpdate(interactive = false) {
+        if (customerReleaseMode) return;
         if (interactive && checkUpdateBtn) {
             checkUpdateBtn.disabled = true;
             checkUpdateBtn.querySelector('span').textContent = '检查中...';
@@ -3183,7 +3505,7 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
                         if (bannerCloseBtn) bannerCloseBtn.style.display = 'none';
                         if (modalUpgradeBtn) {
                             modalUpgradeBtn.disabled = false;
-                            modalUpgradeBtn.textContent = '🚨 立即一键升级 (强制更新)';
+                            modalUpgradeBtn.textContent = '立即一键升级（强制更新）';
                         }
                         // 强制更新立即自动弹窗
                         openModal();
@@ -3195,7 +3517,7 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
                         if (bannerCloseBtn) bannerCloseBtn.style.display = 'inline-block';
                         if (modalUpgradeBtn) {
                             modalUpgradeBtn.disabled = false;
-                            modalUpgradeBtn.textContent = '🚀 立即一键升级';
+                            modalUpgradeBtn.textContent = '立即一键升级';
                         }
                         if (interactive) openModal();
                     }
@@ -3226,8 +3548,9 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
     }
 
     async function applyUpdate() {
+        if (customerReleaseMode) return;
         if (isUpgrading) return;
-        if (!confirm('确定立即升级系统吗？\n升级过程中将拉取最新核心代码并平滑重载后台服务。')) return;
+        if (!confirm('确定立即更新系统吗？\n将更新代码、依赖及数据库结构，失败即中止；部分环境需要手动重启。不会自动暂存本地修改。')) return;
 
         isUpgrading = true;
         if (modalUpgradeBtn) {
@@ -3239,14 +3562,17 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
 
         if (updateTerminal) updateTerminal.style.display = 'block';
         if (terminalLogs) {
-            terminalLogs.textContent = '⏳ [1/4] 正在连接云端代码仓库并准备升级环境...\n';
+            terminalLogs.textContent = '[1/4] 正在连接云端代码仓库并准备升级环境...\n';
         }
 
         try {
+            // Operator-only update flow is disabled in customer release mode.
+            // Keep the direct transport here so this standalone safety path
+            // remains testable without the customer dashboard bootstrap.
             const resp = await fetch('/api/system/apply-update', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ force_stash: true }),
+                body: JSON.stringify({ force_stash: false }),
             });
             const data = await resp.json();
 
@@ -3256,14 +3582,18 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
             }
 
             if (resp.ok && data.ok) {
-                if (terminalLogs) terminalLogs.textContent += '\n🎉 升级执行完毕！系统服务已重载，3 秒后自动刷新页面...\n';
-                if (modalUpgradeBtn) modalUpgradeBtn.textContent = '✅ 升级完成！刷新中';
-                setTimeout(() => {
-                    location.reload();
-                }, 3000);
+                const followUp = data.restart_required
+                    ? '磁盘更新步骤已完成，尚需手动重启；当前服务未确认加载新版本。'
+                    : '更新步骤完成，服务就绪与实际运行版本仍需检查。';
+                if (terminalLogs) terminalLogs.textContent += `\n${followUp}\n`;
+                if (modalUpgradeBtn) modalUpgradeBtn.textContent = data.restart_required ? '待手动重启' : '待验证运行状态';
+                if (modalCancelBtn) modalCancelBtn.disabled = false;
+                if (modalCheckBtn) modalCheckBtn.disabled = false;
+                isUpgrading = false;
             } else {
                 const err = data.error || '升级失败';
-                if (terminalLogs) terminalLogs.textContent += `\n❌ 升级中断: ${err}\n`;
+                if (terminalLogs) terminalLogs.textContent += `\n升级中断: ${err}\n`;
+                if (terminalLogs && data.code_updated) terminalLogs.textContent += '代码阶段已执行；后续步骤未完成，不代表已回滚或运行版本已更新。\n';
                 if (modalUpgradeBtn) {
                     modalUpgradeBtn.disabled = false;
                     modalUpgradeBtn.textContent = '重试升级';
@@ -3273,10 +3603,10 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
                 isUpgrading = false;
             }
         } catch (err) {
-            if (terminalLogs) terminalLogs.textContent += `\n❌ 网络异常: ${err.message}\n`;
+            if (terminalLogs) terminalLogs.textContent += '\n更新响应不可用，操作结果未知。请先核对服务和磁盘状态，不要立即重复更新。\n';
             if (modalUpgradeBtn) {
-                modalUpgradeBtn.disabled = false;
-                modalUpgradeBtn.textContent = '重试升级';
+                modalUpgradeBtn.disabled = true;
+                modalUpgradeBtn.textContent = '结果待确认';
             }
             if (modalCancelBtn) modalCancelBtn.disabled = false;
             if (modalCheckBtn) modalCheckBtn.disabled = false;
@@ -3285,11 +3615,11 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
     }
 
     // 事件绑定
-    versionBadge?.addEventListener('click', () => openModal());
+    versionBadge?.addEventListener('click', event => openModal(event.currentTarget));
     checkUpdateBtn?.addEventListener('click', () => checkUpdate(true));
-    bannerViewBtn?.addEventListener('click', () => openModal());
-    bannerApplyBtn?.addEventListener('click', () => {
-        openModal();
+    bannerViewBtn?.addEventListener('click', event => openModal(event.currentTarget));
+    bannerApplyBtn?.addEventListener('click', event => {
+        openModal(event.currentTarget);
         applyUpdate();
     });
     bannerCloseBtn?.addEventListener('click', () => {
@@ -3300,16 +3630,49 @@ dashboardRuntime.startPoll(loadQueueMetrics, 5000, { global: true, backoff: true
     modalCheckBtn?.addEventListener('click', () => checkUpdate(true));
     modalUpgradeBtn?.addEventListener('click', applyUpdate);
 
+    document.addEventListener('keydown', event => {
+        if (!isModalOpen()) return;
+
+        if (event.key === 'Escape') {
+            // 在捕获阶段处理，避免背景页面同时响应 Escape。
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            closeModal();
+            return;
+        }
+
+        if (event.key !== 'Tab') return;
+        const controls = getModalFocusableControls();
+        if (controls.length === 0) {
+            event.preventDefault();
+            focusControl(updateModal);
+            return;
+        }
+
+        const firstControl = controls[0];
+        const lastControl = controls[controls.length - 1];
+        const activeElement = document.activeElement;
+        const focusIsInsideModal = Boolean(updateModal?.contains(activeElement));
+        const shouldWrapBackward = event.shiftKey && (!focusIsInsideModal || activeElement === firstControl);
+        const shouldWrapForward = !event.shiftKey && (!focusIsInsideModal || activeElement === lastControl);
+
+        if (shouldWrapBackward || shouldWrapForward) {
+            event.preventDefault();
+            focusControl(shouldWrapBackward ? lastControl : firstControl);
+        }
+    }, true);
+
     // 点击弹窗背景遮罩关闭 (非升级状态下)
     updateModalBackdrop?.addEventListener('click', (e) => {
         if (e.target === updateModalBackdrop) closeModal();
     });
 
     // 初始化加载
-    loadVersionInfo();
-    // 页面加载后 1.5 秒自动进行一次静默检查
-    setTimeout(() => checkUpdate(false), 1500);
-    // 每 15 分钟静默检测一次新版本
-    dashboardRuntime.startPoll(() => checkUpdate(false), 900000, { global: true, backoff: true });
+    loadVersionInfo().then(() => {
+        if (customerReleaseMode) return;
+        // 页面加载后 1.5 秒自动进行一次静默检查
+        setTimeout(() => checkUpdate(false), 1500);
+        // 每 15 分钟静默检测一次新版本
+        dashboardRuntime.startPoll(() => checkUpdate(false), 900000, { global: true, backoff: true });
+    });
 })();
-

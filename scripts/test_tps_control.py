@@ -249,6 +249,7 @@ class TestTpsControl(unittest.TestCase):
         manager = multi_worker_runner.MultiWorkerManager(2, 10)
         with mock.patch.object(multi_worker_runner.signal, "signal"), \
                 mock.patch.object(multi_worker_runner.time, "sleep"), \
+                mock.patch.object(manager, "_wait_for_ingester_ready"), \
                 mock.patch.object(multi_worker_runner.subprocess, "Popen",
                                   side_effect=[ingester, first_worker, OSError("synthetic second launch failure")]):
             with self.assertRaisesRegex(OSError, "second launch failure"):

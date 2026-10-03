@@ -67,8 +67,9 @@ def _request_stop(signum, _frame) -> None:
 
 def connect_redis() -> redis.Redis:
     return redis.Redis(
-        host=os.environ.get("REDIS_HOST", "127.0.0.1"),
-        port=int(os.environ.get("REDIS_PORT", "6379")),
+        host=os.environ.get("TPS_REDIS_HOST") or os.environ.get("REDIS_HOST", "127.0.0.1"),
+        port=int(os.environ.get("TPS_REDIS_PORT") or os.environ.get("REDIS_PORT", "6379")),
+        password=os.environ.get("TPS_REDIS_PASSWORD") or os.environ.get("REDIS_PASSWORD") or None,
         decode_responses=True,
     )
 

@@ -19,24 +19,49 @@ from typing import Optional
 from datetime import datetime
 
 import mysql.connector
-from scrapling.fetchers import StealthyFetcher
+try:
+    from scrapling.fetchers import StealthyFetcher
+except Exception:
+    StealthyFetcher = None
 
 
 # ============================================================
-# TiDB 连接配置 — 改成你自己的
+# TiDB / MySQL 连接配置。只连接显式配置的单一目标，不猜测密码或端口。
 # ============================================================
 TIDB_CONFIG = {
-    "host": "127.0.0.1",
-    "port": 4000,
-    "user": "root",
-    "password": "",
-    "database": "people_search",
+    "host": os.environ.get("TPS_DB_HOST") or os.environ.get("TIDB_HOST", "127.0.0.1"),
+    "port": int(os.environ.get("TPS_DB_PORT") or os.environ.get("TIDB_PORT", 4000)),
+    "user": os.environ.get("TPS_DB_USER") or os.environ.get("TIDB_USER", "root"),
+    "password": os.environ.get("TPS_DB_PASSWORD", os.environ.get("TIDB_PASSWORD", "")),
+    "database": os.environ.get("TPS_DB_NAME") or os.environ.get("TIDB_DATABASE", "people_search"),
     "autocommit": False,
 }
 
+_redis_singleton = None
+
+
+def _queue_redis():
+    """搜索结果回灌用的 Redis 单例：每页新建连接会泄 fd。"""
+    global _redis_singleton
+    if _redis_singleton is None:
+        import redis
+        _redis_singleton = redis.Redis(
+            host=os.environ.get("TPS_REDIS_HOST") or os.environ.get("REDIS_HOST", "127.0.0.1"),
+            port=int(os.environ.get("TPS_REDIS_PORT") or os.environ.get("REDIS_PORT", "6379")),
+            password=os.environ.get("TPS_REDIS_PASSWORD") or os.environ.get("REDIS_PASSWORD") or None,
+            decode_responses=True,
+        )
+    return _redis_singleton
+
+
+def db_target_fingerprint() -> str:
+    """Non-secret identity shared by worker/ingester to prevent split DB targets."""
+    target = {name: TIDB_CONFIG[name] for name in ("host", "port", "user", "database")}
+    return hashlib.sha256(json.dumps(target, sort_keys=True).encode("utf-8")).hexdigest()
+
 
 def get_db():
-    """获取 TiDB 连接"""
+    """仅连接当前配置的数据库；错误交给调用方处理。"""
     return mysql.connector.connect(**TIDB_CONFIG)
 
 
@@ -170,18 +195,21 @@ def split_full_name(full_name: str) -> tuple:
 
 def extract_phone_numbers(text: str) -> list:
     """
-    无死角提取 Phone Numbers 区域全部电话、类型、主号标记、运营商、最后报告日期
+    仅提取人物 Phone Numbers 分节中的电话，避免把 Businesses 等区的号码归给人物。
     """
     if not text:
         return []
 
-    # 1. 定位电话区域（兼容单复数 Phone Number / Phone Numbers 及各类后置分节符）
-    phone_section = re.search(
-        r"Phone Numbers?.*?(?:Email Addresses|Current Address Property Details|Previous Addresses|Possible Relatives|Possible Associates|Businesses|Associated Names|Online Profiles|$)",
-        text,
-        re.DOTALL | re.IGNORECASE,
+    heading = re.search(r"(?im)^[ \t]*Phone Numbers?(?:[ \t]*\(\d+\))?[ \t]*$", text)
+    if not heading:
+        return []
+    after_heading = text[heading.end():]
+    next_section = re.search(
+        r"(?im)^[ \t]*(?:Email Addresses|Current Address Property Details|Previous Addresses|"
+        r"Possible Relatives|Possible Associates|Businesses|Associated Names|Online Profiles)\b",
+        after_heading,
     )
-    section_text = phone_section.group() if phone_section else text
+    section_text = after_heading[:next_section.start()] if next_section else after_heading
 
     phone_regex = re.compile(r"(?:\+?1[-.\s]*)?\(?([2-9]\d{2})\)?[-.\s]*([2-9]\d{2})[-.\s]*(\d{4})")
     matches = list(phone_regex.finditer(section_text))
@@ -200,9 +228,14 @@ def extract_phone_numbers(text: str) -> list:
             continue
         seen_numbers.add(formatted_num)
 
-        # 1. 线路类型: Wireless / Landline / Landline/Services / VoIP
-        type_match = re.search(r"\b(Wireless|Landline(?:/Services)?|VoIP|Voip)\b", block, re.IGNORECASE)
-        line_type = "Wireless"
+        # 1. 类型只能来自号码同一行的显式标签（或独立的下一行）。
+        # 不能把运营商名称如 Verizon Wireless 误当成号码类型。
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        number_line = lines[0] if lines else ""
+        type_match = re.search(r"[-–—|]\s*(Wireless|Landline(?:/Services)?|VoIP)\b", number_line, re.IGNORECASE)
+        if not type_match and len(lines) > 1:
+            type_match = re.fullmatch(r"(Wireless|Landline(?:/Services)?|VoIP)", lines[1], re.IGNORECASE)
+        line_type = None
         if type_match:
             lt = type_match.group(1).lower()
             if lt == "voip":
@@ -222,7 +255,6 @@ def extract_phone_numbers(text: str) -> list:
             last_reported = parse_date(f"{date_match.group(1)} {date_match.group(2)}")
 
         # 4. 运营商提取（逐行过滤，保留完整运营商名称，避免误伤与残余词干扰）
-        lines = [l.strip() for l in block.splitlines() if l.strip()]
         carrier_candidates = []
         for line in lines:
             if phone_regex.search(line):
@@ -433,7 +465,7 @@ def parse_person(page, url: str) -> dict:
     if parsed_phones:
         # 1. 电话列表 (逗号拼接所有捕获的号码，附带线路类型)
         data["all_phones"] = ", ".join(
-            f"{p['phone_number']} ({p.get('line_type') or 'Wireless'})"
+            f"{p['phone_number']} ({p.get('line_type') or 'Unknown'})"
             for p in parsed_phones if p.get("phone_number")
         )
 
@@ -458,24 +490,24 @@ def parse_person(page, url: str) -> dict:
                 marked_primary = p
                 break
 
-        chosen = None
-        if marked_primary:
-            if str(marked_primary.get("line_type", "")).lower() == "wireless":
-                chosen = marked_primary
-            else:
-                # 主要电话是座机或其他：优先选用最近时间的无线号码
-                if wireless_sorted:
-                    chosen = wireless_sorted[0]
-                else:
-                    chosen = marked_primary
+        eligible_phones = [
+            p for p in parsed_phones
+            if _eligible_phone_type(p.get("line_type")) and _valid_us_phone(p.get("phone_number"))
+        ]
+        eligible_wireless = [p for p in wireless_sorted if p in eligible_phones]
+        if marked_primary in eligible_wireless:
+            chosen = marked_primary
+        elif eligible_wireless:
+            chosen = eligible_wireless[0]
+        elif marked_primary in eligible_phones:
+            chosen = marked_primary
         else:
-            if wireless_sorted:
-                chosen = wireless_sorted[0]
-            else:
-                chosen = parsed_phones[0]
+            landlines = [p for p in eligible_phones if p not in eligible_wireless]
+            chosen = max(landlines, key=_date_sort_key) if landlines else None
 
-        data["primary_phone"] = chosen.get("phone_number")
-        data["primary_phone_type"] = chosen.get("line_type")
+        if chosen:
+            data["primary_phone"] = chosen.get("phone_number")
+            data["primary_phone_type"] = chosen.get("line_type")
 
     # --- 邮箱 ---
     email_section = re.search(
@@ -599,6 +631,35 @@ def _child_counts(data: dict) -> dict:
         "associate_count": 0,
         "prev_addr_count": len(data.get("previous_addresses") or []),
     }
+
+
+def _eligible_phone_type(value: object) -> bool:
+    return str(value or "").strip().lower() in {"wireless", "landline", "landline/services"}
+
+
+def _valid_us_phone(value: object) -> bool:
+    if not value:
+        return False
+    raw = str(value)
+    if not re.fullmatch(r"[0-9+() .-]+", raw):
+        return False
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return len(digits) == 10 and digits[0] >= "2" and digits[3] >= "2" and len(set(digits)) > 1
+
+
+def has_usable_phone(data: dict) -> bool:
+    """仅明确标注 Wireless/Landline 的完整号码可使人物具备入库资格。"""
+    if _eligible_phone_type(data.get("primary_phone_type")) and _valid_us_phone(data.get("primary_phone")):
+        return True
+    for name in ("wireless_phone_1", "wireless_phone_2", "wireless_phone_3"):
+        if _valid_us_phone(data.get(name)):
+            return True
+    for entry in data.get("phone_numbers") or []:
+        if isinstance(entry, dict) and _eligible_phone_type(entry.get("line_type")) and _valid_us_phone(entry.get("phone_number")):
+            return True
+    return False
 
 
 def _persons_columns(cursor) -> set:
@@ -799,8 +860,15 @@ def _try_update_counts(cursor, person_id: str, content_hash: str, counts: dict, 
             pass
 
 
-def insert_person(db, data: dict):
-    """将解析后的人物数据写入 TiDB。失败 rollback 后重抛，禁止吞异常。"""
+def insert_person(db, data: dict) -> bool:
+    """返回 True 仅表示记录已提交或确认已存在；质量跳过返回 False。"""
+    if not data.get("person_id") or not data.get("full_name"):
+        print("[SKIP_INVALID] 缺少人物标识或姓名，未入库")
+        return False
+    if not has_usable_phone(data):
+        print("[SKIP_NO_PHONE] 未解析到有效电话号码，未入库")
+        return False
+
     cursor = db.cursor()
     person_id = data.get("person_id")
     content_hash = compute_content_hash(data)
@@ -824,7 +892,7 @@ def insert_person(db, data: dict):
                     )
                 db.commit()
                 print(f"[SKIP] {data.get('full_name')} ({person_id}) unchanged")
-                return
+                return True
 
         _upsert_person(cursor, data, content_hash, counts, cols)
         _upsert_children(cursor, data)
@@ -836,6 +904,7 @@ def insert_person(db, data: dict):
             f"   phones={counts['phone_count']} emails={counts['email_count']} "
             f"aliases={counts['alias_count']} prev_addr={counts['prev_addr_count']}"
         )
+        return True
 
     except Exception:
         db.rollback()
@@ -900,7 +969,10 @@ async def open_async_stealth_session(max_pages: int = 1, proxy: str = None):
 
 
 _CHALLENGE_MARKERS = (
+    "internalcaptcha",
     "just a moment",
+    "cf-challenge",
+    "cf-turnstile",
     "attention required",
     "checking your browser",
     "cf-browser-verification",
@@ -967,6 +1039,85 @@ async def fetch_in_async_session(session, url: str):
         return await session.fetch(url, **fetch_kwargs())
     except Exception as exc:
         _raise_fetch_error(exc, url)
+
+
+def _gateway_page(result):
+    if result is None:
+        return None
+    if result.status in (404, 410):
+        return html_page(result.body, result.status, result.url)
+    if result.status != 200 or is_challenge_html(result.body):
+        return None
+    return html_page(result.body, result.status, result.url)
+
+
+def _raise_gateway(exc, url: str) -> None:
+    from cloudbypass_v2 import GatewayError
+
+    if not isinstance(exc, GatewayError):
+        raise exc
+    if exc.kind == "balance":
+        raise HttpError(402, str(exc), bucket="rate_limit") from exc
+    if exc.kind == "timeout":
+        raise FetchTimeoutError(str(exc)) from exc
+    if exc.kind == "rate_limit":
+        raise HttpError(429, str(exc), bucket="rate_limit") from exc
+    raise ScrapeError(str(exc), bucket="proxy_fail") from exc
+
+
+async def fetch_cloudbypass_v2(
+    url: str,
+    part: int = 0,
+    timeout: int = 60,
+    apikey: Optional[str] = None,
+    proxy: Optional[str] = None,
+    sitekey: Optional[str] = None,
+    max_retries: int = 2,
+) -> Optional[HtmlPage]:
+    """穿云 v2 Cookie 模式。part 与 sitekey 保留兼容，控制台当前配置不使用它们。"""
+    del part, sitekey
+    from cloudbypass_v2 import fetch_async
+
+    try:
+        result = await fetch_async(
+            url,
+            apikey=apikey,
+            proxy=proxy,
+            timeout=timeout,
+            max_retries=max_retries,
+            session=True,
+        )
+    except Exception as exc:
+        _raise_gateway(exc, url)
+        return None
+    return _gateway_page(result)
+
+
+def fetch_cloudbypass_v2_sync(
+    url: str,
+    part: int = 0,
+    timeout: int = 60,
+    apikey: Optional[str] = None,
+    proxy: Optional[str] = None,
+    sitekey: Optional[str] = None,
+    max_retries: int = 2,
+) -> Optional[HtmlPage]:
+    """穿云 v2 Cookie 模式的同步入口。"""
+    del part, sitekey
+    from cloudbypass_v2 import fetch_sync
+
+    try:
+        result = fetch_sync(
+            url,
+            apikey=apikey,
+            proxy=proxy,
+            timeout=timeout,
+            max_retries=max_retries,
+        )
+    except Exception as exc:
+        _raise_gateway(exc, url)
+        return None
+    return _gateway_page(result)
 
 
 def close_session(session) -> None:
@@ -1060,7 +1211,7 @@ def ingest_response(page, url: str, db) -> dict:
         raise HttpError(status, f"HTTP {status} for {url}")
 
     # 判断是否为电话反查或搜索结果列表页
-    is_search = "resultphone" in url.lower() or "/results?" in url.lower() or "resultname" in url.lower()
+    is_search = "resultphone" in url.lower() or "/results?" in url.lower() or "resultname" in url.lower() or "/find/phone" in url.lower()
     has_person_path = bool(re.search(r"/(?:find/)?person/([a-zA-Z0-9_]+)", final_url))
 
     if is_search and not has_person_path:
@@ -1068,27 +1219,39 @@ def ingest_response(page, url: str, db) -> dict:
         if person_links:
             unique_pids = list(dict.fromkeys(person_links))
             try:
-                import redis
-                r = redis.Redis(
-                    host=os.environ.get("REDIS_HOST", "127.0.0.1"),
-                    port=int(os.environ.get("REDIS_PORT", "6379")),
-                    decode_responses=True,
-                )
+                r = _queue_redis()
                 from tps_queue import feed
                 full_urls = [f"https://www.truepeoplesearch.com/find/person/{pid}" for pid in unique_pids]
-                res = feed(r, full_urls)
-                print(f"[SEARCH_RESULT] 电话搜索页面已捕获并注入 {len(unique_pids)} 个目标人物档案: {res}", flush=True)
+                res = feed(r, full_urls, front=True)
+                from phone_plan import note_phone_lookup
+                note_phone_lookup(r, url, hit=True)
+                print(f"[SEARCH_RESULT] 电话搜索页面已捕获并注入 {len(unique_pids)} 个目标人物档案 (优先排入队首): {res}", flush=True)
             except Exception as feed_err:
                 print(f"[SEARCH_FEED_ERR] 注入队列提示: {feed_err}", flush=True)
             return {"is_search_result": True, "count": len(unique_pids), "person_ids": unique_pids}
         else:
+            try:
+                from phone_plan import note_phone_lookup
+                r = _queue_redis()
+                note_phone_lookup(r, url, hit=False)
+            except Exception:
+                pass
             raise EmptyPageError(f"电话反查无匹配记录 (0 results): {url}")
 
     data = parse_person(page, url)
     if not data.get("full_name") or not data.get("person_id"):
         raise EmptyPageError(f"empty page (no valid person): {url}")
 
-    insert_person(db, data)
+    if not insert_person(db, data):
+        raise ScrapeError("parsed person did not meet persistence requirements", bucket="no_phone")
+    try:
+        from phone_plan import remember_associated_phones
+
+        remembered = remember_associated_phones(data.get("phone_numbers") or [])
+        if remembered:
+            print(f"[PHONES] 关联号码已一并入库并记入已知集合: {remembered}", flush=True)
+    except Exception as phone_err:
+        print(f"[PHONES] 关联号码已入库，已知集合更新失败: {phone_err}", flush=True)
     return data
 
 

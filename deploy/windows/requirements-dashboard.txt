@@ -1,0 +1,8 @@
+# Customer dashboard runtime only. This is not an internet-install instruction
+# and it is intentionally separate from the collection/runtime requirements.
+# Release engineering must supply a reviewed Windows wheelhouse containing
+# compatible versions before a customer host is provisioned.
+Flask>=3.0,<4.0
+mysql-connector-python>=9.2,<10.0
+redis>=5.0,<7.0
+psutil>=5.9,<8.0

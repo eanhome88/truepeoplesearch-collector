@@ -24,6 +24,9 @@ _SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
+from tps_env import load_project_env
+load_project_env(Path(__file__).resolve().parent.parent, customer_safe=False)
+
 import redis
 
 from batch_ingest import BatchIngester
@@ -33,22 +36,32 @@ from scrape_to_tidb import (
     _child_counts,
     _persons_columns,
     compute_content_hash,
+    db_target_fingerprint,
     ensure_db,
     get_db,
+    has_usable_phone,
     insert_person,
 )
 from tps_metrics import get_metrics
 from tps_queue import ack, nack
 
-REDIS_HOST = os.environ.get("REDIS_HOST", "127.0.0.1")
-REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+REDIS_HOST = os.environ.get("TPS_REDIS_HOST") or os.environ.get("REDIS_HOST", "127.0.0.1")
+REDIS_PORT = int(os.environ.get("TPS_REDIS_PORT") or os.environ.get("REDIS_PORT", "6379"))
+REDIS_PASSWORD = os.environ.get("TPS_REDIS_PASSWORD") or os.environ.get("REDIS_PASSWORD") or None
 BUFFER_KEY = "tps:buffer:parsed"
+PROCESSING_BUFFER_KEY = "tps:buffer:processing"
+INVALID_BUFFER_KEY = "tps:buffer:invalid"
+BULK_COMMITTED_TOTAL_KEY = "tps:ingest:bulk:committed_total"
+BULK_RATE_KEY = "tps:ingest:bulk:rate"
+BULK_RATE_INTERVAL_SEC = 3.0
+BULK_RATE_TTL_SEC = 15
 
 
 def connect_redis() -> redis.Redis:
     return redis.Redis(
         host=REDIS_HOST,
         port=REDIS_PORT,
+        password=REDIS_PASSWORD,
         decode_responses=True,
         socket_timeout=5,
     )
@@ -73,10 +86,28 @@ class BulkIngesterDaemon:
         self._total_rows = 0
         self._last_calc_time = time.time()
         self._last_calc_persons = 0
+        self._db_ready = False
+        self._last_db_check = 0.0
 
     def _get_active_db(self):
-        self._db = ensure_db(self._db)
-        return self._db
+        try:
+            self._db = ensure_db(self._db)
+            self._db_ready = True
+            return self._db
+        except Exception:
+            self._db_ready = False
+            self._db = None
+            raise
+
+    def _check_db_ready_if_due(self) -> None:
+        now = time.monotonic()
+        if now - self._last_db_check < BULK_RATE_INTERVAL_SEC:
+            return
+        self._last_db_check = now
+        try:
+            self._get_active_db()
+        except Exception:
+            self._db_ready = False
 
     def _handle_signal(self, sig, _frame):
         signame = signal.Signals(sig).name
@@ -92,26 +123,123 @@ class BulkIngesterDaemon:
         except Exception as exc:
             print(f"[METRICS] incr {bucket}: {exc}", file=sys.stderr)
 
-    def _record_write_failure(self, job: dict, exc: Exception) -> None:
-        self._safe_metric_incr("write_fail")
+    def _remove_processed_raw(self, raw: Optional[str]) -> bool:
+        if raw is None:
+            return True
         try:
-            nack(self.r, job, "ingest_err", retry=True)
+            return bool(self.r.lrem(PROCESSING_BUFFER_KEY, 1, raw))
+        except Exception as exc:
+            print(f"[BUFFER_RELEASE_FAIL] {exc}", file=sys.stderr)
+            return False
+
+    def _record_write_failure(
+        self, job: dict, exc: Exception, raw: Optional[str] = None,
+        *, retry: bool = True, reason: str = "ingest_err",
+    ) -> bool:
+        try:
+            nack(self.r, job, reason, retry=retry)
         except Exception as nack_exc:
             print(
                 f"[BULK_NACK_FAIL] person_id={job.get('person_id')} "
                 f"write_err={exc} nack_err={nack_exc}",
                 file=sys.stderr,
             )
+            return False
+        if not self._remove_processed_raw(raw):
+            return False
+        self._safe_metric_incr("write_fail")
+        return True
 
-    def _ack_committed(self, job: dict) -> bool:
-        """Count success only after the committed item is ACKed in Redis."""
+    def _ack_committed(self, job: dict, raw: Optional[str] = None) -> bool:
+        """只在数据库提交、队列 ACK、缓冲释放全部成功后计 success。"""
         try:
             ack(self.r, job)
         except Exception as exc:
-            self._record_write_failure(job, exc)
+            print(f"[BULK_ACK_FAIL] person_id={job.get('person_id')} err={exc}", file=sys.stderr)
             return False
+        if not self._remove_processed_raw(raw):
+            return False
+        try:
+            self.r.incr(BULK_COMMITTED_TOTAL_KEY)
+        except Exception as exc:
+            # 真实入库已完成，指标故障不能让任务再次抓取或伪造失败。
+            print(f"[BULK_COUNT_UNAVAILABLE] {type(exc).__name__}", file=sys.stderr)
         self._safe_metric_incr("success")
         return True
+
+    def _publish_rate_if_due(self, *, force: bool = False, log: bool = False) -> None:
+        now = time.time()
+        elapsed = now - self._last_calc_time
+        if not force and elapsed < BULK_RATE_INTERVAL_SEC:
+            return
+        committed_delta = self._total_persons - self._last_calc_persons
+        qps = committed_delta / elapsed if elapsed > 0 else 0.0
+        try:
+            total = int(self.r.get(BULK_COMMITTED_TOTAL_KEY) or 0)
+            snapshot = {
+                "qps": round(max(0.0, qps), 3),
+                "committed_total": total,
+                "updated_at": now,
+                "pid": os.getpid(),
+                "db_ready": self._db_ready,
+                "db_target": db_target_fingerprint(),
+            }
+            self.r.set(BULK_RATE_KEY, json.dumps(snapshot), ex=BULK_RATE_TTL_SEC)
+        except Exception as exc:
+            print(f"[BULK_RATE_UNAVAILABLE] {type(exc).__name__}", file=sys.stderr)
+        if log:
+            print(
+                f"[BULK_INGEST] 已确认入库: {qps:6.1f} 人/秒 | "
+                f"本进程累计确认: {self._total_persons:,}"
+            )
+        self._last_calc_persons = self._total_persons
+        self._last_calc_time = now
+
+    def _claim_raw_batch(self) -> List[str]:
+        """优先恢复上次未确认的缓冲，再原子地移入处理中列表。"""
+        outstanding = self.r.lrange(PROCESSING_BUFFER_KEY, 0, self.batch_size - 1)
+        if outstanding:
+            return outstanding
+        pipe = self.r.pipeline(transaction=True)
+        for _ in range(self.batch_size):
+            pipe.rpoplpush(BUFFER_KEY, PROCESSING_BUFFER_KEY)
+        return [raw for raw in pipe.execute() if raw is not None]
+
+    def _quarantine_raw(self, raw: str) -> bool:
+        """损坏载荷保存在隔离列表，绝不静默丢弃。"""
+        try:
+            pipe = self.r.pipeline(transaction=True)
+            pipe.lpush(INVALID_BUFFER_KEY, raw)
+            pipe.lrem(PROCESSING_BUFFER_KEY, 1, raw)
+            pipe.execute()
+            return True
+        except Exception as exc:
+            print(f"[BUFFER_QUARANTINE_FAIL] {exc}", file=sys.stderr)
+            return False
+
+    def _process_raw_batch(self, raw_items: List[str]) -> int:
+        items: List[Tuple[dict, dict, str]] = []
+        handled = 0
+        for raw in raw_items:
+            try:
+                parsed = json.loads(raw)
+                data = parsed.get("data")
+                job = parsed.get("job")
+            except (TypeError, ValueError, AttributeError):
+                data, job = None, None
+            if not isinstance(data, dict) or not isinstance(job, dict) or not job.get("id"):
+                if isinstance(job, dict) and job.get("id"):
+                    self._record_write_failure(
+                        job, ValueError("invalid_buffer_payload"), raw,
+                        retry=False, reason="invalid_buffer_payload",
+                    )
+                if self._quarantine_raw(raw):
+                    handled += 1
+                continue
+            items.append((data, job, raw))
+        if items:
+            handled += self._flush_batch(items)
+        return handled
 
     def run(self) -> None:
         signal.signal(signal.SIGINT, self._handle_signal)
@@ -124,40 +252,20 @@ class BulkIngesterDaemon:
         print(f"[BULK_INGEST] 监听缓冲队列: {BUFFER_KEY}")
         print("============================================================")
 
-        last_flush = time.time()
+        self._check_db_ready_if_due()
+        self._publish_rate_if_due(force=True)
 
         while not self.stopping:
             try:
-                # 1. 批量从 Redis Buffer 取出数据 (最多 batch_size 条)
-                # Redis 6.2+ 支持 RPOP key count
-                raw_items = []
-                try:
-                    raw_items = self.r.rpop(BUFFER_KEY, self.batch_size) or []
-                except Exception:
-                    # 降级兼容旧版 Redis
-                    pipe = self.r.pipeline()
-                    for _ in range(self.batch_size):
-                        pipe.rpop(BUFFER_KEY)
-                    raw_items = [item for item in pipe.execute() if item]
-
+                raw_items = self._claim_raw_batch()
                 if not raw_items:
+                    self._check_db_ready_if_due()
+                    self._publish_rate_if_due()
                     time.sleep(0.05)
                     continue
-
-                items = []
-                for raw in raw_items:
-                    try:
-                        parsed = json.loads(raw)
-                        data = parsed.get("data")
-                        job = parsed.get("job")
-                        if data and job:
-                            items.append((data, job))
-                    except Exception:
-                        pass
-
-                if items:
-                    self._flush_batch(items)
-                    last_flush = time.time()
+                if not self._process_raw_batch(raw_items):
+                    time.sleep(1)
+                self._publish_rate_if_due()
 
             except Exception as e:
                 print(f"[BULK_ERR] 主循环异常: {e}", file=sys.stderr)
@@ -165,13 +273,20 @@ class BulkIngesterDaemon:
 
         # 优雅停机：刷空剩余所有缓冲
         self._drain_all()
-        print("[BULK_INGEST] 所有缓冲数据已安全入库，守护进程退出完成。")
+        remaining = self.r.llen(BUFFER_KEY) + self.r.llen(PROCESSING_BUFFER_KEY)
+        print(f"[BULK_INGEST] 守护进程退出；未确认缓冲={remaining}（保留待恢复）")
 
-    def _flush_batch(self, items: List[Tuple[dict, dict]]) -> None:
-        """执行单次微批多行插入事务"""
+    def _flush_batch(self, items: List[Tuple[dict, dict, str]]) -> int:
+        """执行单次微批；返回已从可靠缓冲确认/隔离的条数。"""
         start_t = time.time()
-        db = self._get_active_db()
-        cursor = db.cursor()
+        try:
+            db = self._get_active_db()
+            cursor = db.cursor()
+        except Exception as exc:
+            # 数据库暂不可用时保留已解析的原始载荷，不能通过 NACK 消耗抓取尝试次数。
+            self._db_ready = False
+            print(f"[BULK_DB_UNAVAILABLE] type={type(exc).__name__}; parsed buffer retained", file=sys.stderr)
+            return 0
 
         try:
             if self._cached_cols is None:
@@ -187,18 +302,25 @@ class BulkIngesterDaemon:
             phones_rows = []
             emails_rows = []
 
-            for data, job in items:
+            for data, job, raw in items:
                 person_id = data.get("person_id")
                 if not person_id or not data.get("full_name"):
-                    invalid_items.append((data, job))
+                    invalid_items.append((job, raw, "invalid_person"))
                     continue
 
-                committed_items.append((data, job))
+                if not has_usable_phone(data):
+                    invalid_items.append((job, raw, "no_phone"))
+                    continue
+
+                committed_items.append((job, raw))
 
                 content_hash = compute_content_hash(data)
                 counts = _child_counts(data)
 
-                row_dict = {f: data.get(f) for f in _PERSON_CORE_FIELDS if not cols or f in cols}
+                row_dict = {
+                    f: data.get("current_address_text") if f == "current_address" else data.get(f)
+                    for f in _PERSON_CORE_FIELDS if not cols or f in cols
+                }
                 if "content_hash" in cols:
                     row_dict["content_hash"] = content_hash
                 for c in _COUNT_FIELDS:
@@ -313,16 +435,19 @@ class BulkIngesterDaemon:
                     emails_rows,
                 )
 
-            db.commit()
+            if persons_rows:
+                db.commit()
 
-            # DB commit 与 Redis ACK 都成功后才计 success。ACK 失败的任务回队，
-            # 由幂等 upsert 在下次重试时收敛。
+            # DB commit、队列 ACK 和可靠缓冲释放全部成功后才计 success。
             acked_count = 0
-            for _, job in committed_items:
-                if self._ack_committed(job):
+            handled = 0
+            for job, raw in committed_items:
+                if self._ack_committed(job, raw):
                     acked_count += 1
-            for _, job in invalid_items:
-                self._record_write_failure(job, ValueError("missing person_id or full_name"))
+                    handled += 1
+            for job, raw, reason in invalid_items:
+                if self._record_write_failure(job, ValueError(reason), raw, retry=False, reason=reason):
+                    handled += 1
 
             # 统计与耗时
             total_rows_batch = (
@@ -333,53 +458,61 @@ class BulkIngesterDaemon:
             self._total_persons += acked_count
             self._total_rows += total_rows_batch
 
-            # 输出吞吐指标
-            now = time.time()
-            elapsed = now - self._last_calc_time
-            if elapsed >= 3.0:
-                p_delta = self._total_persons - self._last_calc_persons
-                pps = p_delta / elapsed
-                rps = pps * (self._total_rows / max(1, self._total_persons))
-                print(
-                    f"[BULK_INGEST] 实体写入: {pps:6.1f} 人/秒 | "
-                    f"数据库行速: {rps:6.1f} 行/秒 | "
-                    f"单批耗时: {cost_ms:4.0f}ms ({len(items)}条/批) | "
-                    f"累计实体: {self._total_persons:,}"
-                )
-                self._last_calc_persons = self._total_persons
-                self._last_calc_time = now
+            self._publish_rate_if_due(log=True)
+            return handled
 
         except Exception as exc:
-            db.rollback()
-            print(f"[BULK_FAIL] 批量写入异常，逐条重试降级: {exc}", file=sys.stderr)
-            for data, job in items:
+            self._db_ready = False
+            try:
+                db.rollback()
+            except Exception as rollback_exc:
+                print(
+                    f"[BULK_ROLLBACK_FAIL] type={type(rollback_exc).__name__}; parsed buffer retained",
+                    file=sys.stderr,
+                )
+                return 0
+            print(f"[BULK_FAIL] 批量写入异常，逐条重试降级: {type(exc).__name__}", file=sys.stderr)
+            handled = 0
+            acked_count = 0
+            for data, job, raw in items:
                 try:
-                    insert_person(db, data)
+                    persisted = insert_person(db, data)
                 except Exception as s_exc:
-                    self._record_write_failure(job, s_exc)
+                    # 可恢复的 DB/IO 故障原地等待，避免 retries 达上限后丢进 DLQ。
+                    print(
+                        f"[BULK_RETRY_LATER] job={job.get('id')} type={type(s_exc).__name__}",
+                        file=sys.stderr,
+                    )
                     continue
-                self._ack_committed(job)
+                if persisted:
+                    self._db_ready = True
+                    if self._ack_committed(job, raw):
+                        handled += 1
+                        acked_count += 1
+                else:
+                    if not data.get("person_id") or not data.get("full_name"):
+                        reason = "invalid_person"
+                    elif not has_usable_phone(data):
+                        reason = "no_phone"
+                    else:
+                        reason = None
+                    if reason and self._record_write_failure(job, ValueError(reason), raw, retry=False, reason=reason):
+                        handled += 1
+            self._total_persons += acked_count
+            self._publish_rate_if_due(log=True)
+            return handled
         finally:
             cursor.close()
 
     def _drain_all(self) -> None:
-        print("[BULK_INGEST] 正在清空队列剩余数据...")
+        print("[BULK_INGEST] 正在处理剩余可靠缓冲...")
         while True:
-            raw_items = self.r.rpop(BUFFER_KEY, self.batch_size) or []
+            raw_items = self._claim_raw_batch()
             if not raw_items:
                 break
-            items = []
-            for raw in raw_items:
-                try:
-                    parsed = json.loads(raw)
-                    data = parsed.get("data")
-                    job = parsed.get("job")
-                    if data and job:
-                        items.append((data, job))
-                except Exception:
-                    pass
-            if items:
-                self._flush_batch(items)
+            if not self._process_raw_batch(raw_items):
+                print("[BULK_INGEST] 入库或 ACK 未确认，保留缓冲供下次启动恢复", file=sys.stderr)
+                break
 
 
 def main():

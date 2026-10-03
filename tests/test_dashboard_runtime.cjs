@@ -166,7 +166,10 @@ function sectionContext(env) {
 
 test('overview renders successful sections before a slow optional request finishes', async () => {
     const slow = deferred();
-    const env = environment(async url => url.endsWith('/recent') ? slow.promise : response(url.endsWith('/stats') ? {} : []));
+    const env = environment(async url => url.endsWith('/recent') ? slow.promise : response(url.endsWith('/stats') ? {
+        database_available: true, metrics_available: true, throughput_available: true,
+        metrics_quality: { status: 'no_samples' }, current_qps: 0,
+    } : []));
     const { context, elements } = sectionContext(env);
     const loading = context.loadOverview();
     for (let i = 0; i < 15; i++) await Promise.resolve();

@@ -57,7 +57,8 @@ if name == "docker":
         if os.environ.get("FAKE_START_FAIL"):
             print("fake Docker permission denied", file=sys.stderr)
             sys.exit(1)
-        (state / args[1]).touch()
+        service_name = {"tps-tidb": "tidb", "tps-redis": "redis"}.get(args[1], args[1])
+        (state / service_name).touch()
         print(args[1])
         sys.exit(0)
     if args[:2] == ["container", "inspect"]:
@@ -140,8 +141,8 @@ class LocalStartupTests(unittest.TestCase):
     def test_stopped_containers_are_restored_without_creation(self):
         result = self.run_start(FAKE_TIDB="stopped", FAKE_REDIS="stopped")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(["docker", "start", "tidb"], self.calls)
-        self.assertIn(["docker", "start", "redis"], self.calls)
+        self.assertIn(["docker", "start", "tps-tidb"], self.calls)
+        self.assertIn(["docker", "start", "tps-redis"], self.calls)
         self.assertEqual(self.calls[-1], ["fake-python", str(ROOT / "tools/dashboard_api.py"), "--host", "127.0.0.1", "--port", "5001"])
         self.assertNotIn("系统就绪", result.stdout)
 
@@ -167,7 +168,7 @@ class LocalStartupTests(unittest.TestCase):
         result = self.run_start(FAKE_TIDB="down", TPS_DB_HOST="db.example.invalid")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("非本机地址", result.stderr)
-        self.assertNotIn(["docker", "start", "tidb"], self.calls)
+        self.assertNotIn(["docker", "start", "tps-tidb"], self.calls)
 
     def test_app_exit_code_and_address_are_preserved(self):
         result = self.run_start(FAKE_APP_EXIT="23", TPS_DASHBOARD_PORT="5055")
@@ -178,7 +179,7 @@ class LocalStartupTests(unittest.TestCase):
         result = self.run_start(FAKE_TIDB="stopped", FAKE_DOCKER_ENDPOINT="ssh://remote.invalid")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("非本机套接字上下文", result.stderr)
-        self.assertNotIn(["docker", "start", "tidb"], self.calls)
+        self.assertNotIn(["docker", "start", "tps-tidb"], self.calls)
 
     def test_remote_docker_host_override_is_never_started(self):
         result = self.run_start(FAKE_TIDB="stopped", DOCKER_HOST="tcp://remote.invalid:2375")

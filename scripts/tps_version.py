@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -336,6 +337,16 @@ def execute_system_update(force_stash: bool = False) -> Dict[str, Any]:
     """
     logs: List[str] = []
     git_info = get_git_status()
+    phase = "preflight"
+    code_updated = False
+    restart_attempted = False
+
+    def failed(error: str) -> Dict[str, Any]:
+        logs.append(f"❌ [{phase}] {error}")
+        return {
+            "ok": False, "error": error, "phase": phase, "logs": logs,
+            "code_updated": code_updated, "restart_attempted": restart_attempted,
+        }
 
     if not git_info.get("has_git"):
         return {
@@ -351,6 +362,9 @@ def execute_system_update(force_stash: bool = False) -> Dict[str, Any]:
             "logs": logs,
         }
 
+    if git_info.get("dirty") and not force_stash:
+        return failed("工作区存在未提交修改，已拒绝自动更新；请先保存或提交本地修改。")
+
     branch = git_info.get("branch", "main")
     logs.append(f"🔍 检查分支: 当前位于 [{branch}] 分支，远程地址: {git_info.get('remote_url')}")
 
@@ -358,12 +372,12 @@ def execute_system_update(force_stash: bool = False) -> Dict[str, Any]:
         # 处理脏工作区
         if git_info.get("dirty"):
             if force_stash:
+                phase = "stash"
                 logs.append("⚠️ 工作区存在本地改动，正在暂存本地更改 (git stash)...")
                 subprocess.run(["git", "stash"], cwd=str(_ROOT_DIR), check=True, timeout=10)
-            else:
-                logs.append("ℹ️ 工作区保持本地运行状态，使用 fast-forward 模式平滑拉取...")
 
         # 1. 执行 git pull
+        phase = "pull"
         logs.append(f"⬇️ 正在从远程仓库拉取最新代码 (git pull origin {branch})...")
         pull_cmd = ["git", "pull", "--ff-only", "origin", branch]
         pull_res = subprocess.run(
@@ -376,26 +390,10 @@ def execute_system_update(force_stash: bool = False) -> Dict[str, Any]:
         )
 
         if pull_res.returncode != 0:
-            # 如果 --ff-only 失败，尝试标准 pull
-            pull_cmd = ["git", "pull", "origin", branch]
-            pull_res = subprocess.run(
-                pull_cmd,
-                cwd=str(_ROOT_DIR),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=45,
-            )
-
-        if pull_res.returncode != 0:
             err_msg = pull_res.stderr.strip() or pull_res.stdout.strip()
-            logs.append(f"❌ Git 拉取失败: {err_msg}")
-            return {
-                "ok": False,
-                "error": f"代码拉取失败: {err_msg}",
-                "logs": logs,
-            }
+            return failed(f"代码拉取失败: {err_msg}")
 
+        code_updated = True
         logs.append("✅ 代码拉取完成！")
         for line in pull_res.stdout.strip().splitlines()[:5]:
             logs.append(f"   {line}")
@@ -403,11 +401,11 @@ def execute_system_update(force_stash: bool = False) -> Dict[str, Any]:
         # 2. 检查依赖更新要求
         requirements_file = _ROOT_DIR / "requirements.txt"
         if requirements_file.exists():
+            phase = "dependencies"
             logs.append("📦 校验 Python 依赖清单 (requirements.txt)...")
             # 跨平台查找虚拟环境 pip：Windows 在 Scripts/，Unix 在 bin/
-            import sys as _sys
             _venv_base = _ROOT_DIR / ".venv"
-            if _sys.platform == "win32":
+            if sys.platform == "win32":
                 _pip_candidates = [
                     _venv_base / "Scripts" / "pip.exe",
                     _venv_base / "Scripts" / "pip",
@@ -418,51 +416,61 @@ def execute_system_update(force_stash: bool = False) -> Dict[str, Any]:
                     _venv_base / "bin" / "pip3",
                 ]
             venv_pip = next((p for p in _pip_candidates if p.exists()), None)
-            if venv_pip is not None:
-                logs.append("📦 正在同步虚拟环境依赖...")
-                pip_res = subprocess.run(
-                    [str(venv_pip), "install", "-r", str(requirements_file), "--quiet"],
-                    cwd=str(_ROOT_DIR),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=120,
-                )
-                if pip_res.returncode == 0:
-                    logs.append("✅ 虚拟环境依赖同步成功")
-                else:
-                    logs.append(f"⚠️ 依赖同步提示: {pip_res.stderr.strip()[:100]}")
+            if venv_pip is None:
+                return failed("未找到虚拟环境 pip，依赖未同步；已中止更新，未发送重启指令。")
+            logs.append("📦 正在同步虚拟环境依赖...")
+            pip_res = subprocess.run(
+                [str(venv_pip), "install", "-r", str(requirements_file), "--quiet"],
+                cwd=str(_ROOT_DIR),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=120,
+            )
+            if pip_res.returncode != 0:
+                detail = (pip_res.stderr.strip() or pip_res.stdout.strip())[:200]
+                return failed(f"依赖同步失败 (exit={pip_res.returncode}): {detail}")
+            logs.append("✅ 虚拟环境依赖同步成功")
 
         # 3. 检查数据库增量迁移与表结构同步
         init_db_py = _ROOT_DIR / "deploy" / "init_db.py"
         if init_db_py.exists():
+            phase = "database"
             logs.append("🗄️ 正在自动同步数据库结构与视图 (deploy/init_db.py)...")
-            try:
-                py_bin = sys.executable
-                db_res = subprocess.run(
-                    [py_bin, str(init_db_py)],
-                    cwd=str(_ROOT_DIR),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=60,
-                )
-                if db_res.returncode == 0:
-                    logs.append("✅ 数据库表结构增量迁移与 [人物主表] 视图同步成功")
-                else:
-                    logs.append(f"⚠️ 数据库结构同步提示: {db_res.stderr.strip()[:120]}")
-            except Exception as e:
-                logs.append(f"⚠️ 执行数据库迁移异常: {e}")
+            db_res = subprocess.run(
+                [sys.executable, str(init_db_py)],
+                cwd=str(_ROOT_DIR),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+            )
+            if db_res.returncode != 0:
+                detail = (db_res.stderr.strip() or db_res.stdout.strip())[-300:]
+                return failed(f"数据库结构同步失败 (exit={db_res.returncode}): {detail}")
+            logs.append("✅ 数据库表结构增量迁移与 [人物主表] 视图同步成功")
 
         # 4. 平滑重载后台集群与 Supervisor
-        supervisor_py = _ROOT_DIR / "scripts" / "tps_supervisor.py"
+        phase = "restart"
         supervisor_sh = _ROOT_DIR / "supervisor.sh"
-        if sys.platform != "win32" and supervisor_sh.exists() and os.access(str(supervisor_sh), os.X_OK):
-            reload_cmd = ["bash", str(supervisor_sh), "restart"]
-        else:
-            reload_cmd = [sys.executable, str(supervisor_py), "restart"]
+        can_restart = sys.platform != "win32" and supervisor_sh.exists() and os.access(str(supervisor_sh), os.X_OK)
+        if not can_restart:
+            # The Python restart command stays in the foreground indefinitely.
+            # Do not run it under a timeout, which can leave unmanaged children.
+            new_version_info = read_local_version_info()
+            new_git_info = get_git_status()
+            logs.append("⚠️ 磁盘代码、依赖与数据库更新步骤完成；未自动重启，请手动重启后检查服务就绪状态。")
+            return {
+                "ok": True, "phase": "restart_required", "restart_required": True,
+                "restart_attempted": False, "service_verified": False, "code_updated": True,
+                "message": "更新步骤完成，但服务尚未重启；请手动重启并检查服务就绪状态。",
+                "new_version": new_version_info.get("version"),
+                "new_commit": new_git_info.get("short_commit"), "logs": logs,
+            }
+        reload_cmd = ["bash", str(supervisor_sh), "restart"]
 
         logs.append("🔄 正在向后台 Supervisor 发送平滑重载指令...")
+        restart_attempted = True
         reload_res = subprocess.run(
             reload_cmd,
             cwd=str(_ROOT_DIR),
@@ -471,28 +479,30 @@ def execute_system_update(force_stash: bool = False) -> Dict[str, Any]:
             text=True,
             timeout=15,
         )
-        if reload_res.returncode == 0:
-            logs.append("✅ 后台服务集群已平滑重启并加载最新代码")
-        else:
-            logs.append("ℹ️ Supervisor 服务指令已就绪")
+        if reload_res.returncode != 0:
+            detail = (reload_res.stderr.strip() or reload_res.stdout.strip())[-200:]
+            return failed(f"服务重启指令失败 (exit={reload_res.returncode}): {detail}")
+        logs.append("✅ Supervisor 重启指令执行完成；实际服务就绪状态需另行检查")
 
         # 获取更新后的版本与哈希
         new_version_info = read_local_version_info()
         new_git_info = get_git_status()
 
-        logs.append(f"🎉 升级圆满完成！当前运行版本: v{new_version_info.get('version')} ({new_git_info.get('short_commit', 'latest')})")
+        logs.append(f"✅ 更新步骤完成！当前磁盘版本: v{new_version_info.get('version')} ({new_git_info.get('short_commit', 'latest')})")
 
         return {
             "ok": True,
-            "message": "系统升级成功，服务已平滑重载！",
+            "restart_required": False,
+            "restart_attempted": True,
+            "service_verified": False,
+            "code_updated": True,
+            "message": "系统更新步骤及重启指令已完成，请检查服务就绪状态。",
             "new_version": new_version_info.get("version"),
             "new_commit": new_git_info.get("short_commit"),
             "logs": logs,
         }
 
     except subprocess.TimeoutExpired:
-        logs.append("❌ 操作超时：网络拉取时间过长，请检查网络连接或代理设置。")
-        return {"ok": False, "error": "更新超时，请检查网络连接", "logs": logs}
+        return failed(f"更新阶段 [{phase}] 超时；后续步骤已中止，请检查当前状态后再重试。")
     except Exception as e:
-        logs.append(f"❌ 升级过程发生未预期异常: {e}")
-        return {"ok": False, "error": str(e), "logs": logs}
+        return failed(f"更新阶段 [{phase}] 异常: {e}")

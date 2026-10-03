@@ -4,19 +4,14 @@ TruePeopleSearch 协议层分布式高并发 Worker (Protocol Worker)
 
 特点：
 1. 纯 asyncio 异步事件驱动，单进程即可维持 50~200 个并发连接。
-2. 配合动态代理池与 curl_cffi TLS 指纹模拟，完全消除对无头浏览器的依赖。
-3. 内存占用仅 100~300MB，CPU 仅需 1~2 核，轻松达成单机日产 300 万条 (35~70 QPS)。
+2. 协议抓取和队列处理受目标站点速率限制约束，遇到 429 会暂停领取任务。
+3. 实际吞吐以数据库提交成功数为准，不以目标值或缓冲入队数代替。
 4. 无缝兼容 Redis 可靠租约队列 (tps: 机制) 与 TiDB 批量聚合入库。
 
 使用：
-  # 1. 隧道代理模式 (最推荐)
-  python3 protocol_worker.py --mode worker --concurrency 50 --proxy-tunnel "http://user:pass@host:port"
-
-  # 2. 代理文件轮换模式
-  python3 protocol_worker.py --mode worker --concurrency 50 --proxy-file proxies.txt
-
-  # 3. API 提取代理模式
-  python3 protocol_worker.py --mode worker --concurrency 50 --proxy-api "http://api.proxy.com/get"
+  # 先启动同一 Redis/数据库目标的 bulk_ingester_daemon，再启动协议 Worker。
+  # 直接内存写库模式已禁用；代理设置从受信任环境或本地配置读取。
+  python3 protocol_worker.py --mode worker --decoupled-ingest --concurrency 50
 
   # 投递任务 / 查看统计 / 回收过期
   python3 protocol_worker.py --mode feed --file urls.txt
@@ -45,6 +40,9 @@ _SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
+from tps_env import load_project_env
+load_project_env(Path(__file__).resolve().parent.parent, customer_safe=False)
+
 import redis
 
 from batch_ingest import BatchIngester
@@ -59,11 +57,15 @@ from protocol_fetcher import (
 )
 import proxy_pool
 from proxy_pool import ProxyManager
-from tps_control import clear_worker_heartbeat, write_worker_heartbeat
+from scrape_to_tidb import db_target_fingerprint, has_usable_phone
+from tps_control import bulk_ingest_status, clear_worker_heartbeat, write_worker_heartbeat
 from tps_metrics import get_metrics
 from tps_queue import (
+    JOB_KEY_PREFIX,
     LEASE_SEC,
+    LEASES_KEY,
     MAX_ATTEMPTS,
+    PROCESSING_KEY,
     ack,
     claim,
     drain_legacy,
@@ -76,16 +78,76 @@ from tps_queue import (
     recover_expired,
 )
 
-REDIS_HOST = os.environ.get("REDIS_HOST", "127.0.0.1")
-REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+REDIS_HOST = os.environ.get("TPS_REDIS_HOST") or os.environ.get("REDIS_HOST", "127.0.0.1")
+REDIS_PORT = int(os.environ.get("TPS_REDIS_PORT") or os.environ.get("REDIS_PORT", "6379"))
+REDIS_PASSWORD = os.environ.get("TPS_REDIS_PASSWORD") or os.environ.get("REDIS_PASSWORD") or None
+BUFFER_KEY = "tps:buffer:parsed"
+
+
+class BufferHandoffLost(RuntimeError):
+    """抓取租约已被别人回收，不可再提交旧结果。"""
+
+
+def park_buffered_job(r: redis.Redis, job: dict, data: dict) -> None:
+    """原子移交：结果入持久缓冲的同时从抓取租约中摘除。
+
+    入库守护进程随后负责最终 ACK/NACK。若提交结果未知，调用方不能主动
+    NACK：未提交时租约恢复会重试，已提交时可靠缓冲会继续入库。
+    """
+    job_id = str(job.get("id") or "")
+    if not job_id:
+        raise ValueError("buffer handoff requires a job id")
+    job_key = f"{JOB_KEY_PREFIX}{job_id}"
+    buffered_job = dict(job)
+    buffered_job["lease_until"] = 0
+    buffered_job["buffered_at"] = time.time()
+    encoded_job = json.dumps(buffered_job, ensure_ascii=False, separators=(",", ":"))
+    payload = json.dumps({"data": data, "job": buffered_job}, ensure_ascii=False)
+
+    for _ in range(3):
+        with r.pipeline() as pipe:
+            try:
+                pipe.watch(job_key)
+                stored = pipe.get(job_key)
+                if not stored:
+                    raise BufferHandoffLost("job no longer exists")
+                current = json.loads(stored)
+                try:
+                    in_processing = pipe.lpos(PROCESSING_KEY, job_id) is not None
+                except redis.ResponseError:
+                    # 旧版 Redis 不支持 LPOS，仍可用 LRANGE 检查所有权。
+                    in_processing = job_id in {
+                        value.decode() if isinstance(value, bytes) else value
+                        for value in pipe.lrange(PROCESSING_KEY, 0, -1)
+                    }
+                lease_until = pipe.zscore(LEASES_KEY, job_id)
+                if (
+                    str(current.get("id")) != job_id
+                    or current.get("worker_id") != job.get("worker_id")
+                    or current.get("claimed_at") != job.get("claimed_at")
+                    or lease_until is None
+                    or float(lease_until) <= time.time()
+                    or not in_processing
+                ):
+                    raise BufferHandoffLost("claim was already recovered or finalized")
+                pipe.multi()
+                pipe.lpush(BUFFER_KEY, payload)
+                pipe.lrem(PROCESSING_KEY, 1, job_id)
+                pipe.zrem(LEASES_KEY, job_id)
+                pipe.set(job_key, encoded_job)
+                pipe.execute()
+                return
+            except redis.WatchError:
+                continue
+    raise BufferHandoffLost("claim changed during buffer handoff")
 
 HB_INTERVAL_SEC = 15
 RECOVER_INTERVAL_SEC = 15
 STATS_INTERVAL_SEC = 5
 DEFAULT_CONCURRENCY = 50
 DAILY_TARGET = 3_000_000
-# Per-slot pause only. Do not sleep IP_REST_SEC (~70 minutes) here.
-_SLOT_RELEASE_SLEEP_SEC = 3
+# A site rate limit pauses new claims for 5 / 15 / 45 minutes.
+RATE_LIMIT_PAUSE_STEPS_SEC = (300, 900, 2700)
 
 
 def _mentions_captcha(exc: BaseException) -> bool:
@@ -192,6 +254,7 @@ def connect_redis() -> redis.Redis:
     return redis.Redis(
         host=REDIS_HOST,
         port=REDIS_PORT,
+        password=REDIS_PASSWORD,
         decode_responses=True,
         socket_timeout=5,
         socket_connect_timeout=5,
@@ -209,8 +272,10 @@ class ProtocolWorker:
         proxy_manager: Optional[ProxyManager] = None,
         batch_size: int = 50,
         flush_interval: float = 1.0,
-        decoupled_ingest: bool = False,
+        decoupled_ingest: bool = True,
     ):
+        if not decoupled_ingest:
+            raise ValueError("直接内存批量写库模式已禁用；必须启动独立可靠缓冲入库守护进程")
         self.r = r
         self.concurrency = max(1, int(concurrency))
         self.target_per_day = int(target_per_day)
@@ -226,25 +291,33 @@ class ProtocolWorker:
         self.stopping = False
         self._lock = asyncio.Lock()
         self._bg_tasks: List[asyncio.Task] = []
+        self._rate_limit_until = 0.0
+        self._rate_limit_streak = 0
 
         # 统计计数
         self._start_time = time.time()
         self._completed_count = 0
+        self._committed_count = 0
+        self._buffered_count = 0
         self._last_completed_count = 0
         self._last_calc_time = time.time()
         self._current_qps = 0.0
+        self._bulk_check_at = 0.0
+        self._bulk_ready = False
 
         # 初始化批量入库器（仅在非解耦模式下直接连接 TiDB）
-        self.batch_ingester = (
-            None
-            if decoupled_ingest
-            else BatchIngester(
-                batch_size=batch_size,
-                flush_interval_sec=flush_interval,
-                on_success=self._on_batch_success,
-                on_failure=self._on_batch_failure,
-            )
-        )
+        self.batch_ingester = None
+
+    def _bulk_ingester_ready(self, *, force: bool = False) -> bool:
+        now = time.monotonic()
+        if not force and now - self._bulk_check_at < 2:
+            return self._bulk_ready
+        status = bulk_ingest_status(self.r)
+        self._bulk_check_at = now
+        if status.get("db_target") and status["db_target"] != db_target_fingerprint():
+            raise RuntimeError("入库守护进程与抓取 Worker 的数据库目标不一致")
+        self._bulk_ready = bool(status.get("rate_available") and status.get("db_target"))
+        return self._bulk_ready
 
     def _safe_incr(self, bucket: str) -> None:
         try:
@@ -252,24 +325,40 @@ class ProtocolWorker:
         except Exception:
             pass
 
+    def _buffer_backlog(self) -> int:
+        """缓冲待入库量由 Redis 当前状态计算，不用本进程累计投递数冒充。"""
+        return int(self.r.llen(BUFFER_KEY)) + int(self.r.llen("tps:buffer:processing"))
+
     def _on_batch_success(self, jobs: List[dict]) -> None:
-        """批量入库成功回调：批量执行 Redis ack"""
+        """批量入库成功回调：记录已提交量，再尝试 Redis ACK。"""
         for job in jobs:
+            self._committed_count += 1
             try:
                 ack(self.r, job)
                 self.m.incr("success")
                 self._completed_count += 1
-            except Exception as e:
-                print(f"[ACK_ERR] {e}", file=sys.stderr)
+            except Exception:
+                print(f"[ACK_ERR] job={job.get('id')} Redis ACK failed", file=sys.stderr)
 
     def _on_batch_failure(self, job: dict, exc: Exception) -> None:
-        """单条入库失败回调：执行 nack 重新入队重试"""
-        print(f"[INGEST_FAIL] person_id={job.get('person_id')} err={exc}", file=sys.stderr)
+        """确定性质量错误进入 DLQ；数据库和 I/O 错误可重试。"""
+        terminal_quality_error = isinstance(exc, ValueError) and str(exc) in {"no_phone", "invalid_person"}
+        reason = str(exc) if terminal_quality_error else "ingest_error"
+        print(f"[INGEST_FAIL] job={job.get('id')} reason={reason}", file=sys.stderr)
         try:
-            nack(self.r, job, "ingest_error", retry=True)
-            self.m.incr("error")
+            nack(self.r, job, reason, retry=not terminal_quality_error)
+            self._safe_incr("parse_fail" if terminal_quality_error else "write_fail")
+            if terminal_quality_error:
+                self._safe_incr("dlq")
         except Exception as e:
             print(f"[NACK_ERR] {e}", file=sys.stderr)
+
+    async def _wait_for_rate_limit(self) -> None:
+        while not self.stopping:
+            remaining = self._rate_limit_until - time.monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(remaining, 1.0))
 
     async def _proxy_for_slot(self, slot_id: int) -> Optional[str]:
         """轮转网关原样使用，不补 sid。每次请求由 ZooProxy 换出口。"""
@@ -300,16 +389,44 @@ class ProtocolWorker:
         reason: str,
         slot_id: Optional[int] = None,
     ) -> None:
-        """Put the job back on pending without incrementing attempts."""
-        await asyncio.to_thread(release, self.r, job, reason)
+        """Return the job to pending and pause all new claims after a rate limit."""
+        proxy = self._slot_proxies.get(slot_id) if slot_id is not None else None
+        target_proxy = proxy or os.environ.get("PROXY_TUNNEL") or ""
+        no_cooldown = (
+            os.environ.get("NO_RATE_LIMIT_COOLDOWN") == "1"
+            or os.environ.get("TPS_NO_COOLDOWN") == "1"
+            or os.environ.get("RATE_LIMIT_PAUSE_SEC", "").strip() in ("0", "none", "false")
+            or os.environ.get("USE_CLOUDBYPASS") == "1"
+            or "cloudbypass" in target_proxy.lower()
+            or "gw-res" in target_proxy.lower()
+            or "-res_" in target_proxy.lower()
+            or "-region-" in target_proxy.lower()
+        )
+        async with self._lock:
+            if no_cooldown:
+                self._rate_limit_until = 0.0
+                self._rate_limit_streak = 0
+                pause = 0
+            else:
+                now = time.monotonic()
+                if now >= self._rate_limit_until:
+                    self._rate_limit_streak += 1
+                    step = min(self._rate_limit_streak, len(RATE_LIMIT_PAUSE_STEPS_SEC)) - 1
+                    self._rate_limit_until = now + RATE_LIMIT_PAUSE_STEPS_SEC[step]
+                pause = max(0, int(self._rate_limit_until - now))
+        await asyncio.to_thread(release, self.r, job, "rate_limited")
         self._safe_incr("rate_limit")
         async with self._lock:
             self.in_flight.pop(job_id, None)
-        print(f"[rate_limit] {url} returned to pending", flush=True)
-        await asyncio.sleep(_SLOT_RELEASE_SLEEP_SEC)
+        if pause > 0:
+            print(f"[rate_limit] job={job_id} paused_new_claims={pause}s returned to pending", flush=True)
+        else:
+            print(f"[rate_limit] job={job_id} ⚡ 动态住宅代理(每次请求不同IP)，零冷却直接换新IP重试", flush=True)
 
     async def run(self) -> None:
         """启动 Worker 主事件循环"""
+        if not self._bulk_ingester_ready(force=True):
+            raise RuntimeError("入库守护进程未就绪或数据库不可用；拒绝领取抓取任务")
         print(f"============================================================")
         print(f"[PROTOCOL_WORKER] 启动成功: worker_id={self.worker_id}")
         print(f"[PROTOCOL_WORKER] 并发协程数: {self.concurrency}")
@@ -354,6 +471,18 @@ class ProtocolWorker:
     async def _worker_loop(self, slot_id: int) -> None:
         """单个工作协程循环"""
         while not self.stopping:
+            await self._wait_for_rate_limit()
+            if self.stopping:
+                break
+            try:
+                ready = await asyncio.to_thread(self._bulk_ingester_ready)
+            except RuntimeError:
+                raise
+            except Exception:
+                ready = False
+            if not ready:
+                await asyncio.sleep(2)
+                continue
             # 1. 从 Redis 原子领取任务 (BLMOVE)
             try:
                 job = await asyncio.to_thread(claim, self.r, f"{self.worker_id}-{slot_id}")
@@ -376,14 +505,40 @@ class ProtocolWorker:
             # 2. 获取代理并执行协议抓取（同一 slot 复用粘性 sid）
             proxy_url = await self._proxy_for_slot(slot_id)
             try:
-                data = await self.fetcher.fetch_person(url, proxy=proxy_url)
+                # sid 随代理走：暖机 Cookie 精准命中同出口，无 sid 则回退通用键
+                data = await self.fetcher.fetch_person(
+                    url, proxy=proxy_url, sid=_sid_token(proxy_url or ""))
 
                 # 抓取成功，反馈代理并提交入库
                 await self.proxy_mgr.report_result(proxy_url, success=True)
+                if time.monotonic() >= self._rate_limit_until:
+                    self._rate_limit_streak = 0
+                rejection = None
+                if not isinstance(data, dict) or not data.get("person_id") or not data.get("full_name"):
+                    rejection = "invalid_person"
+                elif not has_usable_phone(data):
+                    rejection = "no_phone"
+                if rejection:
+                    await asyncio.to_thread(nack, self.r, job, rejection, False)
+                    self._safe_incr("parse_fail")
+                    self._safe_incr("dlq")
+                    print(f"[QUALITY_FAIL] job={job_id} reason={rejection} moved to DLQ", flush=True)
+                    continue
                 if self.decoupled_ingest:
-                    payload = json.dumps({"data": data, "job": job}, ensure_ascii=False)
-                    await asyncio.to_thread(self.r.lpush, "tps:buffer:parsed", payload)
-                    self._completed_count += 1
+                    try:
+                        await asyncio.to_thread(park_buffered_job, self.r, job, data)
+                    except BufferHandoffLost:
+                        print(f"[BUFFER_HANDOFF_LOST] job={job_id} claim was recovered", file=sys.stderr)
+                        continue
+                    except Exception as handoff_err:
+                        # Redis EXEC 可能已经提交但响应丢失：不主动 NACK。
+                        # 未提交由原租约恢复；已提交由持久缓冲继续入库。
+                        print(
+                            f"[BUFFER_HANDOFF_UNCERTAIN] job={job_id} type={type(handoff_err).__name__}",
+                            file=sys.stderr,
+                        )
+                        continue
+                    self._buffered_count += 1
                 else:
                     await self.batch_ingester.add(data, job)
 
@@ -428,11 +583,14 @@ class ProtocolWorker:
                     await self._release_rate_limited(job, job_id, url, "captcha", slot_id)
                 else:
                     bucket = getattr(sc_err, "bucket", "error")
-                    await asyncio.to_thread(nack, self.r, job, bucket, retry=True)
-                    self._safe_incr(bucket)
+                    terminal_quality_error = bucket in {"no_phone", "invalid_person"}
+                    await asyncio.to_thread(nack, self.r, job, bucket, retry=not terminal_quality_error)
+                    self._safe_incr("parse_fail" if terminal_quality_error else bucket)
+                    if terminal_quality_error:
+                        self._safe_incr("dlq")
 
             except Exception as unk_err:
-                print(f"[UNEXPECTED_ERR] {url}: {unk_err}", file=sys.stderr)
+                print(f"[UNEXPECTED_ERR] job={job_id} type={type(unk_err).__name__}", file=sys.stderr)
                 await asyncio.to_thread(nack, self.r, job, "unexpected_error", retry=True)
                 self._safe_incr("retry")
 
@@ -455,6 +613,13 @@ class ProtocolWorker:
                     except Exception:
                         pass
 
+                buffer_backlog = None
+                if self.decoupled_ingest:
+                    try:
+                        buffer_backlog = await asyncio.to_thread(self._buffer_backlog)
+                    except Exception:
+                        pass
+
                 # 2. 向 Redis 面板控制写入 Worker 状态
                 payload = {
                     "worker_id": self.worker_id,
@@ -466,10 +631,18 @@ class ProtocolWorker:
                         {"id": str(j.get("id")), "person_id": j.get("person_id")}
                         for j in inflight_jobs[:20]
                     ],
-                    "status": "stopping" if self.stopping else "running",
+                    "status": (
+                        "stopping" if self.stopping else
+                        "paused_rate_limit" if time.monotonic() < self._rate_limit_until else
+                        "paused_ingester" if not self._bulk_ready else "running"
+                    ),
                     "current_qps": round(self._current_qps, 2),
-                    "capacity_per_day": int(self._current_qps * 86400) if self._current_qps > 0 else self.target_per_day,
+                    "capacity_per_day": int(self._current_qps * 86400),
                     "target_per_day": self.target_per_day,
+                    "decoupled_ingest": self.decoupled_ingest,
+                    "buffered_total": self._buffered_count,
+                    "buffer_backlog": buffer_backlog,
+                    "db_committed": self._committed_count,
                 }
                 await asyncio.to_thread(write_worker_heartbeat, self.r, payload)
 
@@ -501,11 +674,11 @@ class ProtocolWorker:
                     print(f"[{self.worker_id}] 代理配置已通过管理页面动态热更新")
                 now = time.time()
                 elapsed = now - self._last_calc_time
-                done_delta = self._completed_count - self._last_completed_count
+                done_delta = self._committed_count - self._last_completed_count
 
                 qps = done_delta / elapsed if elapsed > 0 else 0.0
                 self._current_qps = qps
-                self._last_completed_count = self._completed_count
+                self._last_completed_count = self._committed_count
                 self._last_calc_time = now
 
                 async with self._lock:
@@ -513,13 +686,19 @@ class ProtocolWorker:
 
                 active_proxies = self.proxy_mgr.active_count
                 daily_estimate = int(qps * 86400)
+                daily_display = "见共享入库指标" if self.decoupled_ingest else f"{daily_estimate:,} 条/日"
+                try:
+                    buffer_backlog = await asyncio.to_thread(self._buffer_backlog) if self.decoupled_ingest else None
+                except Exception:
+                    buffer_backlog = None
 
                 print(
-                    f"[STATS] 实时吞吐: {qps:5.1f} QPS | "
+                    f"[STATS] 本进程确认入库: {qps:5.1f} QPS | "
                     f"在飞请求: {inflight_len:3d} | "
                     f"可用代理: {active_proxies:3d} | "
-                    f"总完成数: {self._completed_count:6d} | "
-                    f"预估日产: {daily_estimate:,} 条/日"
+                    f"数据库确认: {self._committed_count:6d} | "
+                    f"缓冲待入库: {buffer_backlog if buffer_backlog is not None else '不可用'} | "
+                    f"按已入库推算: {daily_display}"
                 )
 
             except asyncio.CancelledError:
@@ -658,7 +837,7 @@ def main() -> None:
     parser.add_argument(
         "--decoupled-ingest",
         action="store_true",
-        help="启用解耦模式：数据直接写入 Redis 缓冲区，由 bulk_ingester_daemon 独立批量入库 (冲刺 3000万必选)",
+        help="必须启用：数据进入 Redis 可靠缓冲，由已就绪的 bulk_ingester_daemon 入库",
     )
 
     args = parser.parse_args()
@@ -676,6 +855,8 @@ def main() -> None:
         run_stats()
 
     elif args.mode == "worker":
+        if not args.decoupled_ingest:
+            parser.error("直接内存批量写库模式已禁用；请使用 --decoupled-ingest 并先启动入库守护进程")
         r = connect_redis()
         if not args.proxy_tunnel and not args.proxy_file and not args.proxy_api:
             proxy_mgr = ProxyManager.from_redis(r)

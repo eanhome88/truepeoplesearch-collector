@@ -15,10 +15,14 @@ TruePeopleSearch 协议层高性能抓取与解析模块 (Protocol Fetcher)
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 _SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIR not in sys.path:
@@ -28,7 +32,10 @@ from curl_cffi.requests import AsyncSession
 from curl_cffi.curl import CurlError
 from scrapling.parser import Adaptor
 
-from scrape_to_tidb import extract_person_id, parse_date, split_full_name, extract_phone_numbers, MONTHS
+from scrape_to_tidb import (
+    MONTHS, _eligible_phone_type, _valid_us_phone, extract_person_id,
+    extract_phone_numbers, parse_date, split_full_name,
+)
 
 
 # ============================================================
@@ -93,13 +100,13 @@ DEFAULT_HEADERS = {
     "cache-control": "max-age=0",
     "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
     "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"macOS"',
+    "sec-ch-ua-platform": '"Windows"',
     "sec-fetch-dest": "document",
     "sec-fetch-mode": "navigate",
     "sec-fetch-site": "none",
     "sec-fetch-user": "?1",
     "upgrade-insecure-requests": "1",
-    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 }
 
 CF_CHALLENGE_PATTERNS = [
@@ -318,7 +325,7 @@ def parse_person_lean(page, url: str) -> dict:
     if parsed_phones:
         # 1. 电话列表 (逗号拼接所有捕获的号码，附带线路类型)
         data["all_phones"] = ", ".join(
-            f"{p['phone_number']} ({p.get('line_type') or 'Wireless'})"
+            f"{p['phone_number']} ({p.get('line_type') or 'Unknown'})"
             for p in parsed_phones if p.get("phone_number")
         )
 
@@ -343,24 +350,24 @@ def parse_person_lean(page, url: str) -> dict:
                 marked_primary = p
                 break
 
-        chosen = None
-        if marked_primary:
-            if str(marked_primary.get("line_type", "")).lower() == "wireless":
-                chosen = marked_primary
-            else:
-                # 主要电话是座机或其他：优先选用最近时间的无线号码
-                if wireless_sorted:
-                    chosen = wireless_sorted[0]
-                else:
-                    chosen = marked_primary
+        eligible_phones = [
+            p for p in parsed_phones
+            if _eligible_phone_type(p.get("line_type")) and _valid_us_phone(p.get("phone_number"))
+        ]
+        eligible_wireless = [p for p in wireless_sorted if p in eligible_phones]
+        if marked_primary in eligible_wireless:
+            chosen = marked_primary
+        elif eligible_wireless:
+            chosen = eligible_wireless[0]
+        elif marked_primary in eligible_phones:
+            chosen = marked_primary
         else:
-            if wireless_sorted:
-                chosen = wireless_sorted[0]
-            else:
-                chosen = parsed_phones[0]
+            landlines = [p for p in eligible_phones if p not in eligible_wireless]
+            chosen = max(landlines, key=_date_sort_key) if landlines else None
 
-        data["primary_phone"] = chosen.get("phone_number")
-        data["primary_phone_type"] = chosen.get("line_type")
+        if chosen:
+            data["primary_phone"] = chosen.get("phone_number")
+            data["primary_phone_type"] = chosen.get("line_type")
 
     # --- 电子邮箱 ---
     email_section = re.search(
@@ -378,6 +385,187 @@ def parse_person_lean(page, url: str) -> dict:
     return data
 
 
+def get_warmed_cookies(host: str, sid: str = "") -> tuple[dict, str, str]:
+    """从网关发布的暖机 Cookie 里取对应 host 的 cookies+UA；没有则返回 ({}, '', '')。
+    sid 键优先（同出口复用，cf_clearance 绑 IP），通用键兜底。
+    第三个返回值是命中的键类型（'sid'/'host'/''），供失效时精准踢出。"""
+    host = (host or "").lower() or "www.truepeoplesearch.com"
+    sid = (sid or "").strip()[:12]
+    try:
+        import redis  # type: ignore
+
+        r = redis.Redis(
+            host=os.environ.get("TPS_REDIS_HOST") or os.environ.get("REDIS_HOST", "127.0.0.1"),
+            port=int(os.environ.get("TPS_REDIS_PORT") or os.environ.get("REDIS_PORT", "6379")),
+            password=os.environ.get("TPS_REDIS_PASSWORD") or os.environ.get("REDIS_PASSWORD") or None,
+            decode_responses=True,
+            socket_connect_timeout=0.4,
+            socket_timeout=0.8,
+        )
+        keys = ([(f"unblocker:warmed:{host}:{sid}", "sid")] if sid else []) + [(f"unblocker:warmed:{host}", "host")]
+        for key, hit in keys:
+            raw = r.get(key)
+            if not raw:
+                continue
+            data = json.loads(raw)
+            if time.time() - float(data.get("ts", 0)) > 1500:
+                continue
+            cookies = data.get("cookies") or {}
+            if not isinstance(cookies, dict) or not cookies:
+                continue
+            return cookies, str(data.get("user_agent") or ""), hit
+        return {}, "", ""
+    except Exception:
+        return {}, "", ""
+
+
+COVERAGE_FIELDS = ("full_name", "age", "birth_year", "current_city", "current_state",
+                   "current_address", "primary_phone", "phone_numbers", "emails")
+COVERAGE_THRESHOLDS = {"full_name": 0.9, "primary_phone": 0.4, "phone_numbers": 0.4}
+COVERAGE_TTL_SEC = 86400
+
+
+def _field_filled(value) -> bool:
+    if value is None:
+        return False
+    if value == "未知":
+        return False
+    if isinstance(value, (list, dict, set, tuple)):
+        return len(value) > 0
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+def coverage_report(results: list) -> dict:
+    """对一批解析结果算字段覆盖率：解析器被改版打瞎时第一时间现形。"""
+    rows = [r for r in (results or []) if isinstance(r, dict)]
+    total = len(rows)
+    fields = {}
+    for f in COVERAGE_FIELDS:
+        n = sum(1 for r in rows if _field_filled(r.get(f)))
+        fields[f] = {"filled": n, "rate": (round(n / total, 4) if total else 0.0)}
+    return {"total": total, "fields": fields}
+
+
+def coverage_alert(report: dict, thresholds: dict = None) -> list:
+    """覆盖率掉到阈值下就报警（默认：姓名 90%，电话 40%）。"""
+    th = thresholds or COVERAGE_THRESHOLDS
+    out = []
+    total = (report or {}).get("total", 0)
+    if not total:
+        return ["无解析样本，覆盖率未知"]
+    for f, limit in th.items():
+        rate = ((report.get("fields") or {}).get(f) or {}).get("rate", 0.0)
+        if rate < limit:
+            out.append(f"{f} 覆盖率 {rate:.1%} < {limit:.0%}（{total} 样本），解析器可能被改版打瞎")
+    return out
+
+
+_SHARED_REDIS = None
+
+
+def _shared_redis():
+    """模块级复用连接：解析/覆盖率/学习共用，失败返回 None（调用方跳过）。"""
+    global _SHARED_REDIS
+    if _SHARED_REDIS is not None:
+        try:
+            _SHARED_REDIS.ping()
+            return _SHARED_REDIS
+        except Exception:
+            _SHARED_REDIS = None
+    try:
+        import redis  # type: ignore
+
+        client = redis.Redis(
+            host=os.environ.get("TPS_REDIS_HOST") or os.environ.get("REDIS_HOST", "127.0.0.1"),
+            port=int(os.environ.get("TPS_REDIS_PORT") or os.environ.get("REDIS_PORT", "6379")),
+            password=os.environ.get("TPS_REDIS_PASSWORD") or os.environ.get("REDIS_PASSWORD") or None,
+            decode_responses=True,
+            socket_connect_timeout=0.3,
+            socket_timeout=0.5,
+        )
+        client.ping()
+        _SHARED_REDIS = client
+        return client
+    except Exception:
+        return None
+
+
+def record_coverage(result: dict) -> None:
+    """每次解析成功记一笔滚动覆盖率（Redis，24h 滚动窗口），失败静默跳过。
+    过期只在键新建时设一次（incr 返回 1），窗口才能真正滚动，不会越积越多。"""
+    if not isinstance(result, dict):
+        return
+    try:
+        r = _shared_redis()
+        if r is None:
+            return
+        filled = [f for f in COVERAGE_FIELDS if _field_filled(result.get(f))]
+        pipe = r.pipeline()
+        pipe.incr("tps:cov:total")
+        for f in filled:
+            pipe.incr(f"tps:cov:{f}")
+        res = pipe.execute() or []
+        fresh = [i for i, v in enumerate(res) if v == 1]
+        if fresh:
+            keys = ["tps:cov:total"] + [f"tps:cov:{f}" for f in filled]
+            pipe2 = r.pipeline()
+            for i in fresh:
+                if i < len(keys):
+                    pipe2.expire(keys[i], COVERAGE_TTL_SEC)
+            pipe2.execute()
+    except Exception:
+        pass
+
+
+def read_coverage() -> dict:
+    """读滚动覆盖率（供网关 /health 展示），无 Redis 返回空。"""
+    try:
+        import redis  # type: ignore
+
+        r = redis.Redis(
+            host=os.environ.get("TPS_REDIS_HOST") or os.environ.get("REDIS_HOST", "127.0.0.1"),
+            port=int(os.environ.get("TPS_REDIS_PORT") or os.environ.get("REDIS_PORT", "6379")),
+            password=os.environ.get("TPS_REDIS_PASSWORD") or os.environ.get("REDIS_PASSWORD") or None,
+            decode_responses=True,
+            socket_connect_timeout=0.3,
+            socket_timeout=0.5,
+        )
+        total = int(r.get("tps:cov:total") or 0)
+        fields = {}
+        for f in COVERAGE_FIELDS:
+            n = int(r.get(f"tps:cov:{f}") or 0)
+            fields[f] = {"filled": n, "rate": (round(n / total, 4) if total else 0.0)}
+        return {"total": total, "fields": fields,
+                "alerts": coverage_alert({"total": total, "fields": fields}) if total else []}
+    except Exception:
+        return {}
+
+
+def drop_warmed_cookies(host: str, sid: str = "", hit: str = "") -> None:
+    """暖机 Cookie 已失效（拿着它吃 403/验证）时，精准删掉命中的那把键，
+    避免后续请求继续用死 Cookie 空撞，下一轮自动触发浏览器重暖。"""
+    host = (host or "").lower() or "www.truepeoplesearch.com"
+    try:
+        import redis  # type: ignore
+
+        r = redis.Redis(
+            host=os.environ.get("TPS_REDIS_HOST") or os.environ.get("REDIS_HOST", "127.0.0.1"),
+            port=int(os.environ.get("TPS_REDIS_PORT") or os.environ.get("REDIS_PORT", "6379")),
+            password=os.environ.get("TPS_REDIS_PASSWORD") or os.environ.get("REDIS_PASSWORD") or None,
+            decode_responses=True,
+            socket_connect_timeout=0.4,
+            socket_timeout=0.8,
+        )
+        if hit == "sid" and sid:
+            r.delete(f"unblocker:warmed:{host}:{sid.strip()[:12]}")
+        elif hit == "host":
+            r.delete(f"unblocker:warmed:{host}")
+    except Exception:
+        pass
+
+
 class ProtocolFetcher:
     """协议层异步抓取器 (支持流式截断与极限流量压缩)"""
 
@@ -392,21 +580,50 @@ class ProtocolFetcher:
         timeout: Optional[int] = None,
         session: Optional[AsyncSession] = None,
         stream_cutoff: bool = True,
+        cookies: Optional[dict] = None,
+        use_warmed: bool = True,
+        sid: str = "",
     ) -> dict:
         """
         异步请求 TruePeopleSearch 人物页面并解析结构化数据。
-        
+
         :param stream_cutoff: 是否开启流式截断（只下前 10KB，检测到 Previous Addresses 立即掐断，极度省流量）
+        :param sid: 本 lane 的 sticky 会话 id；传了则暖机优先命中同出口（cf_clearance 绑 IP），
+            且暖机失效时精准踢出，不影响别的 lane。
         """
         to = timeout or self.default_timeout
         own_session = session is None
 
+        # 协议主跑：优先用浏览器暖机好的 Cookie（网关 /v1/scrape 成功后发布到 Redis）
+        warmed_ua = ""
+        warmed_hit = ""
+        warmed_host = ""
+        if cookies is None and use_warmed:
+            try:
+                warmed_host = urlparse(url).netloc.lower() or "www.truepeoplesearch.com"
+                cookies, warmed_ua, warmed_hit = get_warmed_cookies(warmed_host, sid)
+            except Exception:
+                cookies, warmed_ua, warmed_hit = None, "", ""
+
         if own_session:
             session = AsyncSession(impersonate=self.impersonate)
+        if cookies and own_session:
+            try:
+                session.cookies.update(cookies)
+            except Exception:
+                pass
 
         try:
+            headers = dict(DEFAULT_HEADERS)
+            if warmed_ua:
+                headers["user-agent"] = warmed_ua
+            if cookies:
+                try:
+                    headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items() if k)
+                except Exception:
+                    pass
             req_kwargs = {
-                "headers": DEFAULT_HEADERS,
+                "headers": headers,
                 "timeout": to,
                 "allow_redirects": True,
                 "accept_encoding": "gzip, deflate, br, zstd",
@@ -455,11 +672,11 @@ class ProtocolFetcher:
                         c_low = chunk.lower()
                         # 一旦在数据流中嗅探到过往地址或亲戚，代表上方核心信息（电话、邮箱、当前地址）已下载完毕
                         # 立即掐断连接，不再传输后续几十 KB 的广告与多余数据
+                        # 注意：sponsored by 可能是广告位先出现，不能当截断信号（会丢电话/邮箱）
                         if (
                             b"previous addresses" in c_low
                             or b"possible relatives" in c_low
                             or b"possible associates" in c_low
-                            or b"sponsored by" in c_low
                         ):
                             break
                         if total_bytes >= 35000:  # 35KB 安全上限
@@ -468,6 +685,7 @@ class ProtocolFetcher:
                     await resp.aclose()
 
                 html_text = b"".join(chunks).decode("utf-8", errors="replace")
+                final_req_url = str(getattr(resp, "url", "") or url)
 
             else:
                 # 完整下载模式
@@ -483,27 +701,33 @@ class ProtocolFetcher:
                         raise ScrapeError(f"Network error: {exc}", bucket="network_err") from exc
 
                 status = resp.status_code
-                html_text = resp.text
+                final_req_url = str(getattr(resp, "url", "") or url)
+                try:
+                    html_text = resp.text
 
-                cf_blocked = check_cloudflare_blocked(status, html_text)
-                if cf_blocked:
-                    raise CloudflareChallengeError(f"Cloudflare challenge encountered (status {status}) for {url}")
-                if status == 404:
-                    raise EmptyPageError(f"Person not found (404) for {url}")
-                if status != 200:
-                    raise HttpError(status, f"HTTP {status} for {url}")
-                # status 200 且 Cloudflare 检测未命中时，同样识别验证码页。
-                if status == 200 and not cf_blocked and _is_captcha_or_challenge(html_text, url):
-                    early_name = parse_person_lean(Adaptor(html_text), url).get("full_name")
-                    _raise_if_captcha_page(html_text, url, early_name)
+                    cf_blocked = check_cloudflare_blocked(status, html_text)
+                    if cf_blocked:
+                        raise CloudflareChallengeError(f"Cloudflare challenge encountered (status {status}) for {url}")
+                    if status == 404:
+                        raise EmptyPageError(f"Person not found (404) for {url}")
+                    if status != 200:
+                        raise HttpError(status, f"HTTP {status} for {url}")
+                    # status 200 且 Cloudflare 检测未命中时，同样识别验证码页。
+                    if status == 200 and not cf_blocked and _is_captcha_or_challenge(html_text, url):
+                        early_name = parse_person_lean(Adaptor(html_text), url).get("full_name")
+                        _raise_if_captcha_page(html_text, url, early_name)
+                finally:
+                    try:
+                        await resp.aclose()
+                    except Exception:
+                        pass
 
             # 统一阻断检查与精简解析
             cf_blocked = check_cloudflare_blocked(200, html_text)
             if cf_blocked:
                 raise CloudflareChallengeError(f"Cloudflare challenge encountered for {url}")
 
-            # 检查是否为电话反查或搜索结果列表页
-            final_req_url = str(getattr(resp, "url", "") or url)
+            # 检查是否为电话反查或搜索结果列表页（final_req_url 已在下载分支提前取值）
             is_search = "resultphone" in url.lower() or "/results?" in url.lower() or "resultname" in url.lower()
             has_person_path = bool(re.search(r"/(?:find/)?person/([a-zA-Z0-9_]+)", final_req_url))
 
@@ -516,6 +740,7 @@ class ProtocolFetcher:
                         r = redis.Redis(
                             host=os.environ.get("REDIS_HOST", "127.0.0.1"),
                             port=int(os.environ.get("REDIS_PORT", "6379")),
+                            password=os.environ.get("TPS_REDIS_PASSWORD") or os.environ.get("REDIS_PASSWORD") or None,
                             decode_responses=True,
                         )
                         from tps_queue import feed
@@ -539,8 +764,27 @@ class ProtocolFetcher:
                 _raise_if_captcha_page(html_text, url, full_name)
                 raise EmptyPageError(f"Empty page (no valid person) for {url}")
 
+            record_coverage(data)
+            try:
+                from phone_plan import learn_from_person
+
+                learn_from_person(data, _shared_redis())
+            except Exception:
+                pass
             return data
 
+        except (CloudflareChallengeError, HttpError) as exc:
+            # 拿着暖机 Cookie 依然撞验证/403：这份暖机已死，精准踢出，
+            # 下一轮自动回退浏览器重暖；429 等限流不踢（Cookie 本身可能没问题）。
+            is_dead_warmed = isinstance(exc, CloudflareChallengeError) or (
+                isinstance(exc, HttpError) and getattr(exc, "status", 0) == 403
+            )
+            if is_dead_warmed and warmed_hit and warmed_host:
+                try:
+                    drop_warmed_cookies(warmed_host, sid, warmed_hit)
+                except Exception:
+                    pass
+            raise
         finally:
             if own_session and session:
                 await session.close()

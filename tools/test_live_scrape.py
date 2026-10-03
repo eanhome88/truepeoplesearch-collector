@@ -1,96 +1,113 @@
 #!/usr/bin/env python3
-"""
-本地实际抓取验证脚本：使用购买的美国住宅代理抓取真实人物、解析入库并刷新面板
-"""
+"""单页采集诊断。默认只解析；显式 --write 才会写入配置的数据库。"""
 
-import sys
+import argparse
 import os
-import json
+import sys
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from scrapling.fetchers import StealthyFetcher
-from scrapling.parser import Adaptor
-from proxy_pool import refresh_sticky_url, load_proxy_config
-from protocol_fetcher import parse_person_lean
-from scrape_to_tidb import insert_person, parse_person, TIDB_CONFIG
-import mysql.connector
 import redis
+from scrapling.fetchers import StealthyFetcher
 
-def main():
-    r = redis.Redis(host="127.0.0.1", port=6379, db=0)
-    cfg = load_proxy_config(r)
-    tunnel = cfg.get("tunnel") or "http://user-spevk8xxrl-country-us-region-US:cOctvu~5aSud5FC72b@gate.decodo.com:7000"
+from proxy_pool import load_proxy_config, refresh_sticky_url
+from scrape_to_tidb import (
+    _page_document, _page_final_url, fetch_cloudbypass_v2_sync, get_db,
+    has_usable_phone, insert_person, is_captcha_document, parse_person,
+)
 
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="单页采集和可选入库诊断")
+    parser.add_argument("url", help="经授权可访问的人物页 URL")
+    parser.add_argument("--write", action="store_true", help="显式写入当前配置的数据库")
+    args = parser.parse_args()
+
+    r = redis.Redis(
+        host=os.environ.get("TPS_REDIS_HOST") or os.environ.get("REDIS_HOST", "127.0.0.1"),
+        port=int(os.environ.get("TPS_REDIS_PORT") or os.environ.get("REDIS_PORT", "6379")),
+        password=os.environ.get("TPS_REDIS_PASSWORD") or os.environ.get("REDIS_PASSWORD") or None,
+        decode_responses=True,
+    )
+    try:
+        tunnel = (load_proxy_config(r) or {}).get("tunnel")
+    except redis.RedisError:
+        tunnel = None
+    tunnel = tunnel or os.environ.get("TPS_PROXY_URL") or os.environ.get("PROXY_TUNNEL")
+    if not tunnel:
+        print("[ERROR] 未配置代理；请设置 TPS_PROXY_URL、PROXY_TUNNEL 或 Redis 代理配置")
+        return 2
     proxy = refresh_sticky_url(tunnel)
-    url = sys.argv[1] if len(sys.argv) > 1 else "https://www.truepeoplesearch.com/find/person/pxnn462rrnl8n06rl0089"
 
-    print("=" * 65)
-    print("【TruePeopleSearch 本地实机抓取验证】")
-    print(f"目标 URL: {url}")
-    print(f"出口代理: {proxy[:40]}... (美国住宅代理)")
-    print("=" * 65)
-
-    print("\n[Step 1] 正在通过浏览器 Stealth 引擎 + 美国住宅出口发起真实请求...")
-    t0 = time.time()
-    fetcher = StealthyFetcher()
-    page = fetcher.fetch(url, proxy=proxy, headless=True, network_idle=True)
-    lat = time.time() - t0
-    print(f"  -> HTTP 响应状态码: {page.status}")
-    print(f"  -> 网络及渲染耗时: {lat:.2f} 秒")
-    print(f"  -> 页面 HTML 体积: {len(page.text):,} 字节")
-
+    print("[Step 1] 抓取单页（优先使用穿云 V2 API 网关）")
+    started = time.time()
+    page = None
+    cb_tried = False
+    if os.environ.get("USE_CLOUDBYPASS", "1") == "1":
+        cb_tried = True
+        try:
+            page = fetch_cloudbypass_v2_sync(args.url, proxy=tunnel)
+            if page is None:
+                print("[CLOUDBYPASS] 穿云 API 返回验证码/空页，3 次重试均未突破")
+        except Exception as e:
+            print(f"[CLOUDBYPASS] API 抓取跳过: {e}")
+    if page is None:
+        if cb_tried:
+            print("[FALLBACK] 穿云失败，降级到 StealthyFetcher 浏览器渲染...")
+        page = StealthyFetcher.fetch(args.url, proxy=proxy, headless=True, network_idle=True)
+    elapsed = time.time() - started
+    doc = _page_document(page)
+    # 诊断：输出页面基本信息
+    import re as _re
+    _titles = _re.findall(r"<title>(.*?)</title>", doc[:2000], _re.I)
+    print(f"HTTP 状态: {page.status}，耗时: {elapsed:.2f} 秒，页面大小: {len(doc)} 字节")
+    if _titles:
+        print(f"页面标题: {_titles[0][:80]}")
     if page.status != 200:
-        print(f"  [ERROR] 抓取非 200: {page.status}")
-        return
+        print("[ERROR] 非成功响应，未解析、未写库")
+        return 1
+    final_url = _page_final_url(page, args.url)
+    if is_captcha_document(final_url, doc):
+        # 找出具体命中了哪个标记
+        blob = f"{final_url}\n{doc}".lower()
+        from scrape_to_tidb import _CAPTCHA_MARKERS
+        hits = [m for m in _CAPTCHA_MARKERS if m in blob]
+        print(f"[BLOCKED] 页面要求验证或限制访问；未解析、未写库")
+        print(f"  命中标记: {hits}")
+        print(f"  页面前 300 字符: {doc[:300]!r}")
+        return 1
 
-    print("\n[Step 2] 正在执行人物档案结构化解析与智能手机号拓扑提取...")
-    data = parse_person(page, url)
+    print("[Step 2] 解析并检查数据质量")
+    data = parse_person(page, args.url)
+    if not data.get("person_id") or not data.get("full_name"):
+        print("[ERROR] 缺少人物标识或姓名，未写库")
+        return 1
+    if not has_usable_phone(data):
+        print("[SKIPPED] 未解析到有效电话号码；未注入模拟数据，未写库")
+        return 1
+    print(f"解析成功：电话记录 {len(data.get('phone_numbers') or [])} 条")
 
-    name = data.get("full_name")
-    age = data.get("age")
-    addr = data.get("current_address")
-    primary_p = data.get("primary_phone")
-    primary_t = data.get("primary_phone_type")
-    wireless = data.get("wireless_phones", [])
-    landlines = data.get("landline_phones", [])
-    relatives = data.get("relatives", [])
+    if not args.write:
+        print("[DRY_RUN] 未写库。需要验证入库时显式加 --write。")
+        return 0
 
-    print(f"  • 姓名: {name}")
-    print(f"  • 年龄: {age}")
-    print(f"  • 当前地址: {addr}")
-    print(f"  • 首选联系电话: {primary_p} [{primary_t}]")
-    print(f"  • 全部手机号 (Wireless): {wireless}")
-    print(f"  • 全部座机号 (Landline): {landlines}")
-    print(f"  • 关联亲属人数: {len(relatives)} 位")
+    print("[Step 3] 写入当前配置的数据库")
+    db = get_db()
+    try:
+        persisted = insert_person(db, data)
+    finally:
+        db.close()
+    if not persisted:
+        print("[SKIPPED] 数据未写入；不计为成功")
+        return 1
 
-    print("\n[Step 3] 正在写入本地 MySQL (people_search 数据库)...")
-    db_cfg = dict(TIDB_CONFIG)
-    db_cfg["port"] = int(os.environ.get("TPS_DB_PORT", 3306))
-    db_cfg["password"] = os.environ.get("TPS_DB_PASSWORD", "")
-    
-    conn = mysql.connector.connect(**db_cfg)
-    data["url"] = url
-    insert_person(conn, data)
-    conn.close()
-    print("  -> 数据库入库状态: SUCCESS 成功写入 (MySQL people_search)")
+    # 临时诊断脚本不写生产任务指标，防止把测试次数伪装成真实采集。
+    print("[OK] 数据库已提交或确认同一记录已存在；未修改生产采集计数")
+    return 0
 
-    print("\n[Step 4] 正在累加大屏生产指标 (Redis)...")
-    r.incr("tps:tasks:total")
-    r.incr("tps:tasks:success")
-    r.incrby("tps:traffic:saved_bytes", 85000)
-    if wireless:
-        r.incr("tps:wireless:count")
-    print("  -> 任务总执行次数 +1")
-    print("  -> 成功计数 +1")
-    print("  -> 省流统计 +85KB")
-    print("=" * 65)
-    print("【实机抓取验证完成】数据已入库，打开面板 http://127.0.0.1:5001 可直接查看！")
-    print("=" * 65)
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
