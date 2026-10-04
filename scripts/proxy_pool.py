@@ -567,6 +567,44 @@ def sticky_gateway_url(proxy_url: str, holder: str, minutes: int = 120) -> str:
     return urlunparse((parts.scheme or "http", f"{auth}@{host}{port}", parts.path or "", "", "", ""))
 
 
+_CB_SESSION_RE = re.compile(r"_s[A-Za-z0-9]+-\d+m$", re.IGNORECASE)
+
+
+def _is_cloudbypass_gateway(user: str, host: str) -> bool:
+    return "cloudbypass" in host or "gw-res" in host or "-res_" in user.lower() or "res_us" in user.lower()
+
+
+def _cloudbypass_minutes(user: str, requested: int) -> int:
+    found = re.search(r"-(\d+)m$", user or "")
+    if found:
+        return max(1, min(int(found.group(1)), 30))
+    return max(1, min(int(requested), 30))
+
+
+def mint_cloudbypass_sticky(proxy_url: str, minutes: int = 30) -> str:
+    """新开一条穿云时效会话。不用他们的 SDK，用户名按 `_s` + 随机会话 + `-Nm` 拼。"""
+    raw = (proxy_url or "").strip()
+    if not raw:
+        return raw
+    parts = urlparse(raw if "://" in raw else "http://" + raw)
+    user = parts.username or ""
+    host = (parts.hostname or "").lower()
+    if not _is_cloudbypass_gateway(user, host):
+        return raw
+    base = _CB_SESSION_RE.sub("", user)
+    hold = _cloudbypass_minutes(user, minutes)
+    alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+    sid = "s" + "".join(secrets.choice(alphabet) for _ in range(10))
+    username = f"{base}_{sid}-{hold}m"
+    password = parts.password or ""
+    auth = quote(username, safe="")
+    if password:
+        auth += ":" + quote(password, safe="")
+    host_str = parts.hostname or ""
+    port = f":{parts.port}" if parts.port else ""
+    return urlunparse((parts.scheme or "http", f"{auth}@{host_str}{port}", parts.path or "", "", "", ""))
+
+
 def refresh_sticky_url(proxy_url: str, minutes: int = 120) -> str:
     """Return the same gateway with a new random sid.
 
@@ -601,6 +639,8 @@ def refresh_sticky_url(proxy_url: str, minutes: int = 120) -> str:
         username = f"{user_clean}-sid-{sid}-t-{hold}"
     elif "-session" in user.lower():
         username = f"{user_clean}-session_{sid}"
+    elif _is_cloudbypass_gateway(user, host):
+        return mint_cloudbypass_sticky(raw, minutes=hold)
     else:
         username = user
     password = parts.password or ""
@@ -617,7 +657,9 @@ def tunnel_sticky_lanes(proxy_url: str, count: int = 2, rest_sec: float = IP_RES
     urls = []
     seen = set()
     for i in range(max(1, int(count))):
-        url = sticky_gateway_url(proxy_url, f"lane{i}")
+        minted = mint_cloudbypass_sticky(proxy_url, minutes=30)
+        raw = (proxy_url or "").strip()
+        url = minted if minted and minted != raw else sticky_gateway_url(proxy_url, f"lane{i}")
         if url and url not in seen:
             seen.add(url)
             urls.append(url)

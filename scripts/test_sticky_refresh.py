@@ -63,6 +63,18 @@ class TestRefreshStickyUrl(unittest.TestCase):
     def test_url_without_region_is_unchanged(self):
         self.assertEqual(refresh_sticky_url(PLAIN), PLAIN)
 
+    def test_cloudbypass_session_is_replaced(self):
+        current = "http://acct-res_US_sp6hjcssnsa-30m:secret@gw-res.cloudbypass.com:1288"
+        url = refresh_sticky_url(current)
+        user = urlparse(url).username or ""
+        self.assertTrue(user.startswith("acct-res_US_s"))
+        self.assertTrue(user.endswith("-30m"))
+        self.assertNotIn("sp6hjcssnsa", user)
+        self.assertEqual(urlparse(url).password, "secret")
+        self.assertNotEqual(user, urlparse(current).username)
+        again = refresh_sticky_url(current)
+        self.assertNotEqual(urlparse(again).username, user)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

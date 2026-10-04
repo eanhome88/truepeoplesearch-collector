@@ -1051,10 +1051,13 @@ class LeaseWorker:
         self.slots = [_BrowserSlot(i, self.ctx) for i in range(self.concurrency)]
         groups = []
         start = 0
+        self._proxy_born = {}
+        opened = time.time()
         for gid, size in enumerate(sizes):
             group = _ChromeGroup(gid, self.slots[start:start + size], self.ctx)
             if self.lanes is not None:
                 group.proxy = self.lanes.checkout(str(gid))
+                self._proxy_born[gid] = opened
             groups.append(group)
             start += size
         self.groups = groups
@@ -1155,6 +1158,9 @@ class LeaseWorker:
             threading.Thread(
                 target=self._api_refresh_loop, name="tps-proxy-refresh", daemon=True,
             ).start()
+        threading.Thread(
+            target=self._sticky_refresh_loop, name="tps-sticky-refresh", daemon=True,
+        ).start()
 
         try:
             n = recover_expired(self.r)
@@ -1362,8 +1368,21 @@ class LeaseWorker:
                 flush=True,
             )
         else:
+            before = group.proxy or ""
             switched = False if stale else self._switch_ip(group)
-            if (
+            after = group.proxy or ""
+            minted = after != before and ("gw-res" in after.lower() or "cloudbypass" in after.lower())
+            many = self.lanes is not None and self.lanes.count > 1
+            if minted and many:
+                group.consecutive_rate_limits += 1
+                warm = LANE_WARM_SEC + random.uniform(0, 5)
+                group.claim_after = time.monotonic() + warm
+                label = ProxyManager._mask_proxy(group.proxy) if group.proxy else "direct"
+                print(
+                    f"  [session_refresh] chrome={group.gid} 429后换新粘性会话，本组热身{warm:.0f}s，其他组不停: {label}",
+                    flush=True,
+                )
+            elif (
                 switched
                 and self.lanes is not None
                 and self.lanes.count > 1
@@ -1409,6 +1428,9 @@ class LeaseWorker:
 
     def _arm_proxy(self, group: _ChromeGroup, proxy: str) -> None:
         group.proxy = proxy
+        if not hasattr(self, "_proxy_born"):
+            self._proxy_born = {}
+        self._proxy_born[group.gid] = time.time()
         group.generation += 1
         group.claim_after = 0.0
         if group.proc is not None and group.proc.is_alive():
@@ -1724,6 +1746,26 @@ class LeaseWorker:
                         pass
             except Exception as exc:
                 print(f"[RECOVER] {exc}", file=sys.stderr)
+
+    def _sticky_refresh_loop(self) -> None:
+        """穿云时效会话 30 分钟失效。满 25 分钟就地换新会话，不用再去面板提取。"""
+        while not self.stop.wait(60):
+            now = time.time()
+            born = getattr(self, "_proxy_born", {})
+            for group in list(self.groups):
+                proxy = group.proxy or ""
+                if "gw-res" not in proxy.lower() and "cloudbypass" not in proxy.lower():
+                    continue
+                if now - float(born.get(group.gid, now)) < 25 * 60:
+                    continue
+                fresh = refresh_sticky_url(proxy, minutes=30)
+                if not fresh or fresh == proxy:
+                    continue
+                print(
+                    f"[STICKY] chrome={group.gid} 会话将满 30 分钟，已换新会话",
+                    flush=True,
+                )
+                self._arm_proxy(group, fresh)
 
     def _api_refresh_loop(self) -> None:
         """定时从上游拉新出口并热合并进 lanes，不停机、不丢任务。"""
