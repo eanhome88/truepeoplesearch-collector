@@ -52,10 +52,9 @@ class TestRateLimitPause(unittest.TestCase):
             "person": job["person_id"],
             "url": job["url"],
         })
-        self.assertEqual(group.proxy, "http://10.0.0.1:8000")
-        self.assertEqual(group.generation, 0)
-        self.assertGreater(worker._pause_remaining_sec(), 290)
-        self.assertEqual(worker._rate_limit_streak, 1)
+        self.assertEqual(group.proxy, "http://10.0.0.2:8000")
+        self.assertEqual(group.generation, 1)
+        self.assertEqual(worker._pause_remaining_sec(), 0)
         self.assertEqual(queue_stats(r)["pending"], 1)
         self.assertEqual(queue_stats(r)["dlq"], 0)
 
@@ -73,10 +72,8 @@ class TestRateLimitPause(unittest.TestCase):
             "person": again["person_id"],
             "url": again["url"],
         })
-        self.assertEqual(group.proxy, "http://10.0.0.1:8000")
         self.assertGreater(worker._pause_remaining_sec(), 290)
         self.assertEqual(worker._rate_limit_streak, 1)
-        self.assertEqual(int(claim(r, "worker-ip-3").get("attempts") or 0), 0)
 
     def test_pause_steps(self):
         self.assertEqual(rate_limit_pause_sec(1), 300)
@@ -176,8 +173,8 @@ class TestRateLimitPause(unittest.TestCase):
         self.assertEqual(worker._rate_limit_streak, 0)
         self.assertEqual(worker._heartbeat_status(), "running")
 
-    def test_dynamic_proxy_and_cloudbypass_zero_cooldown(self):
-        """动态住宅代理（每次请求不同IP / 穿云网关）在 429 时绝不执行 300 秒冷却，零秒无缝继续。"""
+    def test_dynamic_gateway_account_pause(self):
+        """单条穿云网关 429 走账号总量暂停：暂停 15~25 秒、streak 1、status paused、pending 1。"""
         r = make_redis()
         feed(r, [URL])
         job = claim(r, "worker-cb")
@@ -204,11 +201,48 @@ class TestRateLimitPause(unittest.TestCase):
             "generation": 0,
         })
 
-        # 核心断言：动态代理零秒冷却，状态依然为 running，绝无 300 秒停顿
-        self.assertEqual(worker._pause_remaining_sec(), 0)
-        self.assertEqual(worker._heartbeat_status(), "running")
+        self.assertGreaterEqual(worker._pause_remaining_sec(), 15)
+        self.assertLessEqual(worker._pause_remaining_sec(), 25)
+        self.assertEqual(worker._rate_limit_streak, 1)
+        self.assertEqual(worker._heartbeat_status(), "paused")
         self.assertEqual(queue_stats(r)["pending"], 1)
-        self.assertEqual(queue_stats(r)["processing"], 0)
+
+    def test_captcha_keeps_lane_restarts_fingerprint(self):
+        r = make_redis()
+        feed(r, [URL])
+        job = claim(r, "worker-cap")
+        lanes = StickyLanes(["http://10.0.0.1:8000", "http://10.0.0.2:8000"], rest_sec=4200)
+        worker = LeaseWorker(r, 1, 1000, 8.0, lanes=lanes)
+        group = worker.groups[0]
+        slot = worker.slots[0]
+        slot.job = job
+        slot.jid = job["id"]
+        worker.in_flight[job["id"]] = job
+        now = time.monotonic()
+        worker._on_done(slot, {
+            "slot": 0,
+            "kind": "done",
+            "id": job["id"],
+            "bucket": "rate_limit",
+            "error": "captcha challenge for " + URL,
+            "generation": 0,
+            "person": job["person_id"],
+            "url": job["url"],
+        })
+        self.assertEqual(group.proxy, "http://10.0.0.1:8000")
+        self.assertEqual(group.generation, 0)
+        self.assertEqual(worker._pause_remaining_sec(), 0)
+        self.assertGreater(group.claim_after, now)
+
+    def test_claim_gap_adaptive(self):
+        import os
+        os.environ.pop("TPS_CLAIM_GAP_SEC", None)
+        r = make_redis()
+        worker = LeaseWorker(r, 1, 1000, 8.0)
+        worker._recent = [1] * 100
+        self.assertGreater(worker._claim_gap_sec(), 10)
+        worker._recent = []
+        self.assertLess(worker._claim_gap_sec(), 6)
 
 
 if __name__ == "__main__":

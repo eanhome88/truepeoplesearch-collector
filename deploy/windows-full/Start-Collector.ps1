@@ -25,7 +25,7 @@ $configuration = Read-TpsRuntimeEnvironment $environmentPath $root
 
 # Collection proxy credentials are installation state: they are never part of
 # the release archive and must be configured locally before collection starts.
-$proxySources = @('CLOUDBYPASS_PROXY', 'PROXY_TUNNEL', 'PROXY_FILE') | Where-Object {
+$proxySources = @('CLOUDBYPASS_PROXY', 'PROXY_TUNNEL', 'PROXY_FILE', 'PROXY_API_URL') | Where-Object {
     $configuration.ContainsKey($_) -and -not [string]::IsNullOrWhiteSpace($configuration[$_])
 }
 if (@($proxySources).Count -eq 0) {
@@ -38,9 +38,12 @@ if ($configuration.ContainsKey('TPS_CONCURRENCY') -and -not [string]::IsNullOrWh
     if (-not [int]::TryParse([string]$configuration['TPS_CONCURRENCY'], [ref]$parsed)) {
         throw 'TPS_CONCURRENCY in runtime.env must be an integer.'
     }
-    if ($parsed -lt 1 -or $parsed -gt 8) {
-        Write-Host "TPS_CONCURRENCY=$parsed is outside the customer range 1-8; clamped." -ForegroundColor Yellow
-        $parsed = [Math]::Min(8, [Math]::Max(1, $parsed))
+    if ($parsed -lt 1 -or $parsed -gt 64) {
+        Write-Host "TPS_CONCURRENCY=$parsed is outside the range 1-64; clamped." -ForegroundColor Yellow
+        $parsed = [Math]::Min(64, [Math]::Max(1, $parsed))
+    }
+    elseif ($parsed -gt 8) {
+        Write-Host "TPS_CONCURRENCY=$parsed is above the routine customer range 1-8 (high-throughput mode)." -ForegroundColor Yellow
     }
     $concurrency = $parsed
 }

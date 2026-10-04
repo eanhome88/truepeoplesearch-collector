@@ -919,8 +919,9 @@ def insert_person(db, data: dict) -> bool:
 
 def session_kwargs() -> dict:
     """One long-lived stealth browser. Reuse the tab; do not launch per URL."""
+    # 自研过 CF 时关闭内置求解避免打架 (TPS_OWN_CF=="1" 时关闭)
     return {
-        "solve_cloudflare": True,
+        "solve_cloudflare": os.environ.get("TPS_OWN_CF") != "1",
         "headless": True,
         "network_idle": False,
         "timeout": FETCH_TIMEOUT_MS,
@@ -936,8 +937,9 @@ def session_kwargs() -> dict:
 
 
 def fetch_kwargs() -> dict:
+    # 自研过 CF 时关闭内置求解避免打架 (TPS_OWN_CF=="1" 时关闭)
     return {
-        "solve_cloudflare": True,
+        "solve_cloudflare": os.environ.get("TPS_OWN_CF") != "1",
         "network_idle": False,
         "timeout": FETCH_TIMEOUT_MS,
         "disable_resources": True,

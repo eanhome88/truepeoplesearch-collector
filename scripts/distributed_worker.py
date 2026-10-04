@@ -19,9 +19,8 @@ Playwright 同步 API 不能跨线程共享，冷启动浏览器大约 30 秒，
 nack(retry=True) 回队，再关掉浏览器进程。不要 kill -9。
 
 同一出口遇到 HTTP 429 时，任务 release 回 pending（不增加 attempts）。
-普通粘性 IP 暂停领取，浏览器保持打开，等这个 IP 恢复后再抓。
-用户名含 -region- 的粘性网关不暂停约 70 分钟：换新 sid（新出口）并重启 Chrome。
-refresh_sticky_url 原样返回时仍按原来的暂停。
+有备用独立出口只换道不停全局；无备用才全局等；验证码只重刷指纹。
+用户名含 -region- 的粘性网关换新 sid（新出口）并重启 Chrome。
 InternalCaptcha / captcha 页同样 release，不按空页 ACK。
 """
 
@@ -32,6 +31,7 @@ import asyncio
 import json
 import math
 import os
+import random
 import signal
 import socket
 import sys
@@ -83,6 +83,7 @@ from tps_control import clear_worker_heartbeat, write_worker_heartbeat
 from proxy_pool import (
     ProxyManager,
     StickyLanes,
+    fetch_proxy_list,
     load_proxy_config,
     sticky_lanes_from_config,
     tunnel_sticky_lanes,
@@ -154,14 +155,26 @@ from tps_scale import (
     resolve_browsers,
 )
 from scrape_to_tidb import (
+    FETCH_TIMEOUT_MS,
     ensure_db,
     fetch_cloudbypass_v2,
     fetch_document,
     fetch_in_async_session,
+    html_page,
     ingest_response,
+    is_challenge_html,
     open_async_stealth_session,
 )
 import scrape_to_tidb as _scrape_mod
+from cf_solver import (
+    CfSolver,
+    CfSolverError,
+    DEFAULT_USER_AGENT,
+    impersonate_for_ua,
+    publish_warmed,
+    require_cf_solver,
+    sid_for_proxy,
+)
 
 # 异常类由 scrape_to_tidb 导出；尚未落地时按消息分桶
 HttpError = getattr(_scrape_mod, "HttpError", None)
@@ -175,10 +188,24 @@ REDIS_PASSWORD = os.environ.get("TPS_REDIS_PASSWORD") or os.environ.get("REDIS_P
 HB_INTERVAL_SEC = 20
 RECOVER_INTERVAL_SEC = 15
 IDLE_LOG_SEC = 30
-SESSION_RECYCLE_PAGES = 120
+try:
+    SESSION_RECYCLE_PAGES = int(os.environ.get("TPS_SESSION_RECYCLE", "120"))
+    if SESSION_RECYCLE_PAGES < 20:
+        SESSION_RECYCLE_PAGES = 20
+except (TypeError, ValueError):
+    SESSION_RECYCLE_PAGES = 120
 SHUTDOWN_WAIT_SEC = 6
-# 目标站返回 429 后全局暂停领取：5 / 15 / 45 分钟。切换出口不得缩短暂停。
+# 自研过 CF：不开浏览器，凭证来自 TPS_CF_SOLVER，请求走 curl_cffi 同代理同指纹。
+OWN_CF_BYPASS = os.environ.get("TPS_OWN_CF", "0") == "1"
+# 指纹/验证码死亡本组短休秒数，全局不停。
+FP_REST_SEC = float(os.environ.get("TPS_FP_REST_SEC", "45"))
+# 换到备用出口后本组热身秒数。
+LANE_WARM_SEC = float(os.environ.get("TPS_LANE_WARM_SEC", "15"))
+# 固定出口 429：5 / 15 / 45 分钟。换 IP 不能缩短这段。
 RATE_LIMIT_PAUSE_STEPS_SEC = (300, 900, 2700)
+# 动态住宅（穿云箭等）429 是账号总量，不是单个 IP。换出口，但全账号短暂停：
+# 20 秒、40 秒，封顶 60 秒。成功后连击清零。
+ACCOUNT_PAUSE_STEPS_SEC = (20, 40, 60)
 _SESSION_RETRY_BUCKETS = frozenset({"cf_fail", "retry", "empty"})
 
 _ACK_BUCKETS = frozenset({"success", "empty"})
@@ -644,10 +671,178 @@ class _ChromeBox:
             await self.close()
             self.served = 0
         if self.session is None:
-            self.session = await open_async_stealth_session(self.tabs, proxy=self.proxy)
             label = ProxyManager._mask_proxy(self.proxy) if self.proxy else "direct"
-            print(f"[BROWSER] chrome open tabs={self.tabs} proxy={label}", flush=True)
+            if OWN_CF_BYPASS:
+                solver = _own_cf_solver()
+                self.session = _OwnCfSession(self.proxy, solver)
+                print(
+                    f"[OWN_CF] protocol session tabs={self.tabs} proxy={label} solver={solver.describe()}",
+                    flush=True,
+                )
+            else:
+                self.session = await open_async_stealth_session(self.tabs, proxy=self.proxy)
+                print(f"[BROWSER] chrome open tabs={self.tabs} proxy={label}", flush=True)
         return self.session
+
+
+_OWN_CF_SOLVER: Optional[CfSolver] = None
+
+
+def _own_cf_solver() -> CfSolver:
+    """每个浏览器组进程一个求解器实例；加载失败直接抛，整组报 fatal。"""
+    global _OWN_CF_SOLVER
+    if _OWN_CF_SOLVER is None:
+        _OWN_CF_SOLVER = require_cf_solver()
+    return _OWN_CF_SOLVER
+
+
+class _OwnCfSession:
+    """TPS_OWN_CF=1 的会话：没有浏览器。凭证来自自研求解器，请求用 curl_cffi 走同一代理，
+    TLS 指纹按凭证里的 UA 版本挑。一个会话被组里所有标签页共用，重解靠 solves 代数去重。"""
+
+    def __init__(self, proxy: Optional[str], solver: CfSolver):
+        self.proxy = proxy or None
+        self.solver = solver
+        self.client = None
+        self.user_agent = ""
+        self.cookies: dict = {}
+        self.pending_html: dict = {}
+        self.solves = 0
+        self.impersonate = ""
+
+    async def open(self, url: str) -> None:
+        solution = await self.solver.solve(url, proxy=self.proxy, user_agent=None)
+        await self._apply(solution, url)
+
+    async def resolve(self, url: str) -> None:
+        """凭证被拒后重解。沿用 UA，否则 cf_clearance 和 UA 对不上等于白解。"""
+        solution = await self.solver.solve(url, proxy=self.proxy, user_agent=self.user_agent or None)
+        await self._apply(solution, url)
+
+    async def _apply(self, solution, url: str) -> None:
+        ua = solution.user_agent or self.user_agent or DEFAULT_USER_AGENT
+        target = impersonate_for_ua(ua)
+        if self.client is None or target != self.impersonate:
+            await self._close_client()
+            self.client = self._new_client(target)
+            self.impersonate = target
+        self.user_agent = ua
+        if solution.cookies:
+            self.cookies.update(solution.cookies)
+            try:
+                self.client.cookies.update(solution.cookies)
+            except Exception:
+                pass
+        if solution.html:
+            self.pending_html[url] = solution.html
+        self.solves += 1
+        label = ProxyManager._mask_proxy(self.proxy) if self.proxy else "direct"
+        print(
+            f"[OWN_CF] clearance #{self.solves} cookies={len(solution.cookies)} "
+            f"ua=Chrome/{_chrome_major(ua)} impersonate={target} proxy={label}",
+            flush=True,
+        )
+        publish_warmed(url, solution, sid=sid_for_proxy(self.proxy))
+
+    def _new_client(self, impersonate: str):
+        from curl_cffi.requests import AsyncSession
+
+        kwargs = {"impersonate": impersonate, "timeout": FETCH_TIMEOUT_MS / 1000.0}
+        if self.proxy:
+            kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
+        return AsyncSession(**kwargs)
+
+    async def get(self, url: str) -> tuple:
+        html = self.pending_html.pop(url, None)
+        if html is not None:
+            return 200, html
+        if self.client is None:
+            raise RuntimeError("own-cf session has no client; call open() first")
+        headers = {
+            "user-agent": self.user_agent or DEFAULT_USER_AGENT,
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "accept-language": "en-US,en;q=0.9",
+            "referer": "https://www.google.com/",
+            "upgrade-insecure-requests": "1",
+        }
+        if self.cookies:
+            headers["cookie"] = "; ".join(f"{k}={v}" for k, v in self.cookies.items() if k)
+        resp = await self.client.get(
+            url, headers=headers, timeout=FETCH_TIMEOUT_MS / 1000.0, allow_redirects=True,
+        )
+        return int(resp.status_code), resp.text or ""
+
+    async def _close_client(self) -> None:
+        client = self.client
+        self.client = None
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:
+                pass
+
+    async def close(self) -> None:
+        await self._close_client()
+        self.pending_html.clear()
+
+
+def _chrome_major(ua: str) -> str:
+    import re as _re
+
+    m = _re.search(r"Chrome/(\d+)", ua or "")
+    return m.group(1) if m else "?"
+
+
+async def _fetch_page_own_cf(box: _ChromeBox, url: str):
+    """自研过 CF 路径：首页先要凭证；拿着凭证发协议请求；被挑战就重解一次，
+    再被拒就按验证码上报（同出口刷凭证，连续两次换出口），交给 LeaseWorker 的限流逻辑。"""
+    async with box.gate:
+        session = await box.ensure_session()
+        if not box.warm:
+            try:
+                await session.open(url)
+            except CfSolverError as exc:
+                # 拿不到首份凭证按验证码上报：任务 release 不计 attempts，本组休息后同出口再要，连续两次换出口。
+                print(f"[OWN_CF] solver failed on first clearance: {exc}", flush=True)
+                raise HttpError(
+                    503, f"solver failed on first clearance (captcha) for {url}: {exc}",
+                    bucket="rate_limit",
+                ) from exc
+            box.warm = True
+    for attempt in (1, 2):
+        generation = session.solves
+        try:
+            status, body = await session.get(url)
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "timeout" in msg or "timed out" in msg:
+                raise _scrape_mod.FetchTimeoutError(f"timeout {FETCH_TIMEOUT_MS}ms for {url}") from exc
+            raise
+        if status == 429:
+            raise HttpError(429, f"HTTP 429 for {url}")
+        if status in (404, 410):
+            return html_page(body, status, url)
+        challenged = status in (403, 503) or is_challenge_html(body)
+        if status == 200 and not challenged:
+            return html_page(body, status, url)
+        if not challenged:
+            raise HttpError(status, f"HTTP {status} for {url}")
+        if attempt == 1:
+            async with box.gate:
+                if session.solves == generation:
+                    print(f"[OWN_CF] clearance rejected (HTTP {status}); asking solver again", flush=True)
+                    try:
+                        await session.resolve(url)
+                    except CfSolverError as exc:
+                        raise HttpError(
+                            status, f"solver failed after challenge (captcha) for {url}: {exc}",
+                            bucket="rate_limit",
+                        ) from exc
+            continue
+    raise HttpError(
+        status, f"cloudflare challenge persists after re-solve (captcha) for {url}",
+        bucket="rate_limit",
+    )
 
 
 async def _tab_loop(slot: int, queue, box: _ChromeBox, out_q) -> None:
@@ -744,7 +939,9 @@ async def _tab_job(slot: int, box: _ChromeBox, job: dict) -> dict:
 
 
 async def _fetch_page(box: _ChromeBox, url: str):
-    """优先走穿云 V2 API 网关抓取；失败或不可用时退回本地协议与浏览器渲染。"""
+    """自研过 CF 时走求解器+协议；否则优先穿云 V2 网关，失败退回本地协议与浏览器渲染。"""
+    if OWN_CF_BYPASS:
+        return await _fetch_page_own_cf(box, url)
     if os.environ.get("USE_CLOUDBYPASS", "1") == "1":
         try:
             page = await fetch_cloudbypass_v2(url)
@@ -864,7 +1061,14 @@ class LeaseWorker:
         self.idle: set[int] = set()
         self._last_idle = 0.0
         self._claim_after = 0.0
+        self._next_claim_at = 0.0
         self._rate_limit_streak = 0
+        self._recent: list[int] = []
+        self._consec_success = 0
+        try:
+            self._lanes_shared_host = bool(lanes.shared_host) if lanes is not None else True
+        except Exception:
+            self._lanes_shared_host = True
 
     def _on_signal(self, signum, _frame) -> None:
         name = signal.Signals(signum).name
@@ -947,6 +1151,10 @@ class LeaseWorker:
         threading.Thread(
             target=self._recover_loop, name="tps-recover", daemon=True,
         ).start()
+        if os.environ.get("PROXY_API_URL", "").strip():
+            threading.Thread(
+                target=self._api_refresh_loop, name="tps-proxy-refresh", daemon=True,
+            ).start()
 
         try:
             n = recover_expired(self.r)
@@ -1026,6 +1234,7 @@ class LeaseWorker:
             if not _has_captcha(error if isinstance(error, str) else ""):
                 error = _captcha_note(error, str(final_url or url or ""))
             bucket = "rate_limit"
+        self._record_outcome(bucket == "rate_limit")
         if bucket == "rate_limit":
             self._on_rate_limit(slot, job, msg, error, person, url)
             return
@@ -1056,7 +1265,7 @@ class LeaseWorker:
         return "running"
 
     def _is_dynamic_group(self, group: Optional[_ChromeGroup] = None) -> bool:
-        """判断当前槽位或环境是否使用动态住宅代理（每次请求不同IP），若是则不需要任何冷却。"""
+        """判断当前槽位或环境是否使用动态住宅代理（每次请求不同IP），隧道单网关 429 走账号总量暂停。"""
         if os.environ.get("NO_RATE_LIMIT_COOLDOWN") == "1" or os.environ.get("TPS_NO_COOLDOWN") == "1":
             return True
         if os.environ.get("RATE_LIMIT_PAUSE_SEC", "").strip() in ("0", "none", "false"):
@@ -1081,9 +1290,43 @@ class LeaseWorker:
         self._claim_after = now + pause
         return pause
 
+    def _note_account_limit(self) -> int:
+        """动态 IP 的 429：换出口解决不了账号总量，全员按 20/40/60 秒暂停。"""
+        now = time.monotonic()
+        if now < self._claim_after:
+            return self._pause_remaining_sec()
+        self._rate_limit_streak += 1
+        idx = min(max(int(self._rate_limit_streak), 1), len(ACCOUNT_PAUSE_STEPS_SEC)) - 1
+        pause = ACCOUNT_PAUSE_STEPS_SEC[idx]
+        self._claim_after = now + pause
+        return pause
+
+    def _record_outcome(self, limited: bool) -> None:
+        self._recent.append(1 if limited else 0)
+        if len(self._recent) > 100:
+            self._recent = self._recent[-100:]
+
+    def _claim_gap_sec(self) -> float:
+        raw = os.environ.get("TPS_CLAIM_GAP_SEC", "3")
+        try:
+            base = float(raw)
+        except (TypeError, ValueError):
+            base = 3.0
+        if self._recent:
+            ratio = sum(self._recent) / len(self._recent)
+            extra = min(12.0, ratio * 12.0)
+        else:
+            extra = 0.0
+        jitter = random.uniform(0, max(0.5, base * 0.25))
+        return min(18.0, base + extra + jitter)
+
     def _note_success(self) -> None:
-        if time.monotonic() >= self._claim_after:
+        self._consec_success += 1
+        if self._consec_success >= 5:
             self._rate_limit_streak = 0
+            self._consec_success = 0
+        else:
+            self._rate_limit_streak = max(0, self._rate_limit_streak - 2)
 
     def _group_of(self, slot_id: int) -> _ChromeGroup:
         for group in self.groups:
@@ -1102,27 +1345,60 @@ class LeaseWorker:
         group = self._group_of(slot.slot)
         generation = msg.get("generation")
         stale = generation is not None and int(generation) != group.generation
-        switched = False
-        if not stale:
-            switched = self._rotate_region_gateway(group)
-
-        is_dynamic = self._is_dynamic_group(group)
-
-        if switched or is_dynamic:
-            # 动态住宅代理（每次请求不同IP）：无需任何停顿，0秒冷却直接以新IP恢复抓取！
-            group.claim_after = 0.0
-            pause = 0.0
-            self._claim_after = 0.0
-            self._rate_limit_streak = 0
-            label = ProxyManager._mask_proxy(group.proxy) if group.proxy else "dynamic"
+        now = time.monotonic()
+        self._consec_success = 0
+        label = ProxyManager._mask_proxy(group.proxy) if group.proxy else "direct"
+        if _has_captcha(error, url):
+            group.consecutive_rate_limits += 1
+            if group.consecutive_rate_limits >= 2:
+                self._arm_proxy(group, group.proxy)
+                action = "同出口重开浏览器刷指纹"
+            else:
+                action = "先休不重开"
+            rest = FP_REST_SEC + random.uniform(0, 10)
+            group.claim_after = now + rest
             print(
-                f"  [rate_limit] 槽位 chrome={group.gid} 遇到风控 -> ⚡ 动态住宅代理(每次请求不同IP): {label}，零冷却立即重试！",
+                f"  [fp_restart] chrome={group.gid} 指纹/验证码死亡{action}，本组休{rest:.0f}s，全局不停: {label}",
                 flush=True,
             )
         else:
-            # 仅在无法轮换的固定 IP 模式下执行阶梯退避
-            pause = self._note_rate_limit(group)
-            print(f"  [rate_limit] job={jid} pause={pause}s returned to pending (固定IP冷却)", flush=True)
+            switched = False if stale else self._switch_ip(group)
+            if (
+                switched
+                and self.lanes is not None
+                and self.lanes.count > 1
+                and not self._lanes_shared_host
+                and not self._is_dynamic_group(group)
+            ):
+                group.consecutive_rate_limits += 1
+                warm = LANE_WARM_SEC + random.uniform(0, 5)
+                group.claim_after = time.monotonic() + warm
+                label = ProxyManager._mask_proxy(group.proxy) if group.proxy else "direct"
+                print(
+                    f"  [lane_switch] chrome={group.gid} 429换到备用出口，本组热身{warm:.0f}s，全局不停: {label}",
+                    flush=True,
+                )
+            elif self._is_dynamic_group(group):
+                pause = self._note_account_limit()
+                print(
+                    f"  [rate_limit] 槽位 chrome={group.gid} 动态网关账号暂停 {pause}s: {label}",
+                    flush=True,
+                )
+            elif self.lanes is not None and self.lanes.count > 1:
+                try:
+                    soonest = float(self.lanes.seconds_until_ready())
+                except Exception:
+                    soonest = 0.0
+                if now < self._claim_after:
+                    pause = self._pause_remaining_sec()
+                else:
+                    self._rate_limit_streak += 1
+                    pause = min(max(soonest, 30.0), 600.0)
+                    self._claim_after = now + pause
+                print(f"  [lane_wait] 全部出口冷却中，全局等{pause:.0f}s", flush=True)
+            else:
+                pause = self._note_rate_limit(group)
+                print(f"  [rate_limit] job={jid} pause={pause}s returned to pending (固定IP冷却)", flush=True)
 
         try:
             release(self.r, job, "rate_limited")
@@ -1182,6 +1458,8 @@ class LeaseWorker:
         if self._pause_remaining_sec() > 0:
             self._log_idle()
             return
+        if time.monotonic() < self._next_claim_at:
+            return
         usable = [
             slot_id for slot_id in self.idle
             if not self._group_resting(self._group_of(slot_id))
@@ -1213,6 +1491,7 @@ class LeaseWorker:
             self._nack_shutdown(job)
             self.idle.add(slot_id)
             return
+        self._next_claim_at = time.monotonic() + self._claim_gap_sec()
         self._assign(slot_id, job)
 
     def _assign(self, slot_id: int, job: dict) -> None:
@@ -1446,6 +1725,30 @@ class LeaseWorker:
             except Exception as exc:
                 print(f"[RECOVER] {exc}", file=sys.stderr)
 
+    def _api_refresh_loop(self) -> None:
+        """定时从上游拉新出口并热合并进 lanes，不停机、不丢任务。"""
+        try:
+            interval = max(120.0, float(os.environ.get("PROXY_API_REFRESH_SEC", "600")))
+        except (TypeError, ValueError):
+            interval = 600.0
+        api_url = os.environ.get("PROXY_API_URL", "").strip()
+        while not self.stop.wait(interval):
+            if not api_url or self.lanes is None:
+                continue
+            try:
+                urls = fetch_proxy_list(api_url)
+            except Exception as exc:
+                print(f"[PROXY_API] refresh failed: {exc}", file=sys.stderr)
+                continue
+            try:
+                added = self.lanes.merge_urls(urls)
+            except Exception as exc:
+                print(f"[PROXY_API] merge failed: {exc}", file=sys.stderr)
+                continue
+            if added:
+                print(f"[PROXY_API] merged +{added} fresh exits (pool={self.lanes.count})", flush=True)
+            _save_proxy_api_cache(urls)
+
     def _wait_in_flight(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -1535,16 +1838,80 @@ def run_stats() -> None:
     print("[STATS] metrics " + json.dumps(snap, ensure_ascii=False, default=str))
 
 
-def load_worker_lanes(proxy_file: str = None, concurrency: int = 2, proxy_tunnel: str = None):
+def _proxy_api_cache_path() -> Path:
+    """上游拉取的出口列表本地缓存。data/ 在包外，永不进发布包。"""
+    override = (os.environ.get("PROXY_API_CACHE") or "").strip()
+    if override:
+        return Path(override)
+    candidates = (_ROOT_DIR / "data", _ROOT_DIR.parent / "data")
+    for base in candidates:
+        try:
+            if base.is_dir():
+                return base / "proxy_api_cache.txt"
+        except OSError:
+            continue
+    return candidates[0] / "proxy_api_cache.txt"
+
+
+def _save_proxy_api_cache(urls) -> None:
+    try:
+        path = _proxy_api_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(urls) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"[PROXY_API] cache save failed: {exc}", file=sys.stderr)
+
+
+def _load_proxy_api_cache() -> list:
+    try:
+        lines = _proxy_api_cache_path().read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    return [line.strip() for line in lines if line.strip()]
+
+
+def load_worker_lanes(proxy_file: str = None, concurrency: int = 2, proxy_tunnel: str = None, proxy_api_url: str = None):
     """粘性 IP 来自代理文件或隧道网关拆分。"""
+    from proxy_pool import IP_REST_SEC as _DEFAULT_IP_REST
+
+    def _ip_rest_sec() -> float:
+        raw = os.environ.get("TPS_IP_REST_SEC", "")
+        if not str(raw).strip():
+            return float(_DEFAULT_IP_REST)
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return float(_DEFAULT_IP_REST)
+        if val < 60:
+            return 60.0
+        return val
+
+    rest_sec = _ip_rest_sec()
     if proxy_file:
-        lanes = StickyLanes.from_file(proxy_file)
+        lanes = StickyLanes.from_file(proxy_file, rest_sec=rest_sec)
         print(f"[PROXY] sticky file lanes={lanes.count} rest={int(lanes.rest_sec)}s", flush=True)
+        return lanes
+    api_url = (proxy_api_url or os.environ.get("PROXY_API_URL") or "").strip()
+    if api_url:
+        try:
+            urls = fetch_proxy_list(api_url)
+        except Exception as exc:
+            print(f"[PROXY_API] initial pull failed: {exc}", file=sys.stderr)
+            urls = []
+        if not urls:
+            urls = _load_proxy_api_cache()
+            if urls:
+                print(f"[PROXY_API] using cached exits lanes={len(urls)}", flush=True)
+        if not urls:
+            raise RuntimeError("PROXY_API_URL returned no exits and no cache exists; refusing to start without IPs.")
+        _save_proxy_api_cache(urls)
+        lanes = StickyLanes(urls, rest_sec=rest_sec)
+        print(f"[PROXY] api lanes={lanes.count} rest={int(lanes.rest_sec)}s (refreshing in background)", flush=True)
         return lanes
     tunnel = proxy_tunnel or os.environ.get("PROXY_TUNNEL")
     if tunnel:
         lane_count = max(2, int(concurrency or 2))
-        lanes = tunnel_sticky_lanes(tunnel, count=lane_count)
+        lanes = tunnel_sticky_lanes(tunnel, count=lane_count, rest_sec=rest_sec)
         if lanes is not None:
             print(
                 f"[PROXY] sticky tunnel lanes={lanes.count} rest={int(lanes.rest_sec)}s",
@@ -1559,7 +1926,7 @@ def load_worker_lanes(proxy_file: str = None, concurrency: int = 2, proxy_tunnel
     mode = (cfg.get("mode") or "direct").lower()
     if mode == "tunnel" and cfg.get("tunnel"):
         lane_count = max(2, int(concurrency or 2))
-        lanes = tunnel_sticky_lanes(cfg["tunnel"], count=lane_count)
+        lanes = tunnel_sticky_lanes(cfg["tunnel"], count=lane_count, rest_sec=rest_sec)
         if lanes is not None:
             print(
                 f"[PROXY] sticky tunnel lanes={lanes.count} rest={int(lanes.rest_sec)}s",
@@ -1572,14 +1939,18 @@ def load_worker_lanes(proxy_file: str = None, concurrency: int = 2, proxy_tunnel
     return lanes
 
 
-def run_worker(concurrency: int, target_per_day: int, page_sec: float, proxy_file: str = None, proxy_tunnel: str = None) -> None:
+def run_worker(concurrency: int, target_per_day: int, page_sec: float, proxy_file: str = None, proxy_tunnel: str = None, proxy_api_url: str = None) -> None:
+    if OWN_CF_BYPASS:
+        # 启动期就把求解器加载一遍：没配、导不进、写法不对，这里直接死，不要跑起来才在子进程里静默失败。
+        solver = require_cf_solver()
+        print(f"[OWN_CF] 自研过CF模式：浏览器不参与，凭证来自 {solver.describe()}，请求走 curl_cffi 协议层", flush=True)
     r = connect_redis()
     LeaseWorker(
         r,
         concurrency,
         target_per_day,
         page_sec,
-        lanes=load_worker_lanes(proxy_file, concurrency=concurrency, proxy_tunnel=proxy_tunnel),
+        lanes=load_worker_lanes(proxy_file, concurrency=concurrency, proxy_tunnel=proxy_tunnel, proxy_api_url=proxy_api_url),
     ).run()
 
 
@@ -1621,6 +1992,11 @@ def main() -> None:
         default=os.environ.get("PROXY_TUNNEL"),
         help="residential tunnel gateway, e.g. http://username:password@proxy.example.invalid:8080",
     )
+    parser.add_argument(
+        "--proxy-api-url",
+        default=os.environ.get("PROXY_API_URL"),
+        help="upstream provider API that returns fresh exits; pulled at startup and merged periodically",
+    )
     args = parser.parse_args()
 
     if args.mode == "feed":
@@ -1646,6 +2022,7 @@ def main() -> None:
             plan["page_sec"],
             args.proxy_file,
             proxy_tunnel=args.proxy_tunnel,
+            proxy_api_url=args.proxy_api_url,
         )
 
 

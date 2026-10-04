@@ -18,6 +18,18 @@ $script:AllowedRuntimeKeys = @(
     'CLOUDBYPASS_PROXY',
     'PROXY_TUNNEL',
     'PROXY_FILE',
+    'PROXY_API_URL',
+    'PROXY_API_REFRESH_SEC',
+    'USE_CLOUDBYPASS',
+    'TPS_OWN_CF',
+    'TPS_CF_SOLVER',
+    'TPS_CF_SOLVER_TIMEOUT',
+    'TPS_IMPERSONATE',
+    'TPS_CLAIM_GAP_SEC',
+    'TPS_IP_REST_SEC',
+    'TPS_SESSION_RECYCLE',
+    'TPS_FP_REST_SEC',
+    'TPS_LANE_WARM_SEC',
     'TPS_CONCURRENCY'
 )
 
@@ -594,6 +606,8 @@ function Write-TpsRuntimeManifest {
         $json = ($manifest | ConvertTo-Json -Depth 5) + "`r`n"
         [IO.File]::WriteAllText($temporaryPath, $json, (New-Object Text.UTF8Encoding($false)))
         Protect-TpsSecretFile $temporaryPath
+        # PS 5.1 Move-Item cannot replace an existing file, so delete it first.
+        Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue
         Move-Item -LiteralPath $temporaryPath -Destination $manifestPath
         $temporaryPath = $null
     }

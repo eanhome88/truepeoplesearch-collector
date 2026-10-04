@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import json
+import urllib.request
 from contextlib import contextmanager
 import os
 import random
@@ -345,6 +347,41 @@ class StickyLanes:
     def count(self) -> int:
         return len(self._urls)
 
+    def merge_urls(self, urls) -> int:
+        """Merge fresh upstream exits into the pool without dropping hot lanes.
+
+        New exits start rested (rest_until=0) so the next 429 can switch to
+        them immediately. Returns how many exits were added.
+        """
+        added = 0
+        with self._lock:
+            for raw in urls or []:
+                url = ProxyManager._normalize_proxy(raw)
+                if not url or url in self._urls or url in self._rest_until:
+                    continue
+                self._urls.append(url)
+                self._rest_until[url] = 0.0
+                added += 1
+        return added
+
+    @property
+    def shared_host(self) -> bool:
+        # 隧道拆分的多条出口共享同一网关 host，429 可能是账号总量；独立 IP 文件各 host 不同
+        hosts = set()
+        for url in self._urls:
+            try:
+                raw = (url or "").strip()
+                if not raw:
+                    continue
+                if "://" not in raw:
+                    raw = "http://" + raw
+                hostname = urlparse(raw).hostname
+                if hostname:
+                    hosts.add(hostname.lower())
+            except Exception:
+                continue
+        return len(hosts) <= 1
+
     def holder_url(self, holder: str) -> Optional[str]:
         with self._lock:
             return self._holder.get(holder)
@@ -425,6 +462,88 @@ class StickyLanes:
                 if line and not line.startswith("#"):
                     proxies.append(line)
         return cls(proxies, rest_sec=rest_sec)
+
+
+def fetch_proxy_list(api_url: str, timeout: float = 30.0) -> list:
+    """Pull fresh exits from an upstream provider API.
+
+    Accepts plain text (one proxy per line) or JSON (a list of strings,
+    or an object with a list under data/list/proxies/ips/hosts/results;
+    items may be strings or {host, port, user, pass} objects).
+    Returns normalized, de-duplicated proxy URLs, order preserved.
+    Raises RuntimeError with the masked URL on any failure.
+    """
+    raw = (api_url or "").strip()
+    if not raw:
+        raise RuntimeError("proxy API URL is empty")
+    masked = ProxyManager._mask_proxy(raw)
+    try:
+        request = urllib.request.Request(raw, headers={"User-Agent": "tps-proxy-pool/1"})
+        with urllib.request.urlopen(request, timeout=max(5.0, float(timeout))) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        raise RuntimeError(f"proxy API fetch failed ({masked}): {type(exc).__name__}") from exc
+    candidates = _extract_proxy_candidates(body)
+    urls = []
+    seen = set()
+    for item in candidates:
+        url = ProxyManager._normalize_proxy(item)
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    if not urls:
+        raise RuntimeError(f"proxy API returned no usable exits ({masked})")
+    return urls
+
+
+def _extract_proxy_candidates(body: str) -> list:
+    text = (body or "").strip()
+    if not text:
+        return []
+    if text[:1] in ("[", "{"):
+        try:
+            return _candidates_from_json(json.loads(text))
+        except Exception:
+            pass
+    out = []
+    for line in text.splitlines():
+        line = line.strip().strip("\"'")
+        if not line or line.startswith("#"):
+            continue
+        if "://" in line or ":" in line:
+            out.append(line)
+    return out
+
+
+def _candidates_from_json(data) -> list:
+    if isinstance(data, str):
+        return [data]
+    if isinstance(data, dict):
+        for key in ("data", "list", "proxies", "ips", "hosts", "results", "items"):
+            value = data.get(key)
+            if isinstance(value, list):
+                data = value
+                break
+        else:
+            return []
+    if not isinstance(data, list):
+        return []
+    out = []
+    for item in data:
+        if isinstance(item, str):
+            out.append(item)
+        elif isinstance(item, dict):
+            host = item.get("host") or item.get("ip") or item.get("server") or ""
+            port = item.get("port") or ""
+            if host and port:
+                user = item.get("user") or item.get("username") or ""
+                password = item.get("pass") or item.get("password") or ""
+                auth = f"{user}:{password}@" if user else ""
+                scheme = item.get("scheme") or item.get("protocol") or "http"
+                out.append(f"{scheme}://{auth}{host}:{port}")
+            elif host:
+                out.append(str(host))
+    return out
 
 
 def sticky_gateway_url(proxy_url: str, holder: str, minutes: int = 120) -> str:

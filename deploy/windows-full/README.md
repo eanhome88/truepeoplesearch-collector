@@ -108,7 +108,7 @@ powershell -ExecutionPolicy Bypass -File D:\TruePeopleSearch\app\deploy\windows-
 基础栈默认只启动安全面板，不启动采集。采集是独立的、已评审的操作，需要客户现场先配好代理再手动启动：
 
 1. 先完成上面的 1–7 步，`Test-Stack.ps1` 通过；
-2. 把代理填进 `D:\TruePeopleSearch\config\runtime.env`（至少填 `CLOUDBYPASS_PROXY`、`PROXY_TUNNEL`、`PROXY_FILE` 其中一项；可选 `TPS_CONCURRENCY=1-8`，默认 4）。代理凭据只存在客户本机，永远不会进发布包；
+2. 把代理填进 `D:\TruePeopleSearch\config\runtime.env`（至少填 `CLOUDBYPASS_PROXY`、`PROXY_TUNNEL`、`PROXY_FILE`、`PROXY_API_URL` 其中一项，上游 API 会在启动时拉取并定时补充新出口；可选 `TPS_CONCURRENCY=1-64`，默认 4，8 以上为高吞吐模式，先按主机 CPU/内存 sizing；自研过 CF 时配 `TPS_OWN_CF=1` 加 `TPS_CF_SOLVER`，契约见 `docs/1M-runbook.md` §3.1，缺 `TPS_CF_SOLVER` 会拒绝启动）。代理凭据只存在客户本机，永远不会进发布包；
 3. 启动采集：
 
    ```powershell

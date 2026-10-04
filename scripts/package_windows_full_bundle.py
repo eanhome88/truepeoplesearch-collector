@@ -55,6 +55,7 @@ APP_ALLOWLIST = (
     "deploy/windows-full/vendor-manifest.example.json",
     "scripts/batch_ingest.py",
     "scripts/bulk_ingester_daemon.py",
+    "scripts/cf_solver.py",
     "scripts/discover.py",
     "scripts/distributed_worker.py",
     "scripts/local_logs.py",
