@@ -128,7 +128,9 @@ function ConvertFrom-TpsLxSymlinkTarget {
     # is the socket path pinned in docker-compose.yml.
     $bytes = New-Object System.Collections.Generic.List[byte]
     foreach ($line in @($OutputLines)) {
-        $match = [regex]::Match($line, '^\s*[0-9A-Fa-f]{4}:\s+((?:[0-9A-Fa-f]{2} )+)')
+        # fsutil inserts an extra space after every eighth byte. Require whitespace
+        # between bytes, but do not consume the ASCII gutter as another byte.
+        $match = [regex]::Match($line, '^\s*[0-9A-Fa-f]{4}:\s+((?:[0-9A-Fa-f]{2}\s+)+)')
         if (-not $match.Success) { continue }
         foreach ($part in ($match.Groups[1].Value -split ' ' | Where-Object { $_ })) {
             $bytes.Add([Convert]::ToByte($part, 16))

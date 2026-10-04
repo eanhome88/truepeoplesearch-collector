@@ -75,8 +75,8 @@ try {
     }
     $lxDump = @(
         'Reparse Tag Value : 0xa000001d',
-        '0000: 02 00 00 00 2f 74 6d 70 2f 6d 79 73 71 6c 2e 73  ..../tmp/mysql.s',
-        '0010: 6f 63 6b                                         ock'
+        '0000:  02 00 00 00 2f 74 6d 70  2f 6d 79 73 71 6c 2e 73  ..../tmp/mysql.s',
+        '0010:  6f 63 6b                                          ock'
     )
     Assert-TestEqual (ConvertFrom-TpsLxSymlinkTarget $lxDump) '/tmp/mysql.sock' 'docker symlink target'
     $lxNul = @('0000: 02 00 00 00 2f 74 6d 70 2f 6d 79 73 71 6c 2e 73', '0010: 6f 63 6b 00')
