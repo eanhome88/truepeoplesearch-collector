@@ -790,12 +790,11 @@ function Assert-TpsSupportedWindowsHost {
     $wslCandidates = @()
     $storeWsl = Join-Path ${env:ProgramFiles} 'WSL\wsl.exe'
     if (Test-Path -LiteralPath $storeWsl -PathType Leaf) {
-        $storeItem = Get-Item -LiteralPath $storeWsl -Force
-        if (($storeItem -is [IO.FileInfo]) -and
-            (($storeItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) {
-            Assert-NoReparsePoint $storeWsl
-            $wslCandidates += [IO.Path]::GetFullPath($storeWsl)
-        }
+        # The Store payload entry itself may be a link: do not apply the
+        # bundle reparse-point rule to this Microsoft-owned tool. Trust here
+        # comes from the version probe below, not from the path shape; only
+        # administrators can plant files under Program Files anyway.
+        $wslCandidates += [IO.Path]::GetFullPath($storeWsl)
     }
     # The System32 inbox copy may be an ancient stub that does not understand
     # '--version' at all; it is only a fallback when the Store app is absent.
