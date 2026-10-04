@@ -802,7 +802,9 @@ function Assert-TpsSupportedWindowsHost {
     $wsl = $null
     $wslOutput = ''
     foreach ($candidate in $wslCandidates) {
-        $probe = (& $candidate --version 2>&1 | Out-String)
+        # Store wsl.exe writes UTF-16 to a pipe: strip NUL bytes first or the
+        # version triple is invisible to the regex even though exit code is 0.
+        $probe = ((& $candidate --version 2>&1 | Out-String) -replace "\x00", "")
         if ($LASTEXITCODE -eq 0 -and [regex]::Match($probe, '\d+\.\d+\.\d+').Success) {
             $wsl = $candidate
             $wslOutput = $probe
