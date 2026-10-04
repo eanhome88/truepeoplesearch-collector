@@ -1053,6 +1053,12 @@ class LeaseWorker:
         start = 0
         self._proxy_born = {}
         opened = time.time()
+        proxy_file = (os.environ.get("PROXY_FILE") or "").strip()
+        if proxy_file:
+            try:
+                opened = os.path.getmtime(proxy_file)
+            except OSError:
+                pass
         for gid, size in enumerate(sizes):
             group = _ChromeGroup(gid, self.slots[start:start + size], self.ctx)
             if self.lanes is not None:
