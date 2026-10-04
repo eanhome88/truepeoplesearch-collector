@@ -30,7 +30,11 @@ $script:AllowedRuntimeKeys = @(
     'TPS_SESSION_RECYCLE',
     'TPS_FP_REST_SEC',
     'TPS_LANE_WARM_SEC',
-    'TPS_CONCURRENCY'
+    'TPS_CONCURRENCY',
+    'TPS_REQUIRE_PHONE',
+    'TPS_ACCEPT_VOIP',
+    'TPS_ACCEPT_UNKNOWN_TYPE',
+    'TPS_FETCH_TIMEOUT_MS'
 )
 
 function Get-NormalizedInstallRoot {

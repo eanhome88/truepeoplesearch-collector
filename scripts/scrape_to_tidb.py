@@ -126,7 +126,64 @@ class FetchTimeoutError(ScrapeError):
         super().__init__(message, bucket=bucket)
 
 
-FETCH_TIMEOUT_MS = 45_000
+FETCH_TIMEOUT_MS = int(float(__import__("os").environ.get("TPS_FETCH_TIMEOUT_MS", "60")) * 1000)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    import os as _os
+    raw = _os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in ("", "0", "false", "no", "off", "none")
+
+
+# TPS_REQUIRE_PHONE=0 时允许无人名下有效电话的人物也入库（面板先有数）；
+# 默认 1 保持电话门，但查询号兜底 + VoIP/无类型回收后通过率会明显上升。
+REQUIRE_PHONE = _env_flag("TPS_REQUIRE_PHONE", True)
+ACCEPT_VOIP = _env_flag("TPS_ACCEPT_VOIP", True)
+ACCEPT_UNKNOWN_TYPE = _env_flag("TPS_ACCEPT_UNKNOWN_TYPE", True)
+
+
+def _phone_digits_from_url(url: str) -> str:
+    """从 /find/phone/xxxx 或 resultphone=xxxx 中提取查询的 10/11 位号码。"""
+    if not url:
+        return ""
+    m = re.search(r"/find/phone/(\d{7,11})", str(url))
+    if m:
+        digits = re.sub(r"\D", "", m.group(1))
+    else:
+        m2 = re.search(r"resultphone=(\d{7,11})", str(url))
+        digits = re.sub(r"\D", "", m2.group(1)) if m2 else ""
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return digits if len(digits) == 10 else ""
+
+
+def _format_us_phone(digits10: str) -> str:
+    d = re.sub(r"\D", "", digits10 or "")
+    if len(d) == 11 and d.startswith("1"):
+        d = d[1:]
+    if len(d) != 10:
+        return ""
+    return f"({d[:3]}) {d[3:6]}-{d[6:]}"
+
+
+def _synthesize_queried_phone(url: str) -> Optional[dict]:
+    """电话反查页重定向到人物页时：查询号本身就是一条有效号码兜底。"""
+    digits = _phone_digits_from_url(url)
+    if not digits:
+        return None
+    formatted = _format_us_phone(digits)
+    if not _valid_us_phone(formatted):
+        return None
+    return {
+        "phone_number": formatted,
+        "line_type": None,
+        "carrier": None,
+        "last_reported": None,
+        "is_primary": False,
+        "queried": True,
+    }
 
 
 def extract_person_id(url: str) -> str:
@@ -202,7 +259,8 @@ def extract_phone_numbers(text: str) -> list:
 
     heading = re.search(r"(?im)^[ \t]*Phone Numbers?(?:[ \t]*\(\d+\))?[ \t]*$", text)
     if not heading:
-        return []
+        # 标题格式漂移兜底：全文扫描有效号码，类型记 None（由 ACCEPT_UNKNOWN_TYPE 开关决定是否可用）。
+        return _fallback_scan_phones(text)
     after_heading = text[heading.end():]
     next_section = re.search(
         r"(?im)^[ \t]*(?:Email Addresses|Current Address Property Details|Previous Addresses|"
@@ -214,7 +272,8 @@ def extract_phone_numbers(text: str) -> list:
     phone_regex = re.compile(r"(?:\+?1[-.\s]*)?\(?([2-9]\d{2})\)?[-.\s]*([2-9]\d{2})[-.\s]*(\d{4})")
     matches = list(phone_regex.finditer(section_text))
     if not matches:
-        return []
+        # 分节内无号码时同样走全文兜底，避免标题定位偏了就整页丢号。
+        return _fallback_scan_phones(text)
 
     phones = []
     seen_numbers = set()
@@ -291,6 +350,28 @@ def extract_phone_numbers(text: str) -> list:
             "is_primary": is_primary,
         })
 
+    return phones
+
+
+def _fallback_scan_phones(text: str) -> list:
+    """全文兜底扫描：标题缺失/漂移时回收有效号码，line_type 记 None。"""
+    if not text:
+        return []
+    phone_regex = re.compile(r"(?:\+?1[-.\s]*)?\(?([2-9]\d{2})\)?[-.\s]*([2-9]\d{2})[-.\s]*(\d{4})")
+    phones = []
+    seen = set()
+    for m in phone_regex.finditer(text):
+        formatted = f"({m.group(1)}) {m.group(2)}-{m.group(3)}"
+        if formatted in seen or not _valid_us_phone(formatted):
+            continue
+        seen.add(formatted)
+        phones.append({
+            "phone_number": formatted,
+            "line_type": None,
+            "carrier": None,
+            "last_reported": None,
+            "is_primary": False,
+        })
     return phones
 
 
@@ -634,7 +715,16 @@ def _child_counts(data: dict) -> dict:
 
 
 def _eligible_phone_type(value: object) -> bool:
-    return str(value or "").strip().lower() in {"wireless", "landline", "landline/services"}
+    norm = str(value or "").strip().lower()
+    if norm in {"wireless", "landline", "landline/services"}:
+        return True
+    if norm in {"voip", "voice over ip"} and ACCEPT_VOIP:
+        return True
+    # 解析器兜底（全文扫描 / 查询号合成）的号码没有类型标注；
+    # TPS_ACCEPT_UNKNOWN_TYPE=0 可关掉这条回收。
+    if (not norm or norm in {"unknown", "none", "null"}) and ACCEPT_UNKNOWN_TYPE:
+        return True
+    return False
 
 
 def _valid_us_phone(value: object) -> bool:
@@ -650,7 +740,7 @@ def _valid_us_phone(value: object) -> bool:
 
 
 def has_usable_phone(data: dict) -> bool:
-    """仅明确标注 Wireless/Landline 的完整号码可使人物具备入库资格。"""
+    """Wireless/Landline 必过；VoIP 与无类型号由 TPS_ACCEPT_VOIP/_UNKNOWN_TYPE 开关控制。"""
     if _eligible_phone_type(data.get("primary_phone_type")) and _valid_us_phone(data.get("primary_phone")):
         return True
     for name in ("wireless_phone_1", "wireless_phone_2", "wireless_phone_3"):
@@ -865,9 +955,11 @@ def insert_person(db, data: dict) -> bool:
     if not data.get("person_id") or not data.get("full_name"):
         print("[SKIP_INVALID] 缺少人物标识或姓名，未入库")
         return False
-    if not has_usable_phone(data):
+    if REQUIRE_PHONE and not has_usable_phone(data):
         print("[SKIP_NO_PHONE] 未解析到有效电话号码，未入库")
         return False
+    if not has_usable_phone(data):
+        print("[STORE_NO_PHONE] TPS_REQUIRE_PHONE=0：无有效电话仍入库（仅人名/地址）")
 
     cursor = db.cursor()
     person_id = data.get("person_id")
@@ -1149,8 +1241,14 @@ def ensure_db(db):
 def _raise_fetch_error(exc: BaseException, url: str):
     name = type(exc).__name__.lower()
     msg = str(exc).lower()
-    if "timeout" in name or "timeout" in msg:
+    if "timeout" in name or "timeout" in msg or "err_timed_out" in msg or "timed out" in msg:
         raise FetchTimeoutError(f"timeout {FETCH_TIMEOUT_MS}ms for {url}") from exc
+    # Chromium 代理层空响应/连接被重置：明确进 retry 桶（可重排到别的 proxy 组），
+    # 且文案不带 "empty page" 避免被误判成 empty 成功确认。
+    if any(s in msg for s in ("err_empty_response", "err_connection", "err_socket",
+                              "err_proxy", "connection reset", "connection closed",
+                              "empty response", "broken pipe")):
+        raise ScrapeError(f"net_retry {type(exc).__name__}: {exc} for {url}", bucket="retry") from exc
     raise
 
 
@@ -1218,6 +1316,7 @@ def ingest_response(page, url: str, db) -> dict:
 
     if is_search and not has_person_path:
         person_links = re.findall(r"/find/person/([a-zA-Z0-9_]+)", document)
+        queried = _phone_digits_from_url(url)
         if person_links:
             unique_pids = list(dict.fromkeys(person_links))
             try:
@@ -1227,10 +1326,17 @@ def ingest_response(page, url: str, db) -> dict:
                 res = feed(r, full_urls, front=True)
                 from phone_plan import note_phone_lookup
                 note_phone_lookup(r, url, hit=True)
+                if queried:
+                    try:
+                        from phone_plan import remember_associated_phones
+                        remember_associated_phones([{"phone_number": _format_us_phone(queried)}])
+                    except Exception:
+                        pass
                 print(f"[SEARCH_RESULT] 电话搜索页面已捕获并注入 {len(unique_pids)} 个目标人物档案 (优先排入队首): {res}", flush=True)
             except Exception as feed_err:
                 print(f"[SEARCH_FEED_ERR] 注入队列提示: {feed_err}", flush=True)
-            return {"is_search_result": True, "count": len(unique_pids), "person_ids": unique_pids}
+            return {"is_search_result": True, "count": len(unique_pids), "person_ids": unique_pids,
+                    "queried_phone": _format_us_phone(queried) if queried else ""}
         else:
             try:
                 from phone_plan import note_phone_lookup
@@ -1243,6 +1349,15 @@ def ingest_response(page, url: str, db) -> dict:
     data = parse_person(page, url)
     if not data.get("full_name") or not data.get("person_id"):
         raise EmptyPageError(f"empty page (no valid person): {url}")
+
+    # 电话反查直达人物页：人物 Phone Numbers 分节缺失时，用查询号本身兜底，
+    # 保证“查 201xxxxxxx 必有一条号码”可入库、可关联。
+    if not data.get("phone_numbers"):
+        synth = _synthesize_queried_phone(url)
+        if synth:
+            data["phone_numbers"] = [synth]
+            if not data.get("primary_phone"):
+                data["primary_phone"] = synth["phone_number"]
 
     if not insert_person(db, data):
         raise ScrapeError("parsed person did not meet persistence requirements", bucket="no_phone")

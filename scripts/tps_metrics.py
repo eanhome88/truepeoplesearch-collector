@@ -20,6 +20,8 @@ from typing import Any, Dict, Iterable, List, Optional
 BUCKETS = (
     "attempt",
     "success",
+    "db_write",
+    "fanout",
     "empty",
     "http_4xx",
     "rate_limit",

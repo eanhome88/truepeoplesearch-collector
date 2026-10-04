@@ -539,6 +539,13 @@ def _classify_error_kind(exc: BaseException) -> str:
     msg = str(exc).lower()
     name = type(exc).__name__.lower()
 
+    # 代理层网络错误：明确进 retry（换组换 proxy 重排），且排在 "empty"+"page"
+    # 误判之前——文案里带 empty 但不是空页。
+    if any(s in msg for s in ("err_empty_response", "err_connection", "err_socket",
+                              "err_proxy", "err_timed_out", "connection reset",
+                              "connection closed", "empty response", "broken pipe",
+                              "net_retry", "net::")):
+        return "retry"
     if any(s in msg for s in ("timeout", "timed out", "timeouterror")):
         return "cf_fail"
     if any(s in msg for s in ("cloudflare", "cf_clearance", "challenge", "cf ray")):
@@ -867,7 +874,7 @@ async def _tab_job(slot: int, box: _ChromeBox, job: dict) -> dict:
     person = job.get("person_id") or (extract_person_id(url) if url else "")
     t0 = time.monotonic()
 
-    def done(bucket: str, error, served_ok: bool, page=None) -> dict:
+    def done(bucket: str, error, served_ok: bool, page=None, extra=None) -> dict:
         final_url = _captcha_final_url(page, url)
         scan_visible = bucket == "empty" or _has_captcha(error)
         if _has_captcha(error, url, final_url) or _looks_like_captcha(page, url, include_visible=scan_visible):
@@ -877,7 +884,7 @@ async def _tab_job(slot: int, box: _ChromeBox, job: dict) -> dict:
             served_ok = False
         if served_ok:
             box.served += 1
-        return {
+        msg = {
             "slot": slot,
             "kind": "done",
             "id": jid,
@@ -889,6 +896,9 @@ async def _tab_job(slot: int, box: _ChromeBox, job: dict) -> dict:
             "final_url": final_url,
             "generation": box.generation,
         }
+        if extra:
+            msg.update(extra)
+        return msg
 
     if not url:
         return done("parse_fail", "missing url", False)
@@ -907,8 +917,16 @@ async def _tab_job(slot: int, box: _ChromeBox, job: dict) -> dict:
                 box.db = await asyncio.to_thread(ensure_db, box.db)
                 data = await asyncio.to_thread(ingest_response, page, url, box.db)
             box.warm = True
+            # 搜索页 fan-out（只注回人物链接、未写 persons 行）与真正入库分开计数，
+            # 面板 PERSONS 只认 DB 行，success 不再虚胖。
+            is_fanout = isinstance(data, dict) and bool(data.get("is_search_result"))
+            has_db_row = isinstance(data, dict) and bool(data.get("person_id")) and not is_fanout
             bucket = "success" if data else "empty"
-            return done(bucket, None, True, page)
+            return done(bucket, None, True, page, extra={
+                "fanout": int(data.get("count") or 0) if is_fanout else 0,
+                "fanout_hit": bool(is_fanout),
+                "db_write": bool(has_db_row),
+            })
         except Exception as exc:
             page = fetched
             last_error = _short_err(exc)
@@ -1258,6 +1276,14 @@ class LeaseWorker:
             _observe(self.m, "scrape_ms", scrape_ms)
         if bucket == "success":
             self._note_success()
+            # 人物行真实入库才记 db_write；搜索页 fan-out 只记 fanout，不再虚增成功含金量。
+            try:
+                if msg.get("db_write"):
+                    _incr(self.m, "db_write")
+                if msg.get("fanout_hit"):
+                    _incr(self.m, "fanout")
+            except Exception:
+                pass
         if bucket in _ACK_BUCKETS:
             self._group_of(slot.slot).consecutive_rate_limits = 0
             self._finish(job, bucket)
