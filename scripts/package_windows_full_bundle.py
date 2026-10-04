@@ -46,6 +46,7 @@ APP_ALLOWLIST = (
     "deploy/windows-full/Start-Customer.ps1",
     "deploy/windows-full/Stop-Collector.ps1",
     "deploy/windows-full/Stop-Stack.ps1",
+    "deploy/windows-full/Test-CustomerEnv.ps1",
     "deploy/windows-full/Test-FullBundle.ps1",
     "deploy/windows-full/Test-Stack.ps1",
     "deploy/windows-full/docker-compose.yml",
