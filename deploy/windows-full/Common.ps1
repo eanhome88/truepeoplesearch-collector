@@ -103,7 +103,7 @@ function ConvertFrom-TpsFsutilReparseTag {
     return [Convert]::ToUInt32($match.Groups[1].Value, 16)
 }
 
-function Get-TpsReparseTag {
+function Get-TpsReparseQuery {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     $fsutil = Get-TpsNativeSystemToolPath 'fsutil.exe'
@@ -111,7 +111,39 @@ function Get-TpsReparseTag {
     if ($LASTEXITCODE -ne 0) {
         throw 'The native reparse tag query failed.'
     }
-    return ConvertFrom-TpsFsutilReparseTag -OutputLines $outputLines
+    return $outputLines
+}
+
+function Get-TpsReparseTag {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    return ConvertFrom-TpsFsutilReparseTag -OutputLines (Get-TpsReparseQuery $Path)
+}
+
+function ConvertFrom-TpsLxSymlinkTarget {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][AllowEmptyCollection()][string[]]$OutputLines)
+
+    # Docker Desktop shows the in-container symlink as an LX reparse point.
+    # The payload is a 4-byte header plus the POSIX path. Only /tmp/mysql.sock
+    # is the socket path pinned in docker-compose.yml.
+    $bytes = New-Object System.Collections.Generic.List[byte]
+    foreach ($line in @($OutputLines)) {
+        $match = [regex]::Match($line, '^\s*[0-9A-Fa-f]{4}:\s+((?:[0-9A-Fa-f]{2} )+)')
+        if (-not $match.Success) { continue }
+        foreach ($part in ($match.Groups[1].Value -split ' ' | Where-Object { $_ })) {
+            $bytes.Add([Convert]::ToByte($part, 16))
+        }
+    }
+    if ($bytes.Count -le 4) {
+        throw 'The Linux symlink reparse data has no target.'
+    }
+    $end = $bytes.Count
+    while ($end -gt 4 -and $bytes[$end - 1] -eq 0) { $end-- }
+    $target = [Text.Encoding]::UTF8.GetString($bytes.ToArray(), 4, $end - 4)
+    if ($target -cne '/tmp/mysql.sock') {
+        throw 'The Linux symlink target is not the approved MySQL socket.'
+    }
+    return $target
 }
 
 function Test-TpsMySqlUnixSocket {
@@ -120,8 +152,10 @@ function Test-TpsMySqlUnixSocket {
         [Parameter(Mandatory = $true)][IO.FileSystemInfo]$Item
     )
 
-    # An AF_UNIX socket has no link target. This exception is deliberately
-    # restricted to the MySQL socket, not arbitrary links or special files.
+    # Two representations of the same unused MySQL socket are accepted, and
+    # only at this exact path: a native AF_UNIX socket, or the Docker/WSL view
+    # of the symlink whose target is exactly /tmp/mysql.sock. Windows
+    # symlinks, junctions, and any other Linux target stay rejected.
     $approvedRoot = 'D:\TruePeopleSearch\data\mysql'
     if (-not $StorageRoot.Equals($approvedRoot, [StringComparison]::OrdinalIgnoreCase)) {
         return $false
@@ -134,10 +168,15 @@ function Test-TpsMySqlUnixSocket {
         return $false
     }
     try {
-        $tag = Get-TpsReparseTag $full
-        return $tag -eq [Convert]::ToUInt32('80000023', 16)
+        $query = Get-TpsReparseQuery $full
+        $tag = ConvertFrom-TpsFsutilReparseTag -OutputLines $query
+        $unixTag = [Convert]::ToUInt32('80000023', 16)
+        if ($tag -eq $unixTag) { return $true }
+        $lxTag = [Convert]::ToUInt32('A000001D', 16)
+        if ($tag -ne $lxTag) { return $false }
+        return (ConvertFrom-TpsLxSymlinkTarget -OutputLines $query) -ceq '/tmp/mysql.sock'
     } catch {
-        # Unknown tags or an unavailable native query remain rejected.
+        # Unknown tags, unexpected targets, or an unavailable native query remain rejected.
         return $false
     }
 }

@@ -73,6 +73,23 @@ try {
         try { ConvertFrom-TpsFsutilReparseTag @($bad) | Out-Null } catch { $rejected = $true }
         Assert-TestEqual $rejected $true 'malformed header'
     }
+    $lxDump = @(
+        'Reparse Tag Value : 0xa000001d',
+        '0000: 02 00 00 00 2f 74 6d 70 2f 6d 79 73 71 6c 2e 73  ..../tmp/mysql.s',
+        '0010: 6f 63 6b                                         ock'
+    )
+    Assert-TestEqual (ConvertFrom-TpsLxSymlinkTarget $lxDump) '/tmp/mysql.sock' 'docker symlink target'
+    $lxNul = @('0000: 02 00 00 00 2f 74 6d 70 2f 6d 79 73 71 6c 2e 73', '0010: 6f 63 6b 00')
+    Assert-TestEqual (ConvertFrom-TpsLxSymlinkTarget $lxNul) '/tmp/mysql.sock' 'trailing NUL stripped'
+    foreach ($badDump in @(
+        @('0000: 02 00 00 00 2f 65 74 63 2f 70 61 73 73 77 64'),
+        @('0000: 02 00 00 00 2f 74 6d 70 2f 6d 79 73 71 6c 2e 73', '0010: 6f 63 6b 2f 65 76 69 6c'),
+        @('Print Name: /tmp/mysql.sock')
+    )) {
+        $rejected = $false
+        try { ConvertFrom-TpsLxSymlinkTarget $badDump | Out-Null } catch { $rejected = $true }
+        Assert-TestEqual $rejected $true 'unexpected symlink target'
+    }
 
     $socket = Join-Path $mysql 'mysql.sock'
     New-TestUnixSocket $socket
