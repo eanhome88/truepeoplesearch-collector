@@ -25,8 +25,10 @@ from typing import Dict, Optional
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
 TOOLS = ROOT / "tools"
-LOGS = ROOT / "data" / "logs"
-PID_FILE = ROOT / "data" / "supervisor.pid"
+# 运行时状态禁止写入受验的 app/ 树：pid 进安装根 runtime/，日志进安装根 logs/。
+# （客户机上 ROOT.parent 即 D:\truepeoplesearch；tps_control.LOG_DIR 须与此同目录。）
+LOGS = ROOT.parent / "logs" / "supervisor"
+PID_FILE = ROOT.parent / "runtime" / "supervisor.pid"
 
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))

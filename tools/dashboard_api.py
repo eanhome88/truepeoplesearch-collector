@@ -2082,7 +2082,7 @@ _batch100_proc = None
 _batch100_last_exit_code = None
 _batch100_stop_requested = False
 _batch100_lock = threading.Lock()
-_BATCH100_LOG = _REPO_ROOT / "data" / "logs" / "batch100.log"
+_BATCH100_LOG = _REPO_ROOT.parent / "logs" / "batch100.log"
 
 
 def _batch100_external_process():

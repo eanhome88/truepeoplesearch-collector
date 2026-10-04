@@ -38,7 +38,7 @@ try:
 except ImportError:
     psutil = None
 
-LOG_DIR = ROOT / "data" / "logs"
+LOG_DIR = ROOT.parent / "logs" / "supervisor"
 _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 CONTROL_WORKER_KEY = "tps:control:worker"

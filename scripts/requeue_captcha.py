@@ -23,7 +23,7 @@ import redis
 
 from tps_queue import SEEN_KEY, feed
 
-LOG_PATH = Path(__file__).resolve().parent.parent / "data" / "logs" / "worker.log"
+LOG_PATH = Path(__file__).resolve().parent.parent.parent / "logs" / "supervisor" / "worker.log"
 START_MARKER = "--- start "
 EMPTY_RE = re.compile(r"\[empty\] person=(\w+)")
 RATE_RE = re.compile(r"\[rate_limit\] person=(\w+)")

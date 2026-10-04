@@ -243,8 +243,11 @@ def build_lines(entries: list[dict[str, object]], commit: str, short: str) -> st
     out.append("")
     out.append("先跑校验，把这一整段复制进蓝色窗口，按回车：")
     out.append("```powershell")
+    # 已初始化的客户机顶层含 backups/config/data/logs/runtime，必须加
+    # -AllowRuntimeState，否则 pristine 顶层检查必失败；包内 95 文件哈希照常全验。
     out.append(
-        f"powershell -ExecutionPolicy Bypass -File {TEST_SCRIPT_WINDOWS_PATH}"
+        f"powershell -ExecutionPolicy Bypass -File {TEST_SCRIPT_WINDOWS_PATH} "
+        "-AllowRuntimeState"
     )
     out.append("```")
     out.append("")
