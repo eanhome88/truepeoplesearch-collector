@@ -117,18 +117,30 @@ Write-Host 'STEP A DONE'
 $ErrorActionPreference = 'Continue'
 $venvPython = 'D:\truepeoplesearch\runtime\.venv\Scripts\python.exe'
 $root = 'D:\truepeoplesearch'
+. (Join-Path $root 'app\deploy\windows-full\Common.ps1')
+$configuration = Read-TpsRuntimeEnvironment (Join-Path $root 'config\runtime.env') $root
+Set-TpsProcessEnvironment $configuration -IncludeServiceCredentials
 function Get-SuccessTotal {
     Push-Location (Join-Path $root 'app\scripts')
-    $raw = & $venvPython -B distributed_worker.py --mode stats 2>&1 | Out-String
-    Pop-Location
+    try {
+        $raw = & $venvPython -B distributed_worker.py --mode stats 2>&1 | Out-String
+        $statsExit = $LASTEXITCODE
+    } finally { Pop-Location }
+    if ($statsExit -ne 0) { return -1 }
     $m = [regex]::Match($raw, '\[STATS\] metrics (\{.*\})')
     if (-not $m.Success) { return -1 }
     $j = $m.Groups[1].Value | ConvertFrom-Json
-    foreach ($p in $j.PSObject.Properties) { if ($p.Name -match 'success') { return [int64]$p.Value } }
-    return 0
+    if ($null -eq $j.PSObject.Properties['counters'] -or
+        $null -eq $j.counters.PSObject.Properties['success']) { return -1 }
+    $value = [int64]0
+    if (-not [int64]::TryParse([string]$j.counters.success, [ref]$value) -or $value -lt 0) { return -1 }
+    return $value
 }
 $restarts = 0
 $base = Get-SuccessTotal
+if ($base -lt 0) { Write-Host 'STOP: metrics unavailable; not a measured zero'; Clear-TpsServiceCredentialEnvironment; return }
+$previous = $base
+$positiveRounds = 0
 $lastGain = Get-Date
 Write-Host ("T0 success_total={0}" -f $base)
 for ($round = 1; $round -le 12; $round++) {
@@ -144,8 +156,12 @@ for ($round = 1; $round -le 12; $round++) {
         continue
     }
     $now = Get-SuccessTotal
+    if ($now -lt 0) { Write-Host "R$round metrics unavailable; skipping this sample"; continue }
+    if ($now -lt $previous) { Write-Host 'STOP: success counter reset; collect a fresh baseline'; break }
     $gain = $now - $base
-    if ($now -gt $base) { $lastGain = Get-Date }
+    $delta = $now - $previous
+    if ($delta -gt 0) { $lastGain = Get-Date; $positiveRounds++ } else { $positiveRounds = 0 }
+    $previous = $now
     $wl = Get-ChildItem (Join-Path $root 'logs') -Recurse -Filter worker.log -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
     $ok = 0; $rl = 0; $fp = 0; $cf = 0; $tb = 0
     if ($wl) {
@@ -158,11 +174,12 @@ for ($round = 1; $round -le 12; $round++) {
     }
     Write-Host ("R{0} pid={1} success_total={2} (+{3} since T0) LOG200 ok={4} rl={5} fp={6} cf={7} traceback={8}" -f $round, $rec.pid, $now, $gain, $ok, $rl, $fp, $cf, $tb)
     if ($tb -gt 0) { $tail | Select-String -Pattern 'Traceback' -Context 0,12 | Select-Object -Last 1 }
-    if ($rl -ge 70) { Write-Host 'WARN rate-limit heavy: proxy account limit, not code. Do not change config.' }
-    if ($cf -ge 30) { Write-Host 'WARN challenge heavy: proxy sticky-IP likely not set at the gateway panel. Do not change config.' }
+    if ($rl -ge 70) { Write-Host 'WARN repeated rate-limit log messages: cause unconfirmed; report evidence without changing config.' }
+    if ($cf -ge 30) { Write-Host 'WARN repeated challenge-related log messages: cause unconfirmed; report evidence without changing config.' }
     if (((Get-Date) - $lastGain).TotalMinutes -ge 30) { Write-Host 'STOP: no new success for 30 minutes'; break }
-    if ($gain -ge 200 -and $round -ge 3) { Write-Host 'PASS: steady collection confirmed'; break }
+    if ($gain -ge 200 -and $positiveRounds -ge 3 -and $tb -eq 0) { Write-Host 'METRICS_PROGRESS: 3 positive intervals; database ingress still requires separate confirmation'; break }
 }
+Clear-TpsServiceCredentialEnvironment
 Write-Host 'STEP B DONE'
 ```
 
@@ -184,8 +201,9 @@ Write-Host 'STEP B DONE'
 - 任何要改源码或改代理才能解决的问题。
 
 不算故障、不要动配置的情况：
-- LOG200 里 rl 很多、ok 很少：这是代理账号限流，代码在按设计退避。只报数字。
-- LOG200 里 cf 很多：网关没开粘性 IP。只报数字，用户去面板改。
+- LOG200 里 rl 很多、ok 很少：只能证明日志里限流信息多，不能直接排除代码、出口或账号问题。先回传数字和退避状态。
+- LOG200 里 cf 很多：只是挑战相关日志线索，不能仅凭它断言粘性 IP 是唯一原因。回传诊断，暂不改代理配置。
+- LOG200 是滚动日志行计数，不是独立请求数或挑战率。METRICS_PROGRESS 也不是完整验收；必须再核对 MySQL 实际新增记录、最新写入时间和流量窗口。
 
 ========== 汇报格式 ==========
 

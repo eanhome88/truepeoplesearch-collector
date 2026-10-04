@@ -1,0 +1,18 @@
+name: Windows storage socket contract
+on:
+  push:
+    paths:
+      - deploy/windows-full/Common.ps1
+      - tests/windows_storage_reparse.ps1
+      - docs/ops/deploy-11c746b.md
+      - docs/ops/deploy-mysql-socket-11f7d02.md
+      - .github/workflows/windows-storage.yml
+  workflow_dispatch:
+jobs:
+  windows-powershell-51:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native AF_UNIX and rejected link fixtures
+        shell: powershell
+        run: ./tests/windows_storage_reparse.ps1

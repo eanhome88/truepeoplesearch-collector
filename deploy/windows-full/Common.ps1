@@ -68,7 +68,7 @@ function Assert-NoReparsePoint {
 }
 
 function Get-TpsNativeSystemToolPath {
-    param([Parameter(Mandatory = $true)][ValidateSet('icacls.exe', 'wsl.exe')][string]$Name)
+    param([Parameter(Mandatory = $true)][ValidateSet('icacls.exe', 'wsl.exe', 'fsutil.exe')][string]$Name)
 
     if (-not [Environment]::Is64BitProcess) {
         throw 'A native 64-bit PowerShell process is required for Windows system tools.'
@@ -85,6 +85,61 @@ function Get-TpsNativeSystemToolPath {
     }
     Assert-NoReparsePoint $candidate
     return [IO.Path]::GetFullPath($candidate)
+}
+
+function ConvertFrom-TpsFsutilReparseTag {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][AllowEmptyCollection()][string[]]$OutputLines)
+
+    # Only parse the first nonempty header, never a hex value in the payload.
+    # The label is localized; the numeric tag and colon are locale independent.
+    $lines = @($OutputLines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($lines.Count -eq 0) {
+        throw 'The native reparse tag query returned no header.'
+    }
+    $match = [regex]::Match($lines[0], '^\s*[^:]+:\s*0x([0-9a-fA-F]{8})\s*$')
+    if (-not $match.Success) {
+        throw 'The native reparse tag query returned an unrecognized header.'
+    }
+    return [Convert]::ToUInt32($match.Groups[1].Value, 16)
+}
+
+function Get-TpsReparseTag {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $fsutil = Get-TpsNativeSystemToolPath 'fsutil.exe'
+    $outputLines = @(& $fsutil reparsepoint query $Path 2>&1 | ForEach-Object { [string]$_ })
+    if ($LASTEXITCODE -ne 0) {
+        throw 'The native reparse tag query failed.'
+    }
+    return ConvertFrom-TpsFsutilReparseTag -OutputLines $outputLines
+}
+
+function Test-TpsMySqlUnixSocket {
+    param(
+        [Parameter(Mandatory = $true)][string]$StorageRoot,
+        [Parameter(Mandatory = $true)][IO.FileSystemInfo]$Item
+    )
+
+    # An AF_UNIX socket has no link target. This exception is deliberately
+    # restricted to the MySQL socket, not arbitrary links or special files.
+    $approvedRoot = 'D:\TruePeopleSearch\data\mysql'
+    if (-not $StorageRoot.Equals($approvedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+    $full = [IO.Path]::GetFullPath($Item.FullName)
+    $expected = Join-Path $approvedRoot 'mysql.sock'
+    if (-not $full.Equals($expected, [StringComparison]::OrdinalIgnoreCase) -or
+        -not ($Item -is [IO.FileInfo]) -or $Item.Length -ne 0 -or
+        (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) {
+        return $false
+    }
+    try {
+        $tag = Get-TpsReparseTag $full
+        return $tag -eq [Convert]::ToUInt32('80000023', 16)
+    } catch {
+        # Unknown tags or an unavailable native query remain rejected.
+        return $false
+    }
 }
 
 function Assert-TpsStorageDirectoryTree {
@@ -106,6 +161,9 @@ function Assert-TpsStorageDirectoryTree {
                 throw "Storage entry escaped its approved D-drive tree: $full"
             }
             if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                if (Test-TpsMySqlUnixSocket -StorageRoot $root -Item $item) {
+                    continue
+                }
                 throw "Reparse points are not permitted in persistent storage: $full"
             }
             if ($item.PSIsContainer) {
