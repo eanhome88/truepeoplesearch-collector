@@ -128,7 +128,7 @@ $env:TPS_CONCURRENCY = [string]$concurrency
 $stdoutLog = Join-Path $root 'logs\app\collector.out.log'
 $stderrLog = Join-Path $root 'logs\app\collector.err.log'
 $arguments = @(
-    '-I', '-B', '-u', (Join-Path $appRoot 'scripts\tps_supervisor.py'),
+    '-I', '-X', 'utf8', '-B', '-u', (Join-Path $appRoot 'scripts\tps_supervisor.py'),
     'start', '--no-dashboard', '--concurrency', [string]$concurrency
 )
 $collector = $null

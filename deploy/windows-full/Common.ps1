@@ -671,7 +671,8 @@ function Get-TpsVerifiedDockerImageIds {
     }
     $expected = @{}
     foreach ($record in @($bundleManifest.files)) {
-        $role = [string]$record.role
+        $roleProp = $record.PSObject.Properties['role']
+        $role = if ($null -eq $roleProp) { '' } else { [string]$roleProp.Value }
         if (-not $roleToTag.ContainsKey($role)) {
             continue
         }

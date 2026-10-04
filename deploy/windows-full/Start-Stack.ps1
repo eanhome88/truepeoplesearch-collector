@@ -50,7 +50,7 @@ $deadline = [DateTime]::UtcNow.AddSeconds($ReadyTimeoutSeconds)
 foreach ($container in @('tps-full-mysql', 'tps-full-redis')) {
     $healthy = $false
     while ([DateTime]::UtcNow -lt $deadline) {
-        $status = (& $docker --context desktop-linux inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' $container 2>$null)
+        $status = (& $docker --context desktop-linux inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' $container)
         if ($LASTEXITCODE -eq 0 -and ([string]$status).Trim() -eq 'healthy') {
             $healthy = $true
             break
@@ -66,7 +66,7 @@ $containerImages = @{
     'tps-full-redis' = 'tps-offline/redis:7.4.8-alpine-amd64'
 }
 foreach ($container in $containerImages.Keys) {
-    $actualImage = ([string](& $docker --context desktop-linux inspect --format '{{.Image}}' $container 2>$null)).Trim().ToLowerInvariant()
+    $actualImage = ([string](& $docker --context desktop-linux inspect --format '{{.Image}}' $container)).Trim().ToLowerInvariant()
     $expectedImage = ([string]$expectedDockerImages[$containerImages[$container]]).ToLowerInvariant()
     if ($LASTEXITCODE -ne 0 -or $actualImage -ne $expectedImage) {
         throw "Running container does not use the verified offline image: $container"

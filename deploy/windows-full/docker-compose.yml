@@ -19,6 +19,11 @@ services:
       - --innodb-flush-log-at-trx-commit=1
       - --sync-binlog=1
       - --log-error=/var/lib/mysql/mysql-error.log
+      # socket 必须落在 bind mount 之外：mysqld 默认把 mysql.sock 建在
+      # datadir（即 D:\truepeoplesearch\data\mysql）里，它在 Windows 宿主
+      # 侧呈现为 reparse point，会触发 Test-Stack 的持久存储检查失败。
+      # 健康检查与业务全部走 TCP，此 socket 无人使用。
+      - --socket=/tmp/mysql.sock
     ports:
       - "127.0.0.1:${TPS_DB_PORT:-3306}:3306"
     volumes:
