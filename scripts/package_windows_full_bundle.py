@@ -40,6 +40,7 @@ APP_ALLOWLIST = (
     "deploy/windows-full/Initialize-Runtime.ps1",
     "deploy/windows-full/Install-DockerDesktop.ps1",
     "deploy/windows-full/Install-OfflineRuntime.ps1",
+    "deploy/windows-full/Optimize-WindowsHost.ps1",
     "deploy/windows-full/README.md",
     "deploy/windows-full/Start-Stack.ps1",
     "deploy/windows-full/Start-Collector.ps1",
