@@ -787,13 +787,34 @@ function Assert-TpsSupportedWindowsHost {
     if (($build -ge 22000 -and $build -lt 22631) -or ($build -lt 22000 -and $build -lt 19045)) {
         throw 'Windows must be a serviced Windows 10 22H2 or Windows 11 23H2-or-newer build.'
     }
-    $wsl = Get-TpsNativeSystemToolPath 'wsl.exe'
-    $wslOutput = (& $wsl --version 2>&1 | Out-String)
-    if ($LASTEXITCODE -ne 0) {
+    $wslCandidates = @()
+    $storeWsl = Join-Path ${env:ProgramFiles} 'WSL\wsl.exe'
+    if (Test-Path -LiteralPath $storeWsl -PathType Leaf) {
+        $storeItem = Get-Item -LiteralPath $storeWsl -Force
+        if (($storeItem -is [IO.FileInfo]) -and
+            (($storeItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) {
+            Assert-NoReparsePoint $storeWsl
+            $wslCandidates += [IO.Path]::GetFullPath($storeWsl)
+        }
+    }
+    # The System32 inbox copy may be an ancient stub that does not understand
+    # '--version' at all; it is only a fallback when the Store app is absent.
+    $wslCandidates += Get-TpsNativeSystemToolPath 'wsl.exe'
+    $wsl = $null
+    $wslOutput = ''
+    foreach ($candidate in $wslCandidates) {
+        $probe = (& $candidate --version 2>&1 | Out-String)
+        if ($LASTEXITCODE -eq 0 -and [regex]::Match($probe, '\d+\.\d+\.\d+').Success) {
+            $wsl = $candidate
+            $wslOutput = $probe
+            break
+        }
+    }
+    if (-not $wsl) {
         throw 'WSL 2.1.5 or newer is required before installing Docker Desktop.'
     }
     $versionMatch = [regex]::Match($wslOutput, '\d+\.\d+\.\d+')
-    if (-not $versionMatch.Success -or [Version]$versionMatch.Value -lt [Version]'2.1.5') {
+    if ([Version]$versionMatch.Value -lt [Version]'2.1.5') {
         throw 'WSL 2.1.5 or newer is required before installing Docker Desktop.'
     }
 }
