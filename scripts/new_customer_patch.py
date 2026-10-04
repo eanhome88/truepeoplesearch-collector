@@ -157,7 +157,10 @@ def build_lines(entries: list[dict[str, object]], commit: str, short: str) -> st
     for index, entry in enumerate(entries, start=1):
         out.append(f"{index}. 把我发的这个文件：{entry['repo_path']}")
         out.append(f"   复制到：{entry['windows_path']}")
-        out.append("   如果问「是否替换」，点「替换」。")
+        if entry.get("is_new"):
+            out.append("   这是新文件，直接放进去就行。")
+        else:
+            out.append("   如果问「是否替换」，点「替换」。")
     out.append("")
     out.append("应该看到什么：每个位置都只有一个新文件，没有多出来的 .new 文件。")
     out.append("")
@@ -192,12 +195,28 @@ def build_lines(entries: list[dict[str, object]], commit: str, short: str) -> st
             f"$entry_{entry['var']} = @($manifest.files "
             f"| Where-Object {{ $_.path -eq '{entry['manifest_path']}' }})"
         )
-        out.append(
-            f"if ($entry_{entry['var']}.Count -ne 1) "
-            f"{{ throw 'manifest entry not found: {entry['manifest_path']}' }}"
-        )
-        out.append(f"$entry_{entry['var']}[0].sha256 = '{entry['sha256_lower']}'")
-        out.append(f"$entry_{entry['var']}[0].size = {entry['size']}")
+        if entry.get("is_new"):
+            out.append(f"if ($entry_{entry['var']}.Count -eq 0) {{")
+            out.append(
+                f"  $manifest.files += [pscustomobject]@{{category='application'; "
+                f"path='{entry['manifest_path']}'; "
+                f"sha256='{entry['sha256_lower']}'; size={entry['size']}}}"
+            )
+            out.append(
+                f"  $entry_{entry['var']} = @($manifest.files "
+                f"| Where-Object {{ $_.path -eq '{entry['manifest_path']}' }})"
+            )
+            out.append("} else {")
+            out.append(f"  $entry_{entry['var']}[0].sha256 = '{entry['sha256_lower']}'")
+            out.append(f"  $entry_{entry['var']}[0].size = {entry['size']}")
+            out.append("}")
+        else:
+            out.append(
+                f"if ($entry_{entry['var']}.Count -ne 1) "
+                f"{{ throw 'manifest entry not found: {entry['manifest_path']}' }}"
+            )
+            out.append(f"$entry_{entry['var']}[0].sha256 = '{entry['sha256_lower']}'")
+            out.append(f"$entry_{entry['var']}[0].size = {entry['size']}")
     out.append(f"$manifest.commit = '{commit}'")
     out.append(
         "[IO.File]::WriteAllText($manifestPath, "
@@ -252,9 +271,16 @@ def _arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--files",
         action="append",
-        required=True,
+        default=[],
         metavar="REPO_PATH",
-        help="仓库相对路径，可重复传，如 --files deploy/windows-full/Common.ps1",
+        help="已在客户清单里的文件，可重复传，如 --files deploy/windows-full/Common.ps1",
+    )
+    parser.add_argument(
+        "--new-files",
+        action="append",
+        default=[],
+        metavar="REPO_PATH",
+        help="客户清单里还没有的新文件（自动新增条目），如 --new-files deploy/windows-full/Test-CustomerEnv.ps1",
     )
     parser.add_argument(
         "--out",
@@ -287,7 +313,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         seen: set[str] = set()
         entries: list[dict[str, object]] = []
-        for raw in args.files:
+        tasks: list[tuple[str, bool]] = [(raw, False) for raw in (args.files or [])]
+        tasks += [(raw, True) for raw in (args.new_files or [])]
+        if not tasks:
+            raise PatchError("至少传一个 --files 或 --new-files")
+        for raw, is_new in tasks:
             posix_path = normalize_repo_path(raw)
             if posix_path in seen:
                 raise PatchError(f"重复的文件：{posix_path}")
@@ -309,6 +339,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "sha256_upper": sha_lower.upper(),
                     "size": len(blob),
                     "var": var,
+                    "is_new": is_new,
                 }
             )
 
