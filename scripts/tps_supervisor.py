@@ -414,6 +414,7 @@ class Supervisor:
                 PYTHON,
                 str(SCRIPTS / "phone_discover.py"),
                 "--start-area", os.environ.get("TPS_START_AREA", "201"),
+                "--hot",
             ]
             self.specs["phone_feeder"] = ProcessSpec(
                 name="phone_feeder",
