@@ -80,6 +80,10 @@ from tps_queue import (
 )
 from tps_metrics import get_metrics
 from tps_control import clear_worker_heartbeat, write_worker_heartbeat
+try:
+    import cf_challenge
+except ImportError:  # 客户机旧包缺文件时降级：分型缺失不炸主流程
+    cf_challenge = None
 from proxy_pool import (
     ProxyManager,
     StickyLanes,
@@ -830,6 +834,12 @@ async def _fetch_page_own_cf(box: _ChromeBox, url: str):
         if status in (404, 410):
             return html_page(body, status, url)
         challenged = status in (403, 503) or is_challenge_html(body)
+        if challenged and cf_challenge is not None:
+            try:
+                _kind = cf_challenge.classify(url=url, html=body, status=status)
+                print(f"[OWN_CF] kind={_kind} route={cf_challenge.first_action(_kind)} (HTTP {status})", flush=True)
+            except Exception:
+                pass
         if status == 200 and not challenged:
             return html_page(body, status, url)
         if not challenged:
@@ -905,14 +915,29 @@ async def _tab_job(slot: int, box: _ChromeBox, job: dict) -> dict:
 
     last_bucket = "retry"
     last_error = "fetch failed"
+    last_kind = ""
+    last_route = ""
     page = None
+
+    def _cf_kind(exc, pg) -> tuple:
+        """分型+首选动作：纯观测，不改变 bucket 语义，异常时回空。"""
+        if cf_challenge is None:
+            return "", ""
+        try:
+            kind = cf_challenge.classify_exception(exc, url, pg)
+            return kind, cf_challenge.first_action(kind)
+        except Exception:
+            return "", ""
     for attempt in (1, 2):
         fetched = None
         try:
             fetched = await _fetch_page(box, url)
             page = fetched
             if _looks_like_captcha(page, url):
-                return done("rate_limit", None, False, page)
+                kind, route = _cf_kind(RuntimeError("captcha page"), page)
+                return done("rate_limit", None, False, page, extra={
+                    "cf_kind": kind or "site_captcha", "cf_route": route,
+                })
             async with box.db_lock:
                 box.db = await asyncio.to_thread(ensure_db, box.db)
                 data = await asyncio.to_thread(ingest_response, page, url, box.db)
@@ -931,6 +956,7 @@ async def _tab_job(slot: int, box: _ChromeBox, job: dict) -> dict:
             page = fetched
             last_error = _short_err(exc)
             last_bucket = classify_error(exc, url=url, page=page)
+            last_kind, last_route = _cf_kind(exc, page)
             empty_page = "empty" in last_error.lower() and "page" in last_error.lower()
             captcha = _has_captcha(exc, last_error, url) or _looks_like_captcha(
                 page, url, include_visible=(last_bucket == "empty" or empty_page),
@@ -953,7 +979,9 @@ async def _tab_job(slot: int, box: _ChromeBox, job: dict) -> dict:
             if last_bucket not in _SESSION_RETRY_BUCKETS or attempt == 2:
                 break
             print(f"[BROWSER] slot={slot} retry after {last_bucket}", flush=True)
-    return done(last_bucket, last_error, False, page)
+    return done(last_bucket, last_error, False, page, extra={
+        "cf_kind": last_kind, "cf_route": last_route,
+    })
 
 
 async def _fetch_page(box: _ChromeBox, url: str):
@@ -1265,6 +1293,10 @@ class LeaseWorker:
                 error = _captcha_note(error, str(final_url or url or ""))
             bucket = "rate_limit"
         self._record_outcome(bucket == "rate_limit")
+        cf_kind = str(msg.get("cf_kind") or "")
+        if cf_kind and cf_challenge is not None:
+            cf_challenge.note_challenge(self.r, cf_kind)
+            print(f"  [CF_KIND] job={jid} kind={cf_kind} route={msg.get('cf_route') or ''} bucket={bucket}")
         if bucket == "rate_limit":
             self._on_rate_limit(slot, job, msg, error, person, url)
             return
