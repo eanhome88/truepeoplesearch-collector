@@ -34,7 +34,10 @@ $script:AllowedRuntimeKeys = @(
     'TPS_REQUIRE_PHONE',
     'TPS_ACCEPT_VOIP',
     'TPS_ACCEPT_UNKNOWN_TYPE',
-    'TPS_FETCH_TIMEOUT_MS'
+    'TPS_FETCH_TIMEOUT_MS',
+    'TPS_REFERER_MODE',
+    'TPS_FETCH_JITTER_MS',
+    'TPS_LOCALE'
 )
 
 function Get-NormalizedInstallRoot {

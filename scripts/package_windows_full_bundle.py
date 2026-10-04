@@ -68,6 +68,7 @@ APP_ALLOWLIST = (
     "scripts/proxy_pool.py",
     "scripts/requeue_captcha.py",
     "scripts/scrape_to_tidb.py",
+    "scripts/stealth_init.js",
     "scripts/tps_alert.py",
     "scripts/tps_control.py",
     "scripts/tps_coverage.py",

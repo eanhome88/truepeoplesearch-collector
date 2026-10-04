@@ -128,6 +128,54 @@ class FetchTimeoutError(ScrapeError):
 
 FETCH_TIMEOUT_MS = int(float(__import__("os").environ.get("TPS_FETCH_TIMEOUT_MS", "60")) * 1000)
 
+STEALTH_INIT_JS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stealth_init.js")
+
+# Referer 轮换：全站 100% Google referer 是最显眼的机器人特征之一。
+# 真实流量主体是站内跳转（搜索页 -> 人物页），搜索引擎只占一小部分。
+# TPS_REFERER_MODE=google 恢复旧行为；=none 则不带 referer。
+_REFERER_INTERNAL = (
+    "https://www.truepeoplesearch.com/",
+    "https://www.truepeoplesearch.com/find/person/",
+    "https://www.truepeoplesearch.com/results?",
+)
+_REFERER_SEARCH = (
+    "https://www.google.com/",
+    "https://www.bing.com/",
+    "https://search.yahoo.com/",
+)
+
+
+def pick_referer(url: str = "") -> str:
+    """按权重挑 referer：站内 70% / 搜索 20% / 直连(空) 10%。"""
+    import random as _random
+    mode = (os.environ.get("TPS_REFERER_MODE") or "rotate").strip().lower()
+    if mode == "google":
+        return "https://www.google.com/"
+    if mode == "none":
+        return ""
+    roll = _random.random()
+    if roll < 0.70:
+        base = _random.choice(_REFERER_INTERNAL)
+        # 人物页的上一跳多半是站内搜索/人物页，用固定前缀即可，真拼 URL 反而假
+        return base
+    if roll < 0.90:
+        return _random.choice(_REFERER_SEARCH)
+    return ""
+
+
+def parse_jitter_ms() -> tuple:
+    """TPS_FETCH_JITTER_MS="200,800" -> (200, 800)。配 "0,0" 关闭。"""
+    raw = (os.environ.get("TPS_FETCH_JITTER_MS") or "200,800").strip()
+    try:
+        lo_s, _, hi_s = raw.partition(",")
+        lo, hi = int(lo_s or 0), int(hi_s or lo_s or 0)
+    except (TypeError, ValueError):
+        return (200, 800)
+    lo, hi = max(0, lo), max(0, hi)
+    if hi < lo:
+        lo, hi = hi, lo
+    return (lo, hi)
+
 
 def _env_flag(name: str, default: bool) -> bool:
     import os as _os
@@ -1012,7 +1060,7 @@ def insert_person(db, data: dict) -> bool:
 def session_kwargs() -> dict:
     """One long-lived stealth browser. Reuse the tab; do not launch per URL."""
     # 自研过 CF 时关闭内置求解避免打架 (TPS_OWN_CF=="1" 时关闭)
-    return {
+    kwargs = {
         "solve_cloudflare": os.environ.get("TPS_OWN_CF") != "1",
         "headless": True,
         "network_idle": False,
@@ -1020,24 +1068,36 @@ def session_kwargs() -> dict:
         "disable_resources": True,
         "block_ads": True,
         "load_dom": True,
-        "google_search": True,
+        # referer 改为每次请求轮换（见 fetch_kwargs），会话级不再全站 Google。
+        "google_search": False,
         "retries": 1,
         "retry_delay": 0,
         "max_pages": 1,
         "selector_config": StealthyFetcher._generate_parser_arguments(),
+        # 美区代理 + en-US 头 + 美区时区三者对齐；客户机系统若是中文时区会穿帮。
+        "locale": (os.environ.get("TPS_LOCALE") or "en-US").strip() or "en-US",
+        "timezone_id": (os.environ.get("TPS_TIMEZONE") or "America/New_York").strip() or "America/New_York",
     }
+    if os.path.isfile(STEALTH_INIT_JS):
+        kwargs["init_script"] = STEALTH_INIT_JS
+    return kwargs
 
 
-def fetch_kwargs() -> dict:
+def fetch_kwargs(url: str = "") -> dict:
     # 自研过 CF 时关闭内置求解避免打架 (TPS_OWN_CF=="1" 时关闭)
-    return {
+    kwargs = {
         "solve_cloudflare": os.environ.get("TPS_OWN_CF") != "1",
         "network_idle": False,
         "timeout": FETCH_TIMEOUT_MS,
         "disable_resources": True,
         "load_dom": True,
-        "google_search": True,
+        # per-request referer 会覆盖会话默认，scrapling 认 extra_headers 里的 referer。
+        "google_search": False,
     }
+    referer = pick_referer(url)
+    if referer:
+        kwargs["extra_headers"] = {"referer": referer}
+    return kwargs
 
 
 def open_stealth_session():
@@ -1112,7 +1172,7 @@ async def fetch_document(session, url: str):
     response = await request.get(
         url,
         timeout=FETCH_TIMEOUT_MS,
-        headers={"referer": "https://www.google.com/"},
+        headers={"referer": pick_referer(url) or "https://www.truepeoplesearch.com/"},
     )
     try:
         status = int(response.status)
@@ -1130,7 +1190,7 @@ async def fetch_document(session, url: str):
 
 async def fetch_in_async_session(session, url: str):
     try:
-        return await session.fetch(url, **fetch_kwargs())
+        return await session.fetch(url, **fetch_kwargs(url))
     except Exception as exc:
         _raise_fetch_error(exc, url)
 

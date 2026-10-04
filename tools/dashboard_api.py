@@ -644,6 +644,12 @@ def _load_stats():
             payload["scale"] = {}
 
         try:
+            from cf_challenge import challenge_snapshot
+            payload["challenge"] = challenge_snapshot(r)
+        except Exception:
+            payload["challenge"] = {}
+
+        try:
             from tps_control import _scan_heartbeats, bulk_ingest_status
             workers = _scan_heartbeats(r)
             bulk = bulk_ingest_status(r)
@@ -1451,6 +1457,12 @@ def api_metrics():
     try:
         from tps_queue import queue_stats
         payload["queue"] = queue_stats(r)
+    except Exception:
+        pass
+
+    try:
+        from cf_challenge import challenge_snapshot
+        payload["challenge"] = challenge_snapshot(r)
     except Exception:
         pass
 

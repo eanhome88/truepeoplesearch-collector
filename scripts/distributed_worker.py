@@ -883,6 +883,14 @@ async def _tab_job(slot: int, box: _ChromeBox, job: dict) -> dict:
     jid = job_id(job)
     person = job.get("person_id") or (extract_person_id(url) if url else "")
     t0 = time.monotonic()
+    # 反锁步抖动：32 个 tab 同时起抓是明显的机器节拍，加 slight 随机错峰。
+    # TPS_FETCH_JITTER_MS="200,800" 默认；"0,0" 关闭。
+    try:
+        _jlo, _jhi = _scrape_mod.parse_jitter_ms()
+    except Exception:
+        _jlo, _jhi = (0, 0)
+    if _jhi > 0:
+        await asyncio.sleep(random.uniform(_jlo, _jhi) / 1000.0)
 
     def done(bucket: str, error, served_ok: bool, page=None, extra=None) -> dict:
         final_url = _captcha_final_url(page, url)
