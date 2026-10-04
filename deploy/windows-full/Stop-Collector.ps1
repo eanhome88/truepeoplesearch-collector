@@ -19,10 +19,15 @@ if (-not (Test-Path -LiteralPath $recordPath -PathType Leaf)) {
 
 Assert-TpsProtectedFileAcl $recordPath
 $record = Get-Content -LiteralPath $recordPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$recordedExe = [IO.Path]::GetFullPath([string]$record.executable)
+$runtimePrefix = $root.TrimEnd('\') + '\runtime\'
+$exeOk = ($recordedExe -eq [IO.Path]::GetFullPath($python)) -or (
+    $recordedExe.StartsWith($runtimePrefix, [StringComparison]::OrdinalIgnoreCase) -and
+    $recordedExe.EndsWith('\python.exe', [StringComparison]::OrdinalIgnoreCase)
+)
 if ($record.schema_version -ne 1 -or [int]$record.pid -le 0 -or
     [string]$record.release_mode -ne 'customer-collector' -or
-    -not $record.process_start_utc -or -not $record.executable -or -not $record.application_root -or
-    [IO.Path]::GetFullPath([string]$record.executable) -ne [IO.Path]::GetFullPath($python) -or
+    -not $record.process_start_utc -or -not $exeOk -or -not $record.application_root -or
     [IO.Path]::GetFullPath([string]$record.application_root) -ne [IO.Path]::GetFullPath($appRoot)) {
     throw 'Collector process record is invalid; refusing to guess a process target.'
 }

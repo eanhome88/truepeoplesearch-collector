@@ -134,6 +134,45 @@ $arguments = @(
     '-I', '-X', 'utf8', '-B', '-u', (Join-Path $appRoot 'scripts\tps_supervisor.py'),
     'start', '--no-dashboard', '--concurrency', [string]$concurrency
 )
+function Resolve-TpsSupervisorProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$PidPath,
+        [Parameter(Mandatory = $true)][int]$LaunchedPid,
+        [Parameter(Mandatory = $true)][string]$InstallRoot
+    )
+
+    # Windows venv python.exe can be a launcher. Start-Process records the
+    # launcher PID, while the supervisor writes the real interpreter PID.
+    # Accept that child when its command line is tps_supervisor.py and its
+    # executable stays inside this install's runtime directory.
+    if (-not (Test-Path -LiteralPath $PidPath -PathType Leaf)) { return $null }
+    $claimed = 0
+    try { $claimed = [int]([IO.File]::ReadAllText($PidPath).Trim()) } catch { return $null }
+    if ($claimed -le 0) { return $null }
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$claimed" -ErrorAction SilentlyContinue
+    if (-not $proc) { return $null }
+    if (([string]$proc.CommandLine) -notlike '*tps_supervisor.py*') { return $null }
+    $exe = [IO.Path]::GetFullPath([string]$proc.ExecutablePath)
+    $prefix = $InstallRoot.TrimEnd('\') + '\runtime\'
+    if (-not $exe.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or
+        -not $exe.EndsWith('\python.exe', [StringComparison]::OrdinalIgnoreCase)) {
+        return $null
+    }
+    $cursor = $claimed
+    $linked = $false
+    for ($hop = 0; $hop -lt 5; $hop++) {
+        if ($cursor -eq $LaunchedPid) { $linked = $true; break }
+        $node = Get-CimInstance Win32_Process -Filter "ProcessId=$cursor" -ErrorAction SilentlyContinue
+        if (-not $node) { break }
+        $cursor = [int]$node.ParentProcessId
+        if ($cursor -le 0) { break }
+    }
+    if (-not $linked) { return $null }
+    $live = Get-Process -Id $claimed -ErrorAction SilentlyContinue
+    if (-not $live) { return $null }
+    return [pscustomobject]@{ pid = $claimed; exe = $exe; start = $live.StartTime.ToUniversalTime() }
+}
+
 $collector = $null
 $launchedPid = 0
 $launchedStartUtc = $null
@@ -147,7 +186,7 @@ try {
     $launchedPid = $collector.Id
     $launchedStartUtc = $collector.StartTime.ToUniversalTime()
     $launchedExecutable = [IO.Path]::GetFullPath($collector.Path)
-    if ($collector.HasExited -or $launchedExecutable -ne [IO.Path]::GetFullPath($python)) {
+    if ($launchedExecutable -ne [IO.Path]::GetFullPath($python)) {
         throw 'The launched collector process identity could not be verified.'
     }
 
@@ -166,20 +205,20 @@ try {
     $supervisorDeadline = [DateTime]::UtcNow.AddSeconds([Math]::Min(60, $ReadyTimeoutSeconds))
     $supervisorReady = $false
     while ([DateTime]::UtcNow -lt $supervisorDeadline) {
-        if ($collector.HasExited) {
+        $claimed = Resolve-TpsSupervisorProcess $supervisorPidPath $launchedPid $root
+        if ($null -ne $claimed) {
+            $record.pid = $claimed.pid
+            $record.process_start_utc = $claimed.start.ToString('o')
+            $record.executable = $claimed.exe
+            $record | ConvertTo-Json | Set-Content -LiteralPath $recordPath -Encoding UTF8
+            Protect-TpsSecretFile $recordPath
+            Assert-TpsProtectedFileAcl $recordPath
+            $launchedPid = [int]$claimed.pid
+            $supervisorReady = $true
             break
         }
-        if (Test-Path -LiteralPath $supervisorPidPath -PathType Leaf) {
-            try {
-                if ([int](Get-Content -LiteralPath $supervisorPidPath -Raw -Encoding UTF8).Trim() -eq $launchedPid) {
-                    $supervisorReady = $true
-                    break
-                }
-            }
-            catch {
-                Start-Sleep -Seconds 1
-            }
-        }
+        $collector.Refresh()
+        if ($collector.HasExited) { break }
         Start-Sleep -Seconds 1
     }
     if (-not $supervisorReady) {
