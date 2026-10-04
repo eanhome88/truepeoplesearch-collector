@@ -10,6 +10,12 @@ TPS_CF_SOLVER 三种写法：
   package.module:callable      Python 函数，同步/异步都行
   http://127.0.0.1:9000/solve  HTTP 服务，POST JSON
   cmd:D:\\tools\\solver.exe      命令行程序，stdin 收 JSON，stdout 回 JSON
+免费自建节点（本机跑，不花钱）：
+  flaresolverr:http://127.0.0.1:8191/v1   FlareSolverr 兼容 API（Byparr v2 同接口）
+  byparr:http://127.0.0.1:8191/v1        同上，别名
+  这两种把 FlareSolverr 的 solution{cookies,userAgent,response} 转成统一凭证，
+  直接插进 TPS_OWN_CF=1 的协议会话。Byparr(Camoufox 内核)是 2026 年免费档里
+  对 Turnstile/Managed Challenge 成功率最高的，FlareSolverr 本体已过时别用。
 
 三种写法收到的参数一致：
   {"url": "...", "proxy": "http://user:pass@host:port" 或 null,
@@ -210,7 +216,7 @@ def impersonate_for_ua(user_agent: Optional[str]) -> str:
 
 
 class CfSolver:
-    """统一调用面。kind ∈ {python, http, cmd}。solve() 永远是协程，不阻塞事件循环。"""
+    """统一调用面。kind ∈ {python, http, cmd, flaresolverr}。solve() 永远是协程，不阻塞事件循环。"""
 
     def __init__(self, spec: str, timeout: float = DEFAULT_SOLVER_TIMEOUT_SEC):
         self.spec = (spec or "").strip()
@@ -222,6 +228,12 @@ class CfSolver:
     @staticmethod
     def _parse(spec: str) -> tuple:
         low = spec.lower()
+        for prefix in ("flaresolverr:", "flaresolver:", "byparr:"):
+            if low.startswith(prefix):
+                base = spec[len(prefix):].strip().rstrip("/")
+                if not base.lower().startswith(("http://", "https://")):
+                    raise CfSolverError(f"TPS_CF_SOLVER {prefix} needs an http(s) URL, got {base!r}")
+                return "flaresolverr", base
         if low.startswith(("http://", "https://")):
             return "http", spec
         if low.startswith("cmd:"):
@@ -232,7 +244,8 @@ class CfSolver:
         module_name, sep, attr = spec.rpartition(":")
         if not sep or not module_name or not attr:
             raise CfSolverError(
-                "TPS_CF_SOLVER must be module:callable, http(s)://..., or cmd:<command>"
+                "TPS_CF_SOLVER must be module:callable, http(s)://..., cmd:<command>, "
+                "flaresolverr:http(s)://host/v1 or byparr:http(s)://host/v1"
             )
         try:
             module = importlib.import_module(module_name)
@@ -244,9 +257,9 @@ class CfSolver:
         return "python", fn
 
     def describe(self) -> str:
-        if self.kind == "http":
+        if self.kind in ("http", "flaresolverr"):
             parts = urlparse(self._target)
-            return f"http {parts.hostname}:{parts.port or (443 if parts.scheme == 'https' else 80)}{parts.path}"
+            return f"{self.kind} {parts.hostname}:{parts.port or (443 if parts.scheme == 'https' else 80)}{parts.path}"
         if self.kind == "cmd":
             return f"cmd {self._target.split()[0]}"
         fn: Callable = self._target
@@ -272,6 +285,10 @@ class CfSolver:
             elif self.kind == "http":
                 raw = await asyncio.wait_for(
                     asyncio.to_thread(self._post_json, payload, to), to + 10.0
+                )
+            elif self.kind == "flaresolverr":
+                raw = await asyncio.wait_for(
+                    asyncio.to_thread(self._solve_flaresolverr, payload, to), to + 10.0
                 )
             else:
                 raw = await asyncio.wait_for(
@@ -317,6 +334,54 @@ class CfSolver:
             raise CfSolverError(f"solver HTTP {status}")
         return body
 
+    def _solve_flaresolverr(self, payload: dict, timeout: float) -> Any:
+        """FlareSolverr 兼容 API（Byparr v2 同接口）-> 统一凭证。
+        POST {cmd: request.get, url, proxy, maxTimeout}，取 solution{cookies,userAgent}。
+        proxy 原样透传（http://user:pass@host:port），节点走同一出口，cf_clearance 才有效。"""
+        body = {
+            "cmd": "request.get",
+            "url": payload.get("url"),
+            "maxTimeout": int(float(payload.get("timeout") or timeout) * 1000),
+        }
+        proxy = payload.get("proxy")
+        if proxy:
+            body["proxy"] = {"url": proxy}
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            self._target,
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout + 5.0) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:200]
+            except Exception:
+                pass
+            raise CfSolverError(f"flaresolverr HTTP {exc.code}: {detail}") from exc
+        try:
+            doc = json.loads(raw.decode("utf-8", errors="replace"))
+        except ValueError as exc:
+            raise CfSolverError("flaresolverr returned non-JSON output") from exc
+        if not isinstance(doc, dict) or doc.get("status") != "ok":
+            reason = ""
+            if isinstance(doc, dict):
+                reason = str(doc.get("message") or doc.get("error") or "")[:200]
+            raise CfSolverError(f"flaresolverr did not solve: {reason}")
+        sol = doc.get("solution") or {}
+        cookies = {}
+        for item in sol.get("cookies") or []:
+            if isinstance(item, dict) and item.get("name") and item.get("value") is not None:
+                cookies[str(item["name"])] = str(item["value"])
+        ua = sol.get("userAgent") or sol.get("user_agent") or ""
+        if not cookies:
+            raise CfSolverError("flaresolverr solved but returned no cookies")
+        return {"cookies": cookies, "user_agent": str(ua or "")}
+
     def _run_cmd(self, payload: dict, timeout: float) -> Any:
         args = shlex.split(self._target, posix=(os.name != "nt"))
         if os.name == "nt":
@@ -356,7 +421,8 @@ def require_cf_solver() -> CfSolver:
     if solver is None:
         raise CfSolverError(
             "TPS_OWN_CF=1 but TPS_CF_SOLVER is not set. Without a solver nothing passes Cloudflare. "
-            "Set TPS_CF_SOLVER=module:callable | http://host:port/path | cmd:<command>, "
+            "Set TPS_CF_SOLVER=module:callable | http://host:port/path | cmd:<command> | "
+            "flaresolverr:http://127.0.0.1:8191/v1 | byparr:http://127.0.0.1:8191/v1, "
             "or set TPS_OWN_CF=0 to use the built-in browser solver."
         )
     return solver

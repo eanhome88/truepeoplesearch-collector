@@ -130,6 +130,84 @@ class CounterTests(unittest.TestCase):
         self.assertEqual(cc.challenge_snapshot(DeadRedis()), {})
 
 
+class FreeSolverTests(unittest.TestCase):
+    def test_scheme_aliases(self):
+        from cf_solver import CfSolver
+        for spec in ("flaresolverr:http://127.0.0.1:8191/v1",
+                     "flaresolver:http://127.0.0.1:8191/v1",
+                     "byparr:http://127.0.0.1:8191/v1"):
+            s = CfSolver(spec)
+            self.assertEqual(s.kind, "flaresolverr")
+            self.assertIn("8191", s.describe())
+
+    def test_scheme_needs_http(self):
+        from cf_solver import CfSolver, CfSolverError
+        with self.assertRaises(CfSolverError):
+            CfSolver("byparr:not-a-url")
+
+    def test_flaresolverr_solution_mapping(self):
+        import asyncio
+        import json as _json
+        from cf_solver import CfSolver
+
+        payload = {"cookies": [{"name": "cf_clearance", "value": "abc123"}],
+                   "userAgent": "Mozilla/5.0 Chrome/124"}
+        body = _json.dumps({"status": "ok", "solution": payload}).encode()
+
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return body
+
+        solver = CfSolver("byparr:http://127.0.0.1:8191/v1")
+        with mock.patch("urllib.request.urlopen", return_value=FakeResp()):
+            sol = asyncio.run(solver.solve("https://www.truepeoplesearch.com/", proxy=None))
+        self.assertEqual(sol.cookies.get("cf_clearance"), "abc123")
+        self.assertIn("Chrome/124", sol.user_agent)
+
+    def test_flaresolverr_no_cookies_is_failure(self):
+        import asyncio
+        import json as _json
+        from cf_solver import CfSolver, CfSolverError
+
+        body = _json.dumps({"status": "ok", "solution": {"cookies": []}}).encode()
+
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return body
+
+        solver = CfSolver("flaresolverr:http://127.0.0.1:8191/v1")
+        with mock.patch("urllib.request.urlopen", return_value=FakeResp()):
+            with self.assertRaises(CfSolverError):
+                asyncio.run(solver.solve("https://x/"))
+
+
+class CorpusTests(unittest.TestCase):
+    def test_save_prune_and_disable(self):
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        os.environ["TPS_CAPTCHA_CORPUS_DIR"] = tmp
+        os.environ.pop("TPS_CAPTCHA_CORPUS", None)
+        try:
+            html = "<html>" + "x" * 500 + "InternalCaptcha</html>"
+            p1 = cc.save_captcha_sample(html, "http://x/1", "j1")
+            self.assertTrue(p1 and os.path.isfile(p1))
+            # 52 个样本只留 50
+            for i in range(52):
+                cc.save_captcha_sample(html, f"http://x/{i}", f"j{i}")
+            left = [n for n in os.listdir(tmp) if n.endswith(".html")]
+            self.assertEqual(len(left), 50)
+            # 太短不存
+            self.assertEqual(cc.save_captcha_sample("tiny", "http://x", "j"), "")
+            # 关掉不存
+            os.environ["TPS_CAPTCHA_CORPUS"] = "0"
+            self.assertEqual(cc.save_captcha_sample(html, "http://x", "j"), "")
+        finally:
+            os.environ.pop("TPS_CAPTCHA_CORPUS_DIR", None)
+            os.environ.pop("TPS_CAPTCHA_CORPUS", None)
+
+
 class WorkerWireTests(unittest.TestCase):
     def test_tab_job_reports_kind(self):
         import asyncio

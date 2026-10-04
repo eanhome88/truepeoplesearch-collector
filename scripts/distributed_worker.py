@@ -987,9 +987,29 @@ async def _tab_job(slot: int, box: _ChromeBox, job: dict) -> dict:
             if last_bucket not in _SESSION_RETRY_BUCKETS or attempt == 2:
                 break
             print(f"[BROWSER] slot={slot} retry after {last_bucket}", flush=True)
-    return done(last_bucket, last_error, False, page, extra={
-        "cf_kind": last_kind, "cf_route": last_route,
-    })
+    extra = {"cf_kind": last_kind, "cf_route": last_route}
+    if last_kind == "site_captcha" and cf_challenge is not None:
+        # 攒样本：站内验证页长什么样先存下来，免费 OCR 能不能打靠它评估。
+        try:
+            _html = ""
+            for _attr in ("html_content", "html", "body", "content"):
+                try:
+                    _v = getattr(page, _attr, None)
+                except Exception:
+                    continue
+                if isinstance(_v, (bytes, bytearray)):
+                    _html = _v.decode("utf-8", errors="replace")
+                    break
+                if isinstance(_v, str) and _v.strip():
+                    _html = _v
+                    break
+            _sample = cf_challenge.save_captcha_sample(_html, url, jid)
+            if _sample:
+                extra["cf_sample"] = _sample
+                print(f"  [CF_SAMPLE] job={jid} saved={_sample}")
+        except Exception:
+            pass
+    return done(last_bucket, last_error, False, page, extra=extra)
 
 
 async def _fetch_page(box: _ChromeBox, url: str):

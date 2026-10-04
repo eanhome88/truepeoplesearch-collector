@@ -269,3 +269,43 @@ def challenge_snapshot(redis_client: Any) -> Dict[str, int]:
         except (TypeError, ValueError):
             continue
     return out
+
+
+def captcha_corpus_dir() -> str:
+    """样本目录：TPS_CAPTCHA_CORPUS=0/off/none 关闭；否则 data/captcha_corpus（最多保留 50 个）。"""
+    import os as _os
+    raw = (_os.environ.get("TPS_CAPTCHA_CORPUS") or "").strip().lower()
+    if raw in ("0", "false", "no", "off", "none", "disabled"):
+        return ""
+    return (_os.environ.get("TPS_CAPTCHA_CORPUS_DIR") or "data/captcha_corpus").strip() or "data/captcha_corpus"
+
+
+def save_captcha_sample(html: str, url: str = "", job_id: str = "") -> str:
+    """站内验证页存档：给免费 OCR（ddddocr 这类本地识别）攒样本。
+    返回写盘路径；目录关掉/正文太短/异常时返回空串，绝不抛。"""
+    import os as _os
+    import re as _re
+    import time as _time
+    base = captcha_corpus_dir()
+    if not base or not html or len(html.strip()) < 200:
+        return ""
+    try:
+        _os.makedirs(base, exist_ok=True)
+        stamp = _time.strftime("%Y%m%d-%H%M%S")
+        safe_jid = _re.sub(r"[^A-Za-z0-9_-]+", "_", str(job_id or "noj")[:24])
+        path = _os.path.join(base, f"site_captcha-{stamp}-{safe_jid}.html")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(f"<!-- url: {url} -->\n")
+            fh.write(html)
+        files = sorted(
+            (_os.path.join(base, n) for n in _os.listdir(base) if n.endswith(".html")),
+            key=lambda p: _os.path.getmtime(p),
+        )
+        for stale in files[:-50]:
+            try:
+                _os.remove(stale)
+            except OSError:
+                pass
+        return path
+    except Exception:
+        return ""
