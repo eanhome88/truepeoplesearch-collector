@@ -38,7 +38,7 @@ try {
     if ($PSCmdlet.ShouldProcess("PID $($process.Id)", 'Stop the verified collector supervisor and its worker tree')) {
         # The supervisor owns worker/feeder child processes: stop the whole
         # tree, or orphaned workers would keep collecting with no record.
-        $supervisorPidPath = Join-Path $appRoot 'data\supervisor.pid'
+        $supervisorPidPath = Join-Path $root 'runtime\supervisor.pid'
         if (Test-Path -LiteralPath $supervisorPidPath -PathType Leaf) {
             $supervisorPid = 0
             try { $supervisorPid = [int](Get-Content -LiteralPath $supervisorPidPath -Raw -Encoding UTF8).Trim() } catch { $supervisorPid = 0 }

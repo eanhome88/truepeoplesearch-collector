@@ -102,7 +102,7 @@ if (Test-Path -LiteralPath $recordPath -PathType Leaf) {
 }
 
 # Drop a stale supervisor PID/mode record only after its process is confirmed dead.
-$supervisorPidPath = Join-Path $appRoot 'data\supervisor.pid'
+$supervisorPidPath = Join-Path $root 'runtime\supervisor.pid'
 foreach ($stale in @($supervisorPidPath, ($supervisorPidPath + '.mode.json'), ($supervisorPidPath + '.lock'))) {
     if (Test-Path -LiteralPath $stale -PathType Leaf) {
         $stalePid = 0
