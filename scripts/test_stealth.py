@@ -48,14 +48,10 @@ class SessionProfileTests(unittest.TestCase):
     def test_no_site_wide_google_referer(self):
         self.assertFalse(s.session_kwargs().get("google_search"))
 
-    def test_init_script_wired_and_on_disk(self):
-        kw = s.session_kwargs()
-        path = kw.get("init_script")
-        self.assertTrue(path and os.path.isfile(path), "init_script must point at a real file")
-        with open(path, encoding="utf-8") as fh:
-            js = fh.read()
-        for marker in ("webdriver", "window.chrome", "plugins", "languages", "permissions"):
-            self.assertIn(marker, js)
+    def test_no_placebo_init_script(self):
+        # E2E 结论：patchright 静默吞掉自定义注入，挂 init_script 等于假隐身。
+        # 这里锁死“不挂”，将来换栈（原生 playwright）时再恢复。
+        self.assertNotIn("init_script", s.session_kwargs())
 
     def test_locale_timezone_aligned_us(self):
         for var in ("TPS_LOCALE", "TPS_TIMEZONE"):

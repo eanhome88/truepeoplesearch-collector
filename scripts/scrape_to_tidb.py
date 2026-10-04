@@ -128,7 +128,7 @@ class FetchTimeoutError(ScrapeError):
 
 FETCH_TIMEOUT_MS = int(float(__import__("os").environ.get("TPS_FETCH_TIMEOUT_MS", "60")) * 1000)
 
-STEALTH_INIT_JS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stealth_init.js")
+STEALTH_INIT_JS = ""  # 保留名防旧引用；init_script 经 E2E 证实在本栈不执行，已停用
 
 # Referer 轮换：全站 100% Google referer 是最显眼的机器人特征之一。
 # 真实流量主体是站内跳转（搜索页 -> 人物页），搜索引擎只占一小部分。
@@ -1078,8 +1078,11 @@ def session_kwargs() -> dict:
         "locale": (os.environ.get("TPS_LOCALE") or "en-US").strip() or "en-US",
         "timezone_id": (os.environ.get("TPS_TIMEZONE") or "America/New_York").strip() or "America/New_York",
     }
-    if os.path.isfile(STEALTH_INIT_JS):
-        kwargs["init_script"] = STEALTH_INIT_JS
+    # NOTE: 这里故意不用 init_script。2026-10-05 本机 E2E 实测：
+    # scrapling 0.4.15 底层是 patchright 1.63.0，其持久/非持久 context、
+    # context 级/page 级、path=/script= 四种写法全部静默吞掉自定义注入
+    # （同脚本原生 playwright 生效）。挂一个不执行的脚本等于假隐身，
+    # 所以隐身只靠 patchright 内置补丁 + 下面的 referer/locale/抖动。
     return kwargs
 
 
