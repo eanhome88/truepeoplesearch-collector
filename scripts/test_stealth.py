@@ -26,7 +26,9 @@ class RefererTests(unittest.TestCase):
 
     def test_rotate_mix(self):
         os.environ.pop("TPS_REFERER_MODE", None)
-        refs = [s.pick_referer("https://www.truepeoplesearch.com/find/person/x") for _ in range(600)]
+        refs = [s.pick_referer("https://www.truepeoplesearch.com/find/smith/john") for _ in range(600)]
+        person = [s.pick_referer("https://www.truepeoplesearch.com/find/person/x") for _ in range(40)]
+        self.assertTrue(all("truepeoplesearch.com" in r for r in person))
         internal = sum(1 for r in refs if "truepeoplesearch.com" in r)
         search = sum(1 for r in refs if "google.com" in r or "bing.com" in r or "yahoo.com" in r)
         direct = sum(1 for r in refs if r == "")

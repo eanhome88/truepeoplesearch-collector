@@ -21,6 +21,7 @@ from distributed_worker import (  # noqa: E402
     classify_error,
     plan_chrome_groups,
     proxy_tcp_open,
+    proxy_upstream_open,
     rate_limit_pause_sec,
 )
 from proxy_pool import StickyLanes  # noqa: E402
@@ -177,13 +178,13 @@ class TestRateLimitPause(unittest.TestCase):
         self.assertEqual(worker._rate_limit_streak, 0)
         self.assertEqual(worker._heartbeat_status(), "running")
 
-    def test_dynamic_gateway_account_pause(self):
-        """单条穿云网关 429 走账号总量暂停：暂停 15~25 秒、streak 1、status paused、pending 1。"""
+    def test_dynamic_gateway_429_rests_only_that_ip(self):
+        """穿云一条出口 429 只休本组，不把全部 IP 停掉。"""
         r = make_redis()
         feed(r, [URL])
         job = claim(r, "worker-cb")
-        cb_proxy = "http://88940762-res_US:ypvmwawa@gw-res.cloudbypass.com:1288"
-        lanes = StickyLanes([cb_proxy], rest_sec=0)
+        cb_proxy = "http://user-res_US:secret@gw-res.cloudbypass.com:1288"
+        lanes = StickyLanes([cb_proxy, "http://user-res_US_s2:secret@gw-res.cloudbypass.com:1288"], rest_sec=0)
         worker = LeaseWorker(r, 1, 1000, 8.0, lanes=lanes)
         group = worker.groups[0]
         group.proxy = cb_proxy
@@ -192,6 +193,7 @@ class TestRateLimitPause(unittest.TestCase):
         slot.job = job
         slot.jid = job["id"]
         worker.in_flight[job["id"]] = job
+        now = time.monotonic()
 
         worker._on_done(slot, {
             "slot": 0,
@@ -205,10 +207,9 @@ class TestRateLimitPause(unittest.TestCase):
             "generation": 0,
         })
 
-        self.assertGreaterEqual(worker._pause_remaining_sec(), 15)
-        self.assertLessEqual(worker._pause_remaining_sec(), 25)
-        self.assertEqual(worker._rate_limit_streak, 1)
-        self.assertEqual(worker._heartbeat_status(), "paused")
+        self.assertEqual(worker._pause_remaining_sec(), 0)
+        self.assertEqual(worker._heartbeat_status(), "running")
+        self.assertGreater(group.claim_after, now)
         self.assertEqual(queue_stats(r)["pending"], 1)
 
     def test_captcha_keeps_lane_restarts_fingerprint(self):
@@ -281,6 +282,7 @@ class TestRateLimitPause(unittest.TestCase):
         os.environ["TPS_PROXY_PROBE"] = "1"
         try:
             self.assertFalse(proxy_tcp_open("http://127.0.0.1:1", timeout=0.2))
+            self.assertFalse(proxy_upstream_open("http://127.0.0.1:1", timeout=0.3))
             os.environ["TPS_PROXY_PROBE"] = "0"
             self.assertTrue(proxy_tcp_open("http://10.0.0.9:1", timeout=0.2))
         finally:

@@ -190,6 +190,9 @@ def pick_referer(url: str = "") -> str:
         return "https://www.google.com/"
     if mode == "none":
         return ""
+    # 人物页的上一跳应是站内目录/搜索，夹 20% 搜索引擎会像脚本连点。
+    if "/find/person/" in (url or ""):
+        return _random.choice(_REFERER_INTERNAL)
     roll = _random.random()
     if roll < 0.70:
         base = _random.choice(_REFERER_INTERNAL)

@@ -478,6 +478,41 @@ def proxy_tcp_open(proxy: str, timeout: float = 0.4) -> bool:
         return False
 
 
+def proxy_upstream_open(proxy: str, timeout: float = 6.0) -> bool:
+    """穿过代理真正发出一次短请求。网关端口开着、后面的会话已死时，TCP 探活会误判成好的。
+
+    TPS_PROXY_PROBE=0 跳过；=tcp 只做端口检查。其余先查端口，再请求 example.com。
+    """
+    raw = (proxy or "").strip()
+    if not raw:
+        return True
+    flag = (os.environ.get("TPS_PROXY_PROBE", "1") or "1").strip().lower()
+    if flag in ("0", "false", "no", "off"):
+        return True
+    try:
+        limit = float(timeout)
+    except (TypeError, ValueError):
+        limit = 6.0
+    limit = min(15.0, max(0.2, limit))
+    if not proxy_tcp_open(raw, timeout=min(0.4, limit)):
+        return False
+    if flag == "tcp":
+        return True
+    try:
+        import urllib.request
+        handler = urllib.request.ProxyHandler({"http": raw, "https": raw})
+        opener = urllib.request.build_opener(handler)
+        req = urllib.request.Request(
+            "http://example.com/",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with opener.open(req, timeout=limit) as resp:
+            code = int(getattr(resp, "status", 0) or 0)
+            return 200 <= code < 500
+    except Exception:
+        return False
+
+
 def _proxy_username(proxy: str) -> str:
     raw = (proxy or "").strip()
     if not raw:
@@ -1759,19 +1794,15 @@ class LeaseWorker:
                     flush=True,
                 )
             elif self._is_dynamic_group(group):
-                hopped = self._hop_account(group)
-                if hopped:
-                    label = ProxyManager._mask_proxy(group.proxy) if group.proxy else "direct"
-                    print(
-                        f"  [account_hop] chrome={group.gid} 当前账号熔断，换到另一账号出口: {label}",
-                        flush=True,
-                    )
-                else:
-                    pause = self._note_account_limit()
-                    print(
-                        f"  [rate_limit] 槽位 chrome={group.gid} 动态网关账号暂停 {pause}s: {label}",
-                        flush=True,
-                    )
+                # 网站只看出口 IP。一条被 429 只让本组休息，其余 IP 继续领任务。
+                group.consecutive_rate_limits += 1
+                warm = LANE_WARM_SEC + random.uniform(0, 5)
+                group.claim_after = time.monotonic() + warm
+                label = ProxyManager._mask_proxy(group.proxy) if group.proxy else "direct"
+                print(
+                    f"  [rate_limit] chrome={group.gid} 这条 IP 被 429，只休本组{warm:.0f}s，其他 IP 继续: {label}",
+                    flush=True,
+                )
             elif self.lanes is not None and self.lanes.count > 1:
                 try:
                     soonest = float(self.lanes.seconds_until_ready())
@@ -1835,7 +1866,7 @@ class LeaseWorker:
         for _ in range(tries):
             if not url:
                 break
-            if proxy_tcp_open(url):
+            if proxy_upstream_open(url):
                 return url
             print(
                 f"[PROXY] dead lane skipped {ProxyManager._mask_proxy(url)}",
