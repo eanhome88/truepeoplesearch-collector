@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from distributed_worker import load_worker_lanes, plan_chrome_groups, sticky_pool_size  # noqa: E402
+from distributed_worker import lane_target, load_worker_lanes, plan_chrome_groups, sticky_pool_size  # noqa: E402
 from proxy_pool import StickyLanes, sticky_gateway_url, sticky_lanes_from_config  # noqa: E402
 from test_tps_queue import make_redis  # noqa: E402
 
@@ -80,6 +80,11 @@ class TestStickyPool(unittest.TestCase):
         self.assertEqual(lanes.count, 1000)
         self.assertEqual(len(set(lanes._urls)), 1000)
         self.assertEqual(len(plan_chrome_groups(4, lanes.count)), 4)
+
+    def test_128gb_opens_96_lanes(self):
+        self.assertEqual(lane_target(6, 1000, 128), 96)
+        self.assertEqual(lane_target(6, 1000, 16), 7)
+        self.assertEqual(lane_target(6, 3, 128), 6)
 
     def test_pool_env_can_shrink(self):
         os.environ["TPS_STICKY_POOL"] = "6"

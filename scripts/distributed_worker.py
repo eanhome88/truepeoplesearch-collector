@@ -1417,10 +1417,11 @@ class LeaseWorker:
         self.out_q = self.ctx.Queue()
         lane_count = self.lanes.count if self.lanes is not None else 0
         if lane_count >= 100:
-            floor = min(32, lane_count, max(self.budget, 1))
+            from tps_scale import physical_mem_gb
+            floor = lane_target(self.concurrency, lane_count, physical_mem_gb())
             if self.concurrency < floor:
                 print(
-                    f"[SCALE] pool={lane_count} concurrency {self.concurrency} -> {floor}，断线就换下一条",
+                    f"[SCALE] pool={lane_count} mem_lanes={floor} concurrency {self.concurrency} -> {floor}，断线就换下一条",
                     flush=True,
                 )
                 self.concurrency = floor
@@ -2423,6 +2424,20 @@ def _load_proxy_api_cache() -> list:
     except OSError:
         return []
     return [line.strip() for line in lines if line.strip()]
+
+
+def lane_target(requested: int, lane_count: int, mem_gb: float) -> int:
+    """池子不少于 100 条时，按大约 1.1GB 一个浏览器把并发抬到机器吃得下的路数，封顶 96。
+
+    只升不降。8GB 小机器算出来更少时，仍用调用方原来的并发。
+    """
+    requested = max(1, int(requested or 1))
+    if int(lane_count or 0) < 100:
+        return requested
+    usable = max(0.0, float(mem_gb) - 8.0)
+    by_mem = max(1, int(usable // 1.1))
+    target = min(int(lane_count), by_mem, 96)
+    return max(requested, target)
 
 
 def sticky_pool_size(concurrency: int = 2) -> int:
