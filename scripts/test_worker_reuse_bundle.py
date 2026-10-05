@@ -187,7 +187,11 @@ class HeaderTests(unittest.TestCase):
             self.assertIn(key, h)
         self.assertEqual(h["user-agent"], ua)
         self.assertIn("124", h["sec-ch-ua"])
-        self.assertEqual(h["sec-fetch-site"], "same-origin")
+        self.assertIn(h["sec-fetch-site"], ("same-origin", "cross-site", "none"))
+        self.assertEqual(
+            h["sec-fetch-site"] == "same-origin",
+            "truepeoplesearch.com" in (h["referer"] or ""),
+        )
 
 
 class EgressReuseTests(unittest.IsolatedAsyncioTestCase):
