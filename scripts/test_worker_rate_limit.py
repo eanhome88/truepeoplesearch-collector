@@ -77,8 +77,42 @@ class TestRateLimitPause(unittest.TestCase):
             "person": again["person_id"],
             "url": again["url"],
         })
-        self.assertGreater(worker._pause_remaining_sec(), 290)
-        self.assertEqual(worker._rate_limit_streak, 1)
+        self.assertEqual(worker._pause_remaining_sec(), 0)
+        self.assertEqual(worker._heartbeat_status(), "running")
+        self.assertGreater(group.claim_after, time.monotonic())
+        self.assertEqual(worker._rate_limit_streak, 0)
+
+    def test_shared_host_429_rests_only_that_group(self):
+        """同网关多出口认不出动态时，429 只休本组，不写全局暂停。"""
+        r = make_redis()
+        feed(r, [URL])
+        job = claim(r, "worker-shared")
+        lanes = StickyLanes(
+            ["http://10.0.0.1:8000", "http://10.0.0.1:8001"],
+            rest_sec=4200,
+        )
+        self.assertTrue(lanes.shared_host)
+        worker = LeaseWorker(r, 1, 1000, 8.0, lanes=lanes)
+        group = worker.groups[0]
+        slot = worker.slots[0]
+        slot.job = job
+        slot.jid = job["id"]
+        worker.in_flight[job["id"]] = job
+        now = time.monotonic()
+        worker._on_done(slot, {
+            "slot": 0,
+            "kind": "done",
+            "id": job["id"],
+            "bucket": "rate_limit",
+            "error": "HTTP 429 for " + URL,
+            "generation": 0,
+            "person": job["person_id"],
+            "url": job["url"],
+        })
+        self.assertEqual(worker._pause_remaining_sec(), 0)
+        self.assertEqual(worker._heartbeat_status(), "running")
+        self.assertGreater(group.claim_after, now)
+        self.assertNotEqual(group.proxy, "http://10.0.0.1:8000")
 
     def test_pause_steps(self):
         self.assertEqual(rate_limit_pause_sec(1), 300)
@@ -127,10 +161,12 @@ class TestRateLimitPause(unittest.TestCase):
         feed(r, [URL])
         job = claim(r, "worker-429")
         worker = LeaseWorker(r, 1, 1000, 8.0)
+        group = worker.groups[0]
         slot = worker.slots[0]
         slot.job = job
         slot.jid = job["id"]
         worker.in_flight[job["id"]] = job
+        now = time.monotonic()
 
         worker._on_done(slot, {
             "slot": 0,
@@ -147,9 +183,10 @@ class TestRateLimitPause(unittest.TestCase):
         self.assertEqual(stats["pending"], 1)
         self.assertEqual(stats["processing"], 0)
         self.assertEqual(stats.get("dlq", 0), 0)
-        self.assertGreater(worker._pause_remaining_sec(), 290)
+        self.assertEqual(worker._pause_remaining_sec(), 0)
+        self.assertGreater(group.claim_after, now)
         self.assertEqual(worker._rate_limit_streak, 1)
-        self.assertEqual(worker._heartbeat_status(), "paused")
+        self.assertEqual(worker._heartbeat_status(), "running")
         self.assertEqual(int(r.get(COUNTER_KEY.format(bucket="rate_limit")) or 0), 1)
 
         again = claim(r, "worker-429-again")

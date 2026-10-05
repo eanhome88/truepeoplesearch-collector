@@ -19,7 +19,9 @@ Playwright 同步 API 不能跨线程共享，冷启动浏览器大约 30 秒，
 nack(retry=True) 回队，再关掉浏览器进程。不要 kill -9。
 
 同一出口遇到 HTTP 429 时，任务 release 回 pending（不增加 attempts）。
-有备用独立出口只换道不停全局；无备用才全局等；验证码只重刷指纹。
+网站只看出口 IP：一条通道 429 只休该组（group.claim_after），不写全局暂停。
+有多条 lane 时尽量换这一组的出口；换失败或认不出动态也不停其他组。
+验证码只重刷指纹。
 用户名含 -region- 的粘性网关换新 sid（新出口）并重启 Chrome。
 InternalCaptcha / captcha 页同样 release，不按空页 ACK。
 """
@@ -1660,7 +1662,7 @@ class LeaseWorker:
         return "running"
 
     def _is_dynamic_group(self, group: Optional[_ChromeGroup] = None) -> bool:
-        """判断当前槽位或环境是否使用动态住宅代理（每次请求不同IP），隧道单网关 429 走账号总量暂停。"""
+        """当前组是否像动态住宅出口。429 只休本组；认不出动态也不改走全局暂停。"""
         if os.environ.get("NO_RATE_LIMIT_COOLDOWN") == "1" or os.environ.get("TPS_NO_COOLDOWN") == "1":
             return True
         if os.environ.get("RATE_LIMIT_PAUSE_SEC", "").strip() in ("0", "none", "false"):
@@ -1672,17 +1674,17 @@ class LeaseWorker:
         return False
 
     def _note_rate_limit(self, group: Optional[_ChromeGroup] = None) -> int:
-        """同一轮限流里后续 429 不加大暂停。动态代理模式直接返回 0。"""
+        """固定出口 429：只休当前组。同一轮后续 429 不加大休息，不写全局 _claim_after。"""
         if self._is_dynamic_group(group):
-            self._claim_after = 0.0
             self._rate_limit_streak = 0
             return 0
         now = time.monotonic()
-        if now < self._claim_after:
-            return self._pause_remaining_sec()
+        if group is not None and now < group.claim_after:
+            return max(0, int(group.claim_after - now))
         self._rate_limit_streak += 1
         pause = rate_limit_pause_sec(self._rate_limit_streak)
-        self._claim_after = now + pause
+        if group is not None:
+            group.claim_after = now + pause
         return pause
 
     def _note_account_limit(self) -> int:
@@ -1804,20 +1806,29 @@ class LeaseWorker:
                     flush=True,
                 )
             elif self.lanes is not None and self.lanes.count > 1:
+                # 换出口已在上面试过。认不出动态、或没有可换的出口，都只休本组。
                 try:
                     soonest = float(self.lanes.seconds_until_ready())
                 except Exception:
                     soonest = 0.0
-                if now < self._claim_after:
-                    pause = self._pause_remaining_sec()
+                if now < group.claim_after:
+                    pause = max(0.0, group.claim_after - now)
                 else:
-                    self._rate_limit_streak += 1
+                    group.consecutive_rate_limits += 1
                     pause = min(max(soonest, 30.0), 600.0)
-                    self._claim_after = now + pause
-                print(f"  [lane_wait] 全部出口冷却中，全局等{pause:.0f}s", flush=True)
+                    group.claim_after = time.monotonic() + pause
+                label = ProxyManager._mask_proxy(group.proxy) if group.proxy else "direct"
+                print(
+                    f"  [lane_wait] chrome={group.gid} 这条出口 429，只休本组{pause:.0f}s，其他组不停: {label}",
+                    flush=True,
+                )
             else:
                 pause = self._note_rate_limit(group)
-                print(f"  [rate_limit] job={jid} pause={pause}s returned to pending (固定IP冷却)", flush=True)
+                label = ProxyManager._mask_proxy(group.proxy) if group.proxy else "direct"
+                print(
+                    f"  [rate_limit] chrome={group.gid} 固定出口 429，只休本组{pause:.0f}s，不暂停全局: {label}",
+                    flush=True,
+                )
 
         try:
             release(self.r, job, "rate_limited")
@@ -1844,17 +1855,24 @@ class LeaseWorker:
             return False
         user = _proxy_username(current).lower()
         host = (urlparse(current if "://" in current else "http://" + current).hostname or "").lower()
-        if "cloudbypass" in host or "gw-res" in host or "-res_" in user or "res_us" in user:
-            refreshed = refresh_sticky_url(current)
-            if refreshed and refreshed != current:
-                self._arm_proxy(group, refreshed)
-            return True
-        if "-region-" in user:
+        dynamic = (
+            "cloudbypass" in host or "gw-res" in host
+            or "-res_" in user or "res_us" in user or "-region-" in user
+        )
+        if not dynamic:
+            return False
+        for _ in range(3):
             refreshed = refresh_sticky_url(current)
             if not refreshed or refreshed == current:
                 return False
-            self._arm_proxy(group, refreshed)
-            return True
+            if proxy_upstream_open(refreshed):
+                self._arm_proxy(group, refreshed)
+                return True
+            print(
+                f"[PROXY] dead session skipped {ProxyManager._mask_proxy(refreshed)}",
+                flush=True,
+            )
+            current = refreshed
         return False
 
     def _take_live_proxy(self, gid: str):
@@ -1905,6 +1923,8 @@ class LeaseWorker:
                 rebound = False
         if not rebound:
             return False
+        if not proxy_upstream_open(nxt):
+            return False
         self._arm_proxy(group, nxt)
         return True
 
@@ -1918,7 +1938,7 @@ class LeaseWorker:
             nxt = self.lanes.cool(str(group.gid))
             if not nxt:
                 return False
-            if proxy_tcp_open(nxt):
+            if proxy_upstream_open(nxt):
                 self._arm_proxy(group, nxt)
                 return True
             print(

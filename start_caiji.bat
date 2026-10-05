@@ -17,7 +17,8 @@ if not exist "%PYTHON_EXE%" (
 )
 
 REM 2. 设置穿云动态住宅代理与穿云 API 环境变量
-set "PROXY_TUNNEL=http://88940762-res_US:ypvmwawa@gw-res.cloudbypass.com:1288"
+REM 代理只从本机 config/runtime.env 读取，不要写进仓库。
+set "PROXY_TUNNEL="
 set "REDIS_HOST=127.0.0.1"
 set "REDIS_PORT=6379"
 set "TPS_REDIS_HOST=127.0.0.1"
@@ -28,7 +29,7 @@ set "TPS_DB_USER=root"
 set "TPS_DB_PASSWORD=tps123456"
 set "TPS_DB_NAME=people_search"
 set "CLOUDBYPASS_APIKEY=4de045d19fdc477f8abfc323a15c7f9e"
-set "CLOUDBYPASS_PROXY=http://88940762-res_US:ypvmwawa@gw-res.cloudbypass.com:1288"
+set "CLOUDBYPASS_PROXY="
 set "CLOUDBYPASS_SITEKEY=0x4AAAAAAAmywfqBst8n7ro5"
 set "USE_CLOUDBYPASS=1"
 set "TPS_RELEASE_MODE=standard"
