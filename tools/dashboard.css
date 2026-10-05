@@ -2887,3 +2887,17 @@ tbody tr.clickable:focus-visible {
         scroll-behavior: auto !important;
     }
 }
+
+/* ============================================================
+   挑战分型（tps:challenge 累计归因）
+   复用 panel / card-head / card-body / bar-list，仅补间距。
+   ============================================================ */
+.challenge-panel {
+    margin-bottom: 20px;
+}
+.challenge-list .bar {
+    cursor: default;
+}
+.challenge-list .bar-meta .muted {
+    font-weight: 400;
+}

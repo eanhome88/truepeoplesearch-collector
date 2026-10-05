@@ -252,6 +252,14 @@ class TestWorkerOwnCfPath(unittest.TestCase):
         self.assertEqual(len(CALLS), 1)
         self.assertEqual(len(self.gets), 2)
 
+    def test_site_captcha_does_not_resolve(self):
+        box = self._box()
+        self.responses = [(200, "<html>InternalCaptcha please verify</html>")]
+        with self.assertRaises(self.dw.HttpError) as ctx:
+            self._run(box)
+        self.assertEqual(getattr(ctx.exception, "cf_route", ""), "rotate_proxy")
+        self.assertEqual(len(CALLS), 1)
+
     def test_challenge_triggers_one_resolve_with_same_ua(self):
         box = self._box()
         self.responses = [

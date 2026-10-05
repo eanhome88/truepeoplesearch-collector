@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 import unittest
 from pathlib import Path
+
+os.environ["TPS_PROXY_PROBE"] = "0"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -17,6 +20,7 @@ from distributed_worker import (  # noqa: E402
     LeaseWorker,
     classify_error,
     plan_chrome_groups,
+    proxy_tcp_open,
     rate_limit_pause_sec,
 )
 from proxy_pool import StickyLanes  # noqa: E402
@@ -233,6 +237,54 @@ class TestRateLimitPause(unittest.TestCase):
         self.assertEqual(group.generation, 0)
         self.assertEqual(worker._pause_remaining_sec(), 0)
         self.assertGreater(group.claim_after, now)
+
+    def test_site_captcha_rotates_proxy_without_global_pause(self):
+        r = make_redis()
+        feed(r, [URL])
+        job = claim(r, "worker-rot")
+        lanes = StickyLanes(["http://10.0.0.1:8000", "http://10.0.0.2:8000"], rest_sec=4200)
+        worker = LeaseWorker(r, 1, 1000, 8.0, lanes=lanes)
+        group = worker.groups[0]
+        slot = worker.slots[0]
+        slot.job = job
+        slot.jid = job["id"]
+        worker.in_flight[job["id"]] = job
+        worker._on_done(slot, {
+            "slot": 0,
+            "kind": "done",
+            "id": job["id"],
+            "bucket": "rate_limit",
+            "cf_route": "rotate_proxy",
+            "cf_kind": "site_captcha",
+            "error": "rotate_proxy kind=site_captcha",
+            "generation": group.generation,
+            "person": job["person_id"],
+            "url": job["url"],
+        })
+        self.assertEqual(group.proxy, "http://10.0.0.2:8000")
+        self.assertEqual(worker._pause_remaining_sec(), 0)
+
+    def test_second_account_hops_off_fused_account(self):
+        r = make_redis()
+        lanes = StickyLanes([
+            "http://userA:pw@10.0.0.1:8000",
+            "http://userB:pw@10.0.0.2:8000",
+        ], rest_sec=4200)
+        worker = LeaseWorker(r, 1, 1000, 8.0, lanes=lanes)
+        group = worker.groups[0]
+        self.assertIn("userA", group.proxy)
+        self.assertTrue(worker._hop_account(group))
+        self.assertIn("userB", group.proxy)
+        self.assertEqual(worker._pause_remaining_sec(), 0)
+
+    def test_proxy_probe_skips_closed_port_when_enabled(self):
+        os.environ["TPS_PROXY_PROBE"] = "1"
+        try:
+            self.assertFalse(proxy_tcp_open("http://127.0.0.1:1", timeout=0.2))
+            os.environ["TPS_PROXY_PROBE"] = "0"
+            self.assertTrue(proxy_tcp_open("http://10.0.0.9:1", timeout=0.2))
+        finally:
+            os.environ["TPS_PROXY_PROBE"] = "0"
 
     def test_claim_gap_adaptive(self):
         import os

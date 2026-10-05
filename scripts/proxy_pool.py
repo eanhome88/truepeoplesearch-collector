@@ -382,6 +382,22 @@ class StickyLanes:
                 continue
         return len(hosts) <= 1
 
+    def rebind(self, holder: str, url: str) -> bool:
+        """把这个浏览器改绑到池内另一条出口。旧出口进入冷却；目标已被别人占用则不动。"""
+        with self._lock:
+            target = ProxyManager._normalize_proxy(url)
+            if not target or target not in self._rest_until:
+                return False
+            for other, bound in self._holder.items():
+                if bound == target and other != holder:
+                    return False
+            current = self._holder.get(holder)
+            if current and current != target:
+                self._rest_until[current] = time.time() + self.rest_sec
+            self._holder[holder] = target
+            self._rest_until[target] = 0.0
+            return True
+
     def holder_url(self, holder: str) -> Optional[str]:
         with self._lock:
             return self._holder.get(holder)

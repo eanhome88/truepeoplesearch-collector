@@ -587,6 +587,55 @@ function metricsQualityNotice(data) {
     return notes.length ? `<p class="field-hint" role="status">${esc(notes.join(' '))}</p>` : '';
 }
 
+const CHALLENGE_NAMES = {
+    clean: '正常通过',
+    turnstile: 'Turnstile 验证',
+    managed: '托管质询',
+    site_captcha: '站内验证码',
+    rate_limit: '访问限流',
+    ip_block: 'IP 封禁',
+    origin_fail: '源站异常',
+    empty_block: '空响应拦截',
+    timeout: '请求超时',
+    unknown_fail: '未知失败',
+};
+const CHALLENGE_ORDER = [
+    'clean', 'turnstile', 'managed', 'site_captcha', 'rate_limit',
+    'ip_block', 'origin_fail', 'empty_block', 'timeout', 'unknown_fail',
+];
+function challengeBreakdownMarkup(challenge) {
+    const known = challenge != null && typeof challenge === 'object';
+    const src = known ? challenge : {};
+    const rows = CHALLENGE_ORDER.map(kind => {
+        const raw = Number(src[kind]);
+        const count = known && Number.isFinite(raw) && raw > 0 ? raw : 0;
+        return { kind, label: CHALLENGE_NAMES[kind] || kind, count };
+    });
+    const total = rows.reduce((sum, r) => sum + r.count, 0);
+    const max = Math.max(...rows.map(r => r.count), 1);
+    const bars = rows.map(r => {
+        const p = r.count > 0 ? Math.max(r.count / max * 100, 3) : 0;
+        const share = total > 0 && r.count > 0
+            ? ` · ${(r.count / total * 100).toFixed(r.count / total * 100 < 10 ? 1 : 0)}%`
+            : '';
+        const val = known ? `${metricValue(r.count)}${share}` : '—';
+        return `<div class="bar" title="${esc(r.label)}">
+            <span class="bar-meta"><span class="name">${esc(r.label)} <span class="muted">· ${esc(r.kind)}</span></span><span class="val">${val}</span></span>
+            <span class="bar-track"><span class="bar-fill" style="--p:${p}%"></span></span>
+        </div>`;
+    }).join('');
+    const sub = known ? `累计拦截归因 · 共 ${metricValue(total)} 次` : '累计拦截归因 · 数据暂不可用';
+    const hint = !known
+        ? '挑战分型数据暂不可用。'
+        : (total ? '' : '暂无挑战分型数据，抓取遇到验证后将在此归因展示。');
+    return `<article class="panel challenge-panel">
+        <div class="card-head"><div><h3>挑战分型</h3><p>${sub}</p></div><span class="badge badge-accent">tps:challenge</span></div>
+        <div class="card-body"><div class="bar-list challenge-list">${bars}</div>
+        ${hint ? `<p class="muted" style="margin-top:10px">${hint}</p>` : ''}
+        </div>
+    </article>`;
+}
+
 async function loadOverview() {
     render(`
         ${pageHead('Overview', '数据概览与运行监控', '区分实际测量、历史计数与不可用数据')}
@@ -669,7 +718,9 @@ async function loadOverview() {
                 <article class="panel metric"><div class="metric-label">有效手机/座机号码（去重）</div><div class="metric-num">${metricValue(d.database_available === true ? d.phones : null)}</div></article>
                 <article class="panel metric"><div class="metric-label">邮箱地址</div><div class="metric-num">${metricValue(d.database_available === true ? d.emails : null)}</div></article>
                 <article class="panel metric"><div class="metric-label">居住地址</div><div class="metric-num">${metricValue(d.database_available === true ? d.prev_addr : null)}</div></article>
-            </section>`),
+            </section>
+
+            ${challengeBreakdownMarkup(d.challenge)}`),
         loadSection('cityChart', `${API}/api/cities`, data => renderBars((data || []).slice(0, 10), x => `${x.city || '未知'}, ${x.state || ''}`, true)),
         loadSection('overviewAges', `${API}/api/age-distribution`, data => renderBars(data, x => x.age_group)),
         loadSection('overviewRecent', `${API}/api/recent`, data => {

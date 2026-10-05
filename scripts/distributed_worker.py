@@ -193,11 +193,158 @@ HB_INTERVAL_SEC = 20
 RECOVER_INTERVAL_SEC = 15
 IDLE_LOG_SEC = 30
 try:
-    SESSION_RECYCLE_PAGES = int(os.environ.get("TPS_SESSION_RECYCLE", "120"))
-    if SESSION_RECYCLE_PAGES < 20:
-        SESSION_RECYCLE_PAGES = 20
+    _dlo, _dhi = (8, 15)
+    _raw_recycle = (os.environ.get("TPS_SESSION_RECYCLE") or "").strip()
+    if _raw_recycle:
+        if "," in _raw_recycle:
+            _lo_s, _, _hi_s = _raw_recycle.partition(",")
+            _dlo, _dhi = int(_lo_s or 8), int(_hi_s or _lo_s or 15)
+        else:
+            _dlo = _dhi = int(_raw_recycle)
+    _dlo, _dhi = max(2, _dlo), max(2, _dhi)
+    if _dhi < _dlo:
+        _dlo, _dhi = _dhi, _dlo
+    SESSION_RECYCLE_PAGES = _dhi
+    if SESSION_RECYCLE_PAGES < 2:
+        SESSION_RECYCLE_PAGES = 2
 except (TypeError, ValueError):
-    SESSION_RECYCLE_PAGES = 120
+    SESSION_RECYCLE_PAGES = 15
+
+
+def _parse_session_recycle_range() -> tuple:
+    """TPS_SESSION_RECYCLE 未配默认 (8,15)；支持 "8,15" 或单个整数。"""
+    raw = (os.environ.get("TPS_SESSION_RECYCLE") or "").strip()
+    if not raw:
+        return (8, 15)
+    try:
+        if "," in raw:
+            lo_s, _, hi_s = raw.partition(",")
+            lo, hi = int(lo_s.strip() or 8), int(hi_s.strip() or lo_s.strip() or 15)
+        else:
+            lo = hi = int(raw)
+    except (TypeError, ValueError):
+        return (8, 15)
+    lo, hi = max(2, lo), max(2, hi)
+    if hi < lo:
+        lo, hi = hi, lo
+    return (lo, min(hi, 120))
+
+
+def draw_session_recycle_limit() -> int:
+    """每个会话独立抽一个复用上限，默认 8~15 页。"""
+    lo, hi = _parse_session_recycle_range()
+    try:
+        return random.randint(lo, hi)
+    except (TypeError, ValueError):
+        return 15
+
+
+def _parse_page_gap_sec() -> tuple:
+    """TPS_PAGE_GAP_SEC="6,8" -> (6.0, 8.0)。配 "0,0" 关闭。"""
+    raw = (os.environ.get("TPS_PAGE_GAP_SEC") or "6,8").strip()
+    try:
+        lo_s, _, hi_s = raw.partition(",")
+        lo, hi = float(lo_s.strip() or 6), float(hi_s.strip() or lo_s.strip() or 8)
+    except (TypeError, ValueError):
+        return (6.0, 8.0)
+    lo, hi = max(0.0, lo), max(0.0, hi)
+    if hi < lo:
+        lo, hi = hi, lo
+    return (min(lo, 120.0), min(hi, 120.0))
+
+
+def page_gap_sec() -> float:
+    """页间隔：默认 6~8s 均匀随机（含秒级抖动），不再是 200~800ms。"""
+    lo, hi = _parse_page_gap_sec()
+    if hi <= 0:
+        return 0.0
+    try:
+        return random.uniform(lo, hi)
+    except (TypeError, ValueError):
+        return 6.0
+
+
+_ACCEPT_LANGUAGE_POOL = (
+    "en-US,en;q=0.9",
+    "en-US,en;q=0.9,es-US;q=0.8",
+    "en-US,en;q=0.8,es-US;q=0.7",
+)
+
+
+def pick_accept_language() -> str:
+    """每页轮换一条 accept-language，与 en-US 会话 locale 保持一致。"""
+    try:
+        return random.choice(_ACCEPT_LANGUAGE_POOL)
+    except Exception:
+        return _ACCEPT_LANGUAGE_POOL[0]
+
+
+def build_page_headers(url: str = "", user_agent: str = "") -> dict:
+    """协议请求头：每调用一次轮换 referer/accept-language，补齐浏览器一致头。"""
+    ua = (user_agent or "").strip() or DEFAULT_USER_AGENT
+    try:
+        ref = _scrape_mod.pick_referer(url or "")
+    except Exception:
+        ref = ""
+    ref = ref or "https://www.truepeoplesearch.com/"
+    lang = pick_accept_language()
+    if "truepeoplesearch.com" in (ref or ""):
+        site = "same-origin"
+    elif ref:
+        site = "cross-site"
+    else:
+        site = "none"
+    major = _chrome_major(ua)
+    try:
+        _int_major = int(major)
+    except (TypeError, ValueError):
+        _int_major = 124
+    return {
+        "user-agent": ua,
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "accept-language": lang,
+        "referer": ref,
+        "upgrade-insecure-requests": "1",
+        "sec-fetch-site": site,
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-user": "?1",
+        "sec-fetch-dest": "document",
+        "sec-ch-ua": f'"Chromium";v="{_int_major}", "Google Chrome";v="{_int_major}", "Not-A.Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+    }
+
+
+def _lane_of(box) -> str:
+    return str(getattr(box, "_lane_id", None) or getattr(box, "lane_id", None) or "0")
+
+
+def _worker_guard(box):
+    guard = getattr(box, "_guard", None)
+    if guard is not None:
+        return guard
+    try:
+        from egress_guard import default_guard as _default_guard
+        return _default_guard()
+    except Exception:
+        return None
+
+
+async def _check_egress_moved(box) -> bool:
+    """复用会话前探一次出口；探测失败/无代理一律放行 False。"""
+    try:
+        proxy = (getattr(box, "proxy", None) or "").strip()
+    except Exception:
+        return False
+    if not proxy or getattr(box, "session", None) is None:
+        return False
+    guard = _worker_guard(box)
+    if guard is None:
+        return False
+    try:
+        return bool(await asyncio.to_thread(guard.check_lane, _lane_of(box), proxy))
+    except Exception:
+        return False
 SHUTDOWN_WAIT_SEC = 6
 # 自研过 CF：不开浏览器，凭证来自 TPS_CF_SOLVER，请求走 curl_cffi 同代理同指纹。
 OWN_CF_BYPASS = os.environ.get("TPS_OWN_CF", "0") == "1"
@@ -298,6 +445,37 @@ def rate_limit_pause_sec(streak: int) -> int:
     steps = RATE_LIMIT_PAUSE_STEPS_SEC
     idx = min(max(int(streak), 1), len(steps)) - 1
     return steps[idx]
+
+
+def proxy_tcp_open(proxy: str, timeout: float = 0.4) -> bool:
+    """分配前对代理 host:port 做一次短 TCP 连接。连不上就是哑行。
+
+    直连（空代理）视为可用。TPS_PROXY_PROBE=0 时跳过，单测里的假地址不会被误杀。
+    """
+    raw = (proxy or "").strip()
+    if not raw:
+        return True
+    flag = (os.environ.get("TPS_PROXY_PROBE", "1") or "1").strip().lower()
+    if flag in ("0", "false", "no", "off"):
+        return True
+    try:
+        limit = float(timeout)
+    except (TypeError, ValueError):
+        limit = 0.4
+    limit = min(2.0, max(0.05, limit))
+    try:
+        parts = urlparse(raw if "://" in raw else "http://" + raw)
+        host = parts.hostname
+        port = parts.port or (443 if (parts.scheme or "").lower() == "https" else 80)
+    except Exception:
+        return False
+    if not host or not port:
+        return False
+    try:
+        with socket.create_connection((host, int(port)), timeout=limit):
+            return True
+    except Exception:
+        return False
 
 
 def _proxy_username(proxy: str) -> str:
@@ -620,7 +798,7 @@ def _queue_get(q):
         return _QUEUE_TIMEOUT
 
 
-def browser_group_main(slot_ids: list, queues: list, out_q, proxy=None, generation: int = 0) -> None:
+def browser_group_main(slot_ids: list, queues: list, out_q, proxy=None, generation: int = 0, lane_id=None) -> None:
     """One Chrome process, several tabs. Playwright stays inside this process."""
     try:
         if hasattr(os, "setsid"):
@@ -629,7 +807,7 @@ def browser_group_main(slot_ids: list, queues: list, out_q, proxy=None, generati
         pass
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
-        asyncio.run(_browser_group(slot_ids, queues, out_q, proxy, generation))
+        asyncio.run(_browser_group(slot_ids, queues, out_q, proxy, generation, lane_id))
     except Exception as exc:
         for slot in slot_ids:
             try:
@@ -638,8 +816,8 @@ def browser_group_main(slot_ids: list, queues: list, out_q, proxy=None, generati
                 pass
 
 
-async def _browser_group(slot_ids: list, queues: list, out_q, proxy=None, generation: int = 0) -> None:
-    box = _ChromeBox(len(slot_ids), proxy=proxy, generation=generation)
+async def _browser_group(slot_ids: list, queues: list, out_q, proxy=None, generation: int = 0, lane_id=None) -> None:
+    box = _ChromeBox(len(slot_ids), proxy=proxy, generation=generation, lane_id=lane_id)
     try:
         await asyncio.gather(*[
             _tab_loop(slot, queue, box, out_q)
@@ -650,7 +828,7 @@ async def _browser_group(slot_ids: list, queues: list, out_q, proxy=None, genera
 
 
 class _ChromeBox:
-    def __init__(self, tabs: int, proxy=None, generation: int = 0):
+    def __init__(self, tabs: int, proxy=None, generation: int = 0, lane_id=None, egress_guard=None, recycle_at=None):
         self.tabs = max(1, int(tabs))
         self.proxy = proxy or None
         self.generation = int(generation)
@@ -660,6 +838,12 @@ class _ChromeBox:
         self.served = 0
         self.gate = asyncio.Lock()
         self.db_lock = asyncio.Lock()
+        self._lane_id = str(lane_id) if lane_id is not None else "0"
+        self._guard = egress_guard
+        try:
+            self.recycle_at = max(2, int(recycle_at)) if recycle_at else draw_session_recycle_limit()
+        except (TypeError, ValueError):
+            self.recycle_at = 15
 
     async def close(self) -> None:
         session = self.session
@@ -677,11 +861,22 @@ class _ChromeBox:
                 pass
             self.db = None
 
-    async def ensure_session(self):
-        if self.session is not None and self.served >= SESSION_RECYCLE_PAGES:
-            await self.close()
-            self.served = 0
+    async def ensure_session(self, lane_id=None, opener=None):
+        if lane_id is not None:
+            self._lane_id = str(lane_id)
+        if self.session is not None:
+            if await _check_egress_moved(self):
+                await self.close()
+                self.served = 0
+                self.recycle_at = draw_session_recycle_limit()
+            elif self.served >= max(2, int(self.recycle_at or 8)):
+                await self.close()
+                self.served = 0
+                self.recycle_at = draw_session_recycle_limit()
         if self.session is None:
+            if opener is not None:
+                self.session = await opener()
+                return self.session
             label = ProxyManager._mask_proxy(self.proxy) if self.proxy else "direct"
             if OWN_CF_BYPASS:
                 solver = _own_cf_solver()
@@ -720,6 +915,11 @@ class _OwnCfSession:
         self.pending_html: dict = {}
         self.solves = 0
         self.impersonate = ""
+        self.expires_at: float = 0.0
+
+    @property
+    def expired(self) -> bool:
+        return bool(self.expires_at) and time.time() >= self.expires_at
 
     async def open(self, url: str) -> None:
         solution = await self.solver.solve(url, proxy=self.proxy, user_agent=None)
@@ -745,8 +945,14 @@ class _OwnCfSession:
             except Exception:
                 pass
         if solution.html:
+            if url not in self.pending_html and len(self.pending_html) >= 32:
+                self.pending_html.pop(next(iter(self.pending_html)), None)
             self.pending_html[url] = solution.html
         self.solves += 1
+        try:
+            self.expires_at = float(solution.solved_at) + float(solution.ttl)
+        except (TypeError, ValueError, AttributeError):
+            self.expires_at = time.time() + 1500.0
         label = ProxyManager._mask_proxy(self.proxy) if self.proxy else "direct"
         print(
             f"[OWN_CF] clearance #{self.solves} cookies={len(solution.cookies)} "
@@ -763,19 +969,21 @@ class _OwnCfSession:
             kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
         return AsyncSession(**kwargs)
 
+    @staticmethod
+    def _referer_for(url: str) -> str:
+        try:
+            ref = _scrape_mod.pick_referer(url)
+        except Exception:
+            ref = ""
+        return ref or "https://www.truepeoplesearch.com/"
+
     async def get(self, url: str) -> tuple:
         html = self.pending_html.pop(url, None)
         if html is not None:
             return 200, html
         if self.client is None:
             raise RuntimeError("own-cf session has no client; call open() first")
-        headers = {
-            "user-agent": self.user_agent or DEFAULT_USER_AGENT,
-            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "accept-language": "en-US,en;q=0.9",
-            "referer": "https://www.google.com/",
-            "upgrade-insecure-requests": "1",
-        }
+        headers = build_page_headers(url, self.user_agent)
         if self.cookies:
             headers["cookie"] = "; ".join(f"{k}={v}" for k, v in self.cookies.items() if k)
         resp = await self.client.get(
@@ -823,6 +1031,18 @@ async def _fetch_page_own_cf(box: _ChromeBox, url: str):
     for attempt in (1, 2):
         generation = session.solves
         try:
+            try:
+                from egress_guard import expire_own_cf_session_if_egress_moved as _expire_own_cf
+                _eg = getattr(box, "_guard", None)
+                if _eg is None:
+                    try:
+                        from egress_guard import default_guard as _dg
+                        _eg = _dg()
+                    except Exception:
+                        _eg = None
+                await asyncio.to_thread(_expire_own_cf, _lane_of(box), session.proxy or "", session, _eg)
+            except Exception:
+                pass
             status, body = await session.get(url)
         except Exception as exc:
             msg = str(exc).lower()
@@ -833,13 +1053,38 @@ async def _fetch_page_own_cf(box: _ChromeBox, url: str):
             raise HttpError(429, f"HTTP 429 for {url}")
         if status in (404, 410):
             return html_page(body, status, url)
-        challenged = status in (403, 503) or is_challenge_html(body)
-        if challenged and cf_challenge is not None:
+        challenged = status in (403, 503) or is_challenge_html(body) or session.expired
+        _kind = ""
+        _resolve = True
+        if challenged:
             try:
-                _kind = cf_challenge.classify(url=url, html=body, status=status)
-                print(f"[OWN_CF] kind={_kind} route={cf_challenge.first_action(_kind)} (HTTP {status})", flush=True)
+                from cf_solver import classify_for_fastpath, should_resolve_challenge
+                _kind = classify_for_fastpath(url=url, html=body, status=status)
+                _resolve = should_resolve_challenge(kind=_kind) if _kind else should_resolve_challenge(
+                    url=url, html=body, status=status,
+                )
             except Exception:
-                pass
+                _kind = ""
+                _resolve = True
+            if cf_challenge is not None:
+                try:
+                    _obs = cf_challenge.classify(url=url, html=body, status=status)
+                    _kind = _kind or _obs
+                    print(
+                        f"[OWN_CF] kind={_kind} route={cf_challenge.first_action(_obs)} (HTTP {status})",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+            if not _resolve:
+                err = HttpError(
+                    status or 403,
+                    f"rotate_proxy kind={_kind or 'unknown'} for {url}",
+                    bucket="rate_limit",
+                )
+                err.cf_kind = _kind or "site_captcha"
+                err.cf_route = "rotate_proxy"
+                raise err
         if status == 200 and not challenged:
             return html_page(body, status, url)
         if not challenged:
@@ -878,19 +1123,17 @@ async def _tab_loop(slot: int, queue, box: _ChromeBox, out_q) -> None:
         )
 
 
-async def _tab_job(slot: int, box: _ChromeBox, job: dict) -> dict:
+async def _tab_job(slot: int, box: _ChromeBox, job: dict, sleep_fn=None) -> dict:
     url = job_url(job)
     jid = job_id(job)
     person = job.get("person_id") or (extract_person_id(url) if url else "")
     t0 = time.monotonic()
-    # 反锁步抖动：32 个 tab 同时起抓是明显的机器节拍，加 slight 随机错峰。
-    # TPS_FETCH_JITTER_MS="200,800" 默认；"0,0" 关闭。
-    try:
-        _jlo, _jhi = _scrape_mod.parse_jitter_ms()
-    except Exception:
-        _jlo, _jhi = (0, 0)
-    if _jhi > 0:
-        await asyncio.sleep(random.uniform(_jlo, _jhi) / 1000.0)
+    # 行为节奏：clearance 只复用 2 页就撞站内 InternalCaptcha，200~800ms 错峰不够。
+    # 页间隔拉到 6~8s 均匀随机（含秒级抖动）；TPS_PAGE_GAP_SEC="0,0" 关闭（单测用）。
+    gap = page_gap_sec()
+    if gap > 0:
+        _sleep = sleep_fn or asyncio.sleep
+        await _sleep(gap)
 
     def done(bucket: str, error, served_ok: bool, page=None, extra=None) -> dict:
         final_url = _captcha_final_url(page, url)
@@ -964,7 +1207,11 @@ async def _tab_job(slot: int, box: _ChromeBox, job: dict) -> dict:
             page = fetched
             last_error = _short_err(exc)
             last_bucket = classify_error(exc, url=url, page=page)
-            last_kind, last_route = _cf_kind(exc, page)
+            if getattr(exc, "cf_route", None):
+                last_kind = str(getattr(exc, "cf_kind", "") or "")
+                last_route = str(exc.cf_route)
+            else:
+                last_kind, last_route = _cf_kind(exc, page)
             empty_page = "empty" in last_error.lower() and "page" in last_error.lower()
             captcha = _has_captcha(exc, last_error, url) or _looks_like_captcha(
                 page, url, include_visible=(last_bucket == "empty" or empty_page),
@@ -1028,15 +1275,20 @@ async def _fetch_page(box: _ChromeBox, url: str):
             print(f"[CLOUDBYPASS] fallback: {e}", flush=True)
 
     if box.warm and box.session is not None:
+        async with box.gate:
+            await box.ensure_session()
+            session = box.session
+        if session is None:
+            session = await box.ensure_session()
         try:
-            page = await fetch_document(box.session, url)
+            page = await fetch_document(session, url)
         except Exception:
             print("[PROTO] protocol fetch failed; using rendered page", flush=True)
             page = None
         if page is not None:
             return page
         print("[PROTO] rendering page", flush=True)
-        return await fetch_in_async_session(box.session, url)
+        return await fetch_in_async_session(session, url)
     async with box.gate:
         session = await box.ensure_session()
         if box.warm and box.session is not None:
@@ -1083,6 +1335,7 @@ class _ChromeGroup:
                 out_q,
                 self.proxy,
                 self.generation,
+                str(self.gid),
             ),
             name=f"tps-chrome-{self.gid}",
             daemon=False,
@@ -1136,7 +1389,7 @@ class LeaseWorker:
         for gid, size in enumerate(sizes):
             group = _ChromeGroup(gid, self.slots[start:start + size], self.ctx)
             if self.lanes is not None:
-                group.proxy = self.lanes.checkout(str(gid))
+                group.proxy = self._take_live_proxy(str(gid))
                 self._proxy_born[gid] = opened
             groups.append(group)
             start += size
@@ -1152,6 +1405,15 @@ class LeaseWorker:
             self._lanes_shared_host = bool(lanes.shared_host) if lanes is not None else True
         except Exception:
             self._lanes_shared_host = True
+        self.accounts = None
+        if self.lanes is not None:
+            try:
+                from account_lanes import AccountLanes
+                urls = list(getattr(self.lanes, "_urls", []) or [])
+                if urls:
+                    self.accounts = AccountLanes(urls)
+            except Exception:
+                self.accounts = None
 
     def _on_signal(self, signum, _frame) -> None:
         name = signal.Signals(signum).name
@@ -1446,7 +1708,14 @@ class LeaseWorker:
         now = time.monotonic()
         self._consec_success = 0
         label = ProxyManager._mask_proxy(group.proxy) if group.proxy else "direct"
-        if _has_captcha(error, url):
+        if str(msg.get("cf_route") or "") == "rotate_proxy":
+            self._switch_ip(group)
+            label = ProxyManager._mask_proxy(group.proxy) if group.proxy else "direct"
+            print(
+                f"  [rotate_proxy] chrome={group.gid} 站内验证码换出口，不重解: {label}",
+                flush=True,
+            )
+        elif _has_captcha(error, url):
             group.consecutive_rate_limits += 1
             if group.consecutive_rate_limits >= 2:
                 self._arm_proxy(group, group.proxy)
@@ -1490,11 +1759,19 @@ class LeaseWorker:
                     flush=True,
                 )
             elif self._is_dynamic_group(group):
-                pause = self._note_account_limit()
-                print(
-                    f"  [rate_limit] 槽位 chrome={group.gid} 动态网关账号暂停 {pause}s: {label}",
-                    flush=True,
-                )
+                hopped = self._hop_account(group)
+                if hopped:
+                    label = ProxyManager._mask_proxy(group.proxy) if group.proxy else "direct"
+                    print(
+                        f"  [account_hop] chrome={group.gid} 当前账号熔断，换到另一账号出口: {label}",
+                        flush=True,
+                    )
+                else:
+                    pause = self._note_account_limit()
+                    print(
+                        f"  [rate_limit] 槽位 chrome={group.gid} 动态网关账号暂停 {pause}s: {label}",
+                        flush=True,
+                    )
             elif self.lanes is not None and self.lanes.count > 1:
                 try:
                     soonest = float(self.lanes.seconds_until_ready())
@@ -1549,16 +1826,75 @@ class LeaseWorker:
             return True
         return False
 
+    def _take_live_proxy(self, gid: str):
+        """领一条代理；TCP 探不通就冷却并换下一条。全灭时仍交还原绑定，避免组上空代理。"""
+        if self.lanes is None:
+            return None
+        url = self.lanes.checkout(str(gid))
+        tries = max(1, int(getattr(self.lanes, "count", 1) or 1))
+        for _ in range(tries):
+            if not url:
+                break
+            if proxy_tcp_open(url):
+                return url
+            print(
+                f"[PROXY] dead lane skipped {ProxyManager._mask_proxy(url)}",
+                flush=True,
+            )
+            nxt = self.lanes.cool(str(gid))
+            if not nxt:
+                return self.lanes.holder_url(str(gid)) or url
+            url = nxt
+        return url
+
+    def _hop_account(self, group: _ChromeGroup) -> bool:
+        """池里有第二个网关账号时，熔断当前账号并改绑另一账号的出口。单账号返回 False。"""
+        accounts = getattr(self, "accounts", None)
+        lanes = self.lanes
+        if accounts is None or lanes is None:
+            return False
+        try:
+            names = list(accounts.accounts)
+        except Exception:
+            return False
+        if len(names) < 2:
+            return False
+        accounts.report_429(group.proxy or "")
+        nxt = accounts.checkout(str(group.gid))
+        if not nxt or nxt == (group.proxy or ""):
+            return False
+        if accounts.is_fused(accounts.account_of(nxt)):
+            return False
+        rebound = False
+        rebind = getattr(lanes, "rebind", None)
+        if callable(rebind):
+            try:
+                rebound = bool(rebind(str(group.gid), nxt))
+            except Exception:
+                rebound = False
+        if not rebound:
+            return False
+        self._arm_proxy(group, nxt)
+        return True
+
     def _switch_ip(self, group: _ChromeGroup, region_checked: bool = False) -> bool:
         if not region_checked and self._rotate_region_gateway(group):
             return True
         if self.lanes is None:
             return False
-        nxt = self.lanes.cool(str(group.gid))
-        if not nxt:
-            return False
-        self._arm_proxy(group, nxt)
-        return True
+        tries = max(1, int(getattr(self.lanes, "count", 1) or 1))
+        for _ in range(tries):
+            nxt = self.lanes.cool(str(group.gid))
+            if not nxt:
+                return False
+            if proxy_tcp_open(nxt):
+                self._arm_proxy(group, nxt)
+                return True
+            print(
+                f"[PROXY] dead lane skipped {ProxyManager._mask_proxy(nxt)}",
+                flush=True,
+            )
+        return False
 
     def _claim_one(self) -> None:
         if self.stop.is_set() or not self.idle:

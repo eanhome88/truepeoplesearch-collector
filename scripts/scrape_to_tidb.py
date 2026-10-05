@@ -117,6 +117,43 @@ def is_captcha_document(url: str, html: str) -> bool:
     return any(marker in blob for marker in _CAPTCHA_MARKERS)
 
 
+def is_dead_person_shell(html: str) -> bool:
+    """约 67–70KB、且没有人物标记的正文，是固定 404 壳，不当人物页解析。
+
+    长度按响应正文字符数（与验活时 len(html) 同一口径）。
+    带 Current Address / Lives in 的同体积页仍当活人页。
+    """
+    raw = html or ""
+    n = len(raw)
+    if n < 67_000 or n > 70_000:
+        return False
+    low = raw.lower()
+    if "current address" in low or "lives in" in low:
+        return False
+    return True
+
+
+def _is_not_found_document(title: str, text: str, status=None) -> bool:
+    """404/410 空页判定：状态码命中，或标题/正文命中 404/not found 信号。
+
+    正文不用裸 "404" 匹配，避免误伤 404 区号电话正文。
+    """
+    try:
+        if status is not None and int(status) in (404, 410):
+            return True
+    except (TypeError, ValueError):
+        pass
+    low_title = (title or "").lower()
+    if re.search(r"\b404\b", low_title) or "not found" in low_title:
+        return True
+    low_text = (text or "").lower()
+    if "not found" in low_text:
+        return True
+    if re.search(r"error\s*404|404\s*error", low_text):
+        return True
+    return False
+
+
 class FetchTimeoutError(ScrapeError):
     """浏览器/Cloudflare 等待超时。"""
 
@@ -478,6 +515,13 @@ def parse_person(page, url: str) -> dict:
     title = page.css("title::text").get() if hasattr(page, "css") else ""
     title = title or ""
     if is_captcha_document(url, text or title) or is_captcha_document(url, title):
+        return data
+    if _is_not_found_document(title, text, getattr(page, "status", None)):
+        return data
+    raw_html = getattr(page, "html", None)
+    if not isinstance(raw_html, str):
+        raw_html = ""
+    if is_dead_person_shell(raw_html):
         return data
 
     name_match = re.match(r"^([^,]+)", title)
@@ -1142,9 +1186,10 @@ _CHALLENGE_MARKERS = (
 class HtmlPage:
     """协议响应：只有 HTML 正文，接口与浏览器页一致，供 parse_person 使用。"""
 
-    def __init__(self, selector, status: int):
+    def __init__(self, selector, status: int, html: str = ""):
         self._selector = selector
         self.status = status
+        self.html = html or ""
 
     def get_all_text(self, *args, **kwargs):
         return self._selector.get_all_text(*args, **kwargs)
@@ -1163,7 +1208,7 @@ def is_challenge_html(html: str) -> bool:
 def html_page(html: str, status: int, url: str) -> HtmlPage:
     from scrapling.parser import Selector
 
-    return HtmlPage(Selector(html or "", url=url), int(status))
+    return HtmlPage(Selector(html or "", url=url), int(status), html or "")
 
 
 async def fetch_document(session, url: str):
