@@ -354,6 +354,8 @@ OWN_CF_BYPASS = os.environ.get("TPS_OWN_CF", "0") == "1"
 FP_REST_SEC = float(os.environ.get("TPS_FP_REST_SEC", "45"))
 # 换到备用出口后本组热身秒数。
 LANE_WARM_SEC = float(os.environ.get("TPS_LANE_WARM_SEC", "15"))
+# 池子可以有 1000 条，领和换的时候最多探这么多条，避免启动被探活拖死。
+MAX_PROXY_HOPS = 20
 # 固定出口 429：5 / 15 / 45 分钟。换 IP 不能缩短这段。
 RATE_LIMIT_PAUSE_STEPS_SEC = (300, 900, 2700)
 # 动态住宅（穿云箭等）429 是账号总量，不是单个 IP。换出口，但全账号短暂停：
@@ -1880,7 +1882,7 @@ class LeaseWorker:
         if self.lanes is None:
             return None
         url = self.lanes.checkout(str(gid))
-        tries = max(1, int(getattr(self.lanes, "count", 1) or 1))
+        tries = _proxy_hop_budget_for(getattr(self.lanes, "count", 1))
         for _ in range(tries):
             if not url:
                 break
@@ -1933,7 +1935,7 @@ class LeaseWorker:
             return True
         if self.lanes is None:
             return False
-        tries = max(1, int(getattr(self.lanes, "count", 1) or 1))
+        tries = _proxy_hop_budget_for(getattr(self.lanes, "count", 1))
         for _ in range(tries):
             nxt = self.lanes.cool(str(group.gid))
             if not nxt:
@@ -2391,6 +2393,23 @@ def _load_proxy_api_cache() -> list:
     return [line.strip() for line in lines if line.strip()]
 
 
+def sticky_pool_size(concurrency: int = 2) -> int:
+    """隧道要备多少条粘性 IP。默认 1000，同时开工的仍是并发数，不是这 1000 条一起开。"""
+    raw = (os.environ.get("TPS_STICKY_POOL") or "1000").strip()
+    try:
+        size = int(raw)
+    except (TypeError, ValueError):
+        size = 1000
+    floor = max(2, int(concurrency or 2))
+    if size <= 0:
+        return floor
+    return max(floor, size)
+
+
+def _proxy_hop_budget_for(count: int) -> int:
+    return max(1, min(MAX_PROXY_HOPS, int(count or 1)))
+
+
 def load_worker_lanes(proxy_file: str = None, concurrency: int = 2, proxy_tunnel: str = None, proxy_api_url: str = None):
     """粘性 IP 来自代理文件或隧道网关拆分。"""
     from proxy_pool import IP_REST_SEC as _DEFAULT_IP_REST
@@ -2431,11 +2450,11 @@ def load_worker_lanes(proxy_file: str = None, concurrency: int = 2, proxy_tunnel
         return lanes
     tunnel = proxy_tunnel or os.environ.get("PROXY_TUNNEL")
     if tunnel:
-        lane_count = max(2, int(concurrency or 2))
+        lane_count = sticky_pool_size(concurrency)
         lanes = tunnel_sticky_lanes(tunnel, count=lane_count, rest_sec=rest_sec)
         if lanes is not None:
             print(
-                f"[PROXY] sticky tunnel lanes={lanes.count} rest={int(lanes.rest_sec)}s",
+                f"[PROXY] sticky tunnel pool={lanes.count} concurrency={int(concurrency or 0)} rest={int(lanes.rest_sec)}s",
                 flush=True,
             )
             return lanes
@@ -2446,11 +2465,11 @@ def load_worker_lanes(proxy_file: str = None, concurrency: int = 2, proxy_tunnel
         return None
     mode = (cfg.get("mode") or "direct").lower()
     if mode == "tunnel" and cfg.get("tunnel"):
-        lane_count = max(2, int(concurrency or 2))
+        lane_count = sticky_pool_size(concurrency)
         lanes = tunnel_sticky_lanes(cfg["tunnel"], count=lane_count, rest_sec=rest_sec)
         if lanes is not None:
             print(
-                f"[PROXY] sticky tunnel lanes={lanes.count} rest={int(lanes.rest_sec)}s",
+                f"[PROXY] sticky tunnel pool={lanes.count} concurrency={int(concurrency or 0)} rest={int(lanes.rest_sec)}s",
                 flush=True,
             )
             return lanes

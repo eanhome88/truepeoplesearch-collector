@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from distributed_worker import load_worker_lanes, plan_chrome_groups, sticky_pool_size  # noqa: E402
 from proxy_pool import StickyLanes, sticky_gateway_url, sticky_lanes_from_config  # noqa: E402
 from test_tps_queue import make_redis  # noqa: E402
 
@@ -64,6 +67,36 @@ class TestStickyLanes(unittest.TestCase):
             "mode": "tunnel",
             "tunnel": "http://user:secret@gate.example:8000",
         }))
+
+
+class TestStickyPool(unittest.TestCase):
+    def test_default_pool_is_1000_and_groups_follow_concurrency(self):
+        os.environ.pop("TPS_STICKY_POOL", None)
+        self.assertEqual(sticky_pool_size(4), 1000)
+        lanes = load_worker_lanes(
+            proxy_tunnel="http://user-res_US:secret@gw-res.cloudbypass.com:1288",
+            concurrency=4,
+        )
+        self.assertEqual(lanes.count, 1000)
+        self.assertEqual(len(set(lanes._urls)), 1000)
+        self.assertEqual(len(plan_chrome_groups(4, lanes.count)), 4)
+
+    def test_pool_env_can_shrink(self):
+        os.environ["TPS_STICKY_POOL"] = "6"
+        try:
+            self.assertEqual(sticky_pool_size(4), 6)
+        finally:
+            os.environ.pop("TPS_STICKY_POOL", None)
+
+    def test_proxy_file_keeps_every_line(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as handle:
+            handle.write("http://10.0.0.1:8000\nhttp://10.0.0.2:8000\nhttp://10.0.0.3:8000\n")
+            path = handle.name
+        try:
+            lanes = load_worker_lanes(proxy_file=path, concurrency=2)
+        finally:
+            os.unlink(path)
+        self.assertEqual(lanes.count, 3)
 
 
 if __name__ == "__main__":
