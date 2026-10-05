@@ -38,10 +38,13 @@ class RefererTests(unittest.TestCase):
         self.assertLess(sum(1 for r in refs if r == "https://www.google.com/"), 600)
 
     def test_fetch_kwargs_per_request_referer(self):
-        os.environ.pop("TPS_REFERER_MODE", None)
-        kw = s.fetch_kwargs("https://www.truepeoplesearch.com/find/person/x")
-        self.assertFalse(kw.get("google_search"))
-        self.assertIn("referer", (kw.get("extra_headers") or {}))
+        os.environ["TPS_REFERER_MODE"] = "google"
+        try:
+            kw = s.fetch_kwargs("https://www.truepeoplesearch.com/find/person/x")
+            self.assertFalse(kw.get("google_search"))
+            self.assertIn("referer", (kw.get("extra_headers") or {}))
+        finally:
+            os.environ.pop("TPS_REFERER_MODE", None)
 
 
 class SessionProfileTests(unittest.TestCase):

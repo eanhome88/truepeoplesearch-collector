@@ -318,6 +318,7 @@ class TestTpsControl(unittest.TestCase):
                     "script": str(tps_control.SCRIPTS / "multi_worker_runner.py"),
                     "session_id": 42, "group_id": 42}
         with mock.patch.object(tps_control, "find_cluster_pids", return_value=[]), \
+                mock.patch.object(tps_control, "find_role_pids", return_value=[]), \
                 mock.patch.object(tps_control, "_start_process", side_effect=fake_launch), \
                 mock.patch.object(tps_control, "_process_identity", return_value=(object(), identity)):
             tps_control.start_cluster(FakeRedis(), proxy_tunnel=secret)

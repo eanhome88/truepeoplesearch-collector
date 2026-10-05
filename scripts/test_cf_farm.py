@@ -536,9 +536,9 @@ class LaneConcurrencyTests(unittest.TestCase):
         drained = 0
         while sem.acquire(blocking=False):  # 占满全部建浏览器许可
             drained += 1
-        try:
-            with mock.patch.object(farm, "_new_session",
-                                   side_effect=lambda p: FakeSession()):
+        with mock.patch.object(farm, "_new_session",
+                               side_effect=lambda p: FakeSession()):
+            try:
                 done: list = []
                 th = _REAL_THREAD(
                     target=lambda: done.append(
@@ -552,11 +552,11 @@ class LaneConcurrencyTests(unittest.TestCase):
                 self.assertLess(time.monotonic() - t0, 5)
                 self.assertEqual(done, [])  # 工作线程仍在等信号量
                 self.assertTrue(th.is_alive())
-        finally:
-            for _ in range(drained):
-                sem.release()
-        th.join(timeout=10)
-        self.assertEqual(len(done), 1)
+            finally:
+                for _ in range(drained):
+                    sem.release()
+                th.join(timeout=10)
+            self.assertEqual(len(done), 1)
 
 
 class LoopIsolationTests(unittest.TestCase):
