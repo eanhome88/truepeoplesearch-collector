@@ -276,6 +276,33 @@ class TestRateLimitPause(unittest.TestCase):
         self.assertEqual(worker._pause_remaining_sec(), 0)
         self.assertGreater(group.claim_after, now)
 
+    def test_dead_exit_switches_ip_and_requeues(self):
+        r = make_redis()
+        feed(r, [URL])
+        job = claim(r, "worker-dead")
+        lanes = StickyLanes(["http://10.0.0.1:8000", "http://10.0.0.2:8000"], rest_sec=4200)
+        worker = LeaseWorker(r, 1, 1000, 8.0, lanes=lanes)
+        group = worker.groups[0]
+        slot = worker.slots[0]
+        slot.job = job
+        slot.jid = job["id"]
+        worker.in_flight[job["id"]] = job
+        worker._on_done(slot, {
+            "slot": 0,
+            "kind": "done",
+            "id": job["id"],
+            "bucket": "retry",
+            "cf_kind": "empty_block",
+            "error": "Page.goto: net::ERR_CONNECTION_RESET at " + URL,
+            "scrape_ms": 12000,
+            "person": job["person_id"],
+            "url": job["url"],
+            "generation": group.generation,
+        })
+        self.assertEqual(group.proxy, "http://10.0.0.2:8000")
+        self.assertEqual(worker._pause_remaining_sec(), 0)
+        self.assertEqual(queue_stats(r)["pending"], 1)
+
     def test_site_captcha_rotates_proxy_without_global_pause(self):
         r = make_redis()
         feed(r, [URL])

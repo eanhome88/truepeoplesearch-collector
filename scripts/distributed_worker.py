@@ -451,6 +451,18 @@ def rate_limit_pause_sec(streak: int) -> int:
     return steps[idx]
 
 
+def _is_dead_exit(text: str, kind: str = "") -> bool:
+    """浏览器没打开页面：连接被掐、空响应、超时。这是出口死了，不是页面内容问题。"""
+    if (kind or "").strip().lower() in ("empty_block", "timeout"):
+        return True
+    blob = (text or "").lower()
+    return any(token in blob for token in (
+        "err_empty_response", "err_connection", "err_socket", "err_proxy",
+        "err_timed_out", "connection reset", "connection closed", "empty response",
+        "broken pipe", "net_retry", "net::",
+    ))
+
+
 def proxy_tcp_open(proxy: str, timeout: float = 0.4) -> bool:
     """分配前对代理 host:port 做一次短 TCP 连接。连不上就是哑行。
 
@@ -762,10 +774,7 @@ def _classify_error_kind(exc: BaseException) -> str:
 
     # 代理层网络错误：明确进 retry（换组换 proxy 重排），且排在 "empty"+"page"
     # 误判之前——文案里带 empty 但不是空页。
-    if any(s in msg for s in ("err_empty_response", "err_connection", "err_socket",
-                              "err_proxy", "err_timed_out", "connection reset",
-                              "connection closed", "empty response", "broken pipe",
-                              "net_retry", "net::")):
+    if _is_dead_exit(msg):
         return "retry"
     if any(s in msg for s in ("timeout", "timed out", "timeouterror")):
         return "cf_fail"
@@ -1270,6 +1279,9 @@ async def _tab_job(slot: int, box: _ChromeBox, job: dict, sleep_fn=None) -> dict
                 break
             if last_bucket in ("http_4xx", "rate_limit"):
                 break
+            if _is_dead_exit(last_error, last_kind):
+                last_route = "rotate_proxy"
+                break
             if last_bucket not in _SESSION_RETRY_BUCKETS or attempt == 2:
                 break
             print(f"[BROWSER] slot={slot} retry after {last_bucket}", flush=True)
@@ -1404,6 +1416,15 @@ class LeaseWorker:
         self.ctx = get_context("spawn")
         self.out_q = self.ctx.Queue()
         lane_count = self.lanes.count if self.lanes is not None else 0
+        if lane_count >= 100:
+            floor = min(32, lane_count, max(self.budget, 1))
+            if self.concurrency < floor:
+                print(
+                    f"[SCALE] pool={lane_count} concurrency {self.concurrency} -> {floor}，断线就换下一条",
+                    flush=True,
+                )
+                self.concurrency = floor
+                self.capacity = daily_capacity(self.concurrency, self.page_sec)
         sizes = plan_chrome_groups(self.concurrency, lane_count)
         used = sum(sizes)
         if used < self.concurrency:
@@ -1628,6 +1649,17 @@ class LeaseWorker:
             print(f"  [CF_KIND] job={jid} kind={cf_kind} route={msg.get('cf_route') or ''} bucket={bucket}")
         if bucket == "rate_limit":
             self._on_rate_limit(slot, job, msg, error, person, url)
+            return
+        if _is_dead_exit(str(error or message or ""), cf_kind):
+            group = self._group_of(slot.slot)
+            self._switch_ip(group)
+            label = ProxyManager._mask_proxy(group.proxy) if group.proxy else "direct"
+            print(
+                f"  [dead_exit] chrome={group.gid} 这条出口连不上网站，已换下一条: {label}",
+                flush=True,
+            )
+            self._finish(job, bucket, error=(error if isinstance(error, str) and error else bucket), retry=True)
+            print(f"  [{bucket}] job={jid} scrape={scrape_ms:.0f}ms")
             return
         if bucket == "no_phone":
             self._finish(job, "parse_fail", error="no_phone", retry=False)
