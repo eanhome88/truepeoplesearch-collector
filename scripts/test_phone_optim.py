@@ -6,9 +6,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-os.environ.setdefault("TPS_ACCEPT_VOIP", "1")
-os.environ.setdefault("TPS_ACCEPT_UNKNOWN_TYPE", "1")
-os.environ.setdefault("TPS_REQUIRE_PHONE", "1")
+import unittest.mock
 
 import scrape_to_tidb as s
 
@@ -22,6 +20,26 @@ class FakePage:
 
 
 class PhoneOptTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._env_patch = unittest.mock.patch.dict(
+            os.environ,
+            {
+                "TPS_ACCEPT_VOIP": "1",
+                "TPS_ACCEPT_UNKNOWN_TYPE": "1",
+                "TPS_REQUIRE_PHONE": "1",
+            },
+        )
+        cls._env_patch.start()
+        cls._old_flags = (s.ACCEPT_VOIP, s.ACCEPT_UNKNOWN_TYPE, s.REQUIRE_PHONE)
+        s.ACCEPT_VOIP = True
+        s.ACCEPT_UNKNOWN_TYPE = True
+        s.REQUIRE_PHONE = True
+
+    @classmethod
+    def tearDownClass(cls):
+        s.ACCEPT_VOIP, s.ACCEPT_UNKNOWN_TYPE, s.REQUIRE_PHONE = cls._old_flags
+        cls._env_patch.stop()
     def test_digits_from_phone_url(self):
         self.assertEqual(s._phone_digits_from_url("https://www.truepeoplesearch.com/find/phone/2015550123"), "2015550123")
         self.assertEqual(s._phone_digits_from_url("https://x/results?resultphone=12015550123"), "2015550123")
@@ -87,16 +105,10 @@ class PhoneOptTests(unittest.TestCase):
         self.assertEqual(out.get("queried_phone"), "(201) 555-0123")
 
     def test_require_phone_switch(self):
-        import importlib
-        os.environ["TPS_REQUIRE_PHONE"] = "0"
-        importlib.reload(s)
-        try:
+        with unittest.mock.patch.object(s, "REQUIRE_PHONE", False):
             self.assertFalse(s.REQUIRE_PHONE)
             # 无电话人物在开关关掉后可入库判定通过（insert 的门）
             self.assertFalse(s.has_usable_phone({"phone_numbers": []}))
-        finally:
-            os.environ["TPS_REQUIRE_PHONE"] = "1"
-            importlib.reload(s)
         self.assertTrue(s.REQUIRE_PHONE)
 
 

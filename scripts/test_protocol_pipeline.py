@@ -30,9 +30,11 @@ class TestProxyManager(unittest.TestCase):
         self.assertIn("****", masked)
 
     def test_proxy_file_and_cooldown(self):
+        import tempfile
         # 临时创建一个代理文件
-        test_file = Path(_SCRIPT_DIR) / "_temp_proxies.txt"
-        test_file.write_text("http://p1:8080\nhttp://p2:8080\n", encoding="utf-8")
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as f:
+            f.write("http://p1:8080\nhttp://p2:8080\n")
+            test_file = Path(f.name)
 
         try:
             pm = ProxyManager(proxy_file=str(test_file), cooldown_sec=10.0)

@@ -355,15 +355,22 @@ def parse_person_lean(page, url: str) -> dict:
             if _eligible_phone_type(p.get("line_type")) and _valid_us_phone(p.get("phone_number"))
         ]
         eligible_wireless = [p for p in wireless_sorted if p in eligible_phones]
+        eligible_landlines = [
+            p for p in eligible_phones
+            if str(p.get("line_type", "")).lower().startswith("landline")
+        ]
         if marked_primary in eligible_wireless:
             chosen = marked_primary
         elif eligible_wireless:
             chosen = eligible_wireless[0]
+        elif marked_primary in eligible_landlines:
+            chosen = marked_primary
+        elif eligible_landlines:
+            chosen = max(eligible_landlines, key=_date_sort_key)
         elif marked_primary in eligible_phones:
             chosen = marked_primary
         else:
-            landlines = [p for p in eligible_phones if p not in eligible_wireless]
-            chosen = max(landlines, key=_date_sort_key) if landlines else None
+            chosen = max(eligible_phones, key=_date_sort_key) if eligible_phones else None
 
         if chosen:
             data["primary_phone"] = chosen.get("phone_number")

@@ -460,8 +460,9 @@ def _process_identity(pid: int, script_name: str):
         script_index = 2 if len(args) > 1 and args[1] == "-u" else 1
         if len(args) <= script_index or args[script_index] != str(SCRIPTS / script_name):
             return None
-        if os.getsid(pid) != pid or os.getpgid(pid) != pid:
-            return None
+        if hasattr(os, "getsid") and hasattr(os, "getpgid"):
+            if os.getsid(pid) != pid or os.getpgid(pid) != pid:
+                return None
         return process, {
             "pid": pid,
             "create_time": process.create_time(),
@@ -469,7 +470,7 @@ def _process_identity(pid: int, script_name: str):
             "session_id": pid,
             "group_id": pid,
         }
-    except (OSError, psutil.Error):
+    except (OSError, psutil.Error, AttributeError):
         return None
 
 

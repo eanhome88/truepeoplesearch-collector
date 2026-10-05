@@ -1613,7 +1613,7 @@ class LeaseWorker:
             if generation is not None and int(generation) != group.generation:
                 return
             group.swapping = False
-            if slot.job is None and not self._group_resting(group):
+            if slot.job is None:
                 self.idle.add(slot.slot)
         elif kind == "done":
             self._on_done(slot, msg)
@@ -1628,7 +1628,9 @@ class LeaseWorker:
         slot.jid = ""
         if job is None:
             return
-        slot.restarts = 0
+        group = self._group_of(slot.slot)
+        if group is not None:
+            group.restarts = 0
         bucket = str(msg.get("bucket") or "retry")
         error = msg.get("error")
         try:

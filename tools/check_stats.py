@@ -34,24 +34,34 @@ def get_stats():
     db_data = {"total": 0, "phones": 0, "wireless": 0, "err": None}
     try:
         import mysql.connector
-        conn = mysql.connector.connect(
-            host=os.environ.get("TPS_DB_HOST", "127.0.0.1"),
-            port=int(os.environ.get("TPS_DB_PORT", 3306)),
-            user=os.environ.get("TPS_DB_USER", "root"),
-            password=os.environ.get("TPS_DB_PASSWORD", ""),
-            database=os.environ.get("TPS_DB_NAME", "people_search"),
-            connection_timeout=3
-        )
-        cur = conn.cursor()
-        cur.execute(f"SELECT COUNT(*) FROM persons p WHERE p.person_id NOT LIKE 'http%' AND p.person_id NOT LIKE '%resultphone%' AND {person_has_phone_sql()}")
-        db_data["total"] = cur.fetchone()[0]
+        conn = None
+        cur = None
+        try:
+            conn = mysql.connector.connect(
+                host=os.environ.get("TPS_DB_HOST", "127.0.0.1"),
+                port=int(os.environ.get("TPS_DB_PORT", 3306)),
+                user=os.environ.get("TPS_DB_USER", "root"),
+                password=os.environ.get("TPS_DB_PASSWORD", ""),
+                database=os.environ.get("TPS_DB_NAME", "people_search"),
+                connection_timeout=3
+            )
+            cur = conn.cursor()
+            id_filter = "p.person_id NOT LIKE 'http%' AND p.person_id NOT LIKE '%resultphone%'"
+            cur.execute(f"SELECT COUNT(*) FROM persons p WHERE {id_filter} AND {person_has_phone_sql()}")
+            db_data["total"] = cur.fetchone()[0]
 
-        cur.execute(f"SELECT COUNT(DISTINCT ph.person_id) FROM phone_numbers ph JOIN persons p ON p.person_id=ph.person_id WHERE {person_has_phone_sql()} AND {usable_phone_sql('ph.phone_number')} AND {eligible_phone_type_sql('ph.line_type')}")
-        db_data["phones"] = cur.fetchone()[0]
+            cur.execute(f"SELECT COUNT(DISTINCT ph.person_id) FROM phone_numbers ph JOIN persons p ON p.person_id=ph.person_id WHERE {id_filter} AND {person_has_phone_sql()} AND {usable_phone_sql('ph.phone_number')} AND {eligible_phone_type_sql('ph.line_type')}")
+            db_data["phones"] = cur.fetchone()[0]
 
-        cur.execute(f"SELECT COUNT(*) FROM phone_numbers ph JOIN persons p ON p.person_id=ph.person_id WHERE LOWER(ph.line_type)='wireless' AND {person_has_phone_sql()} AND {usable_phone_sql('ph.phone_number')}")
-        db_data["wireless"] = cur.fetchone()[0]
-        conn.close()
+            cur.execute(f"SELECT COUNT(*) FROM phone_numbers ph JOIN persons p ON p.person_id=ph.person_id WHERE {id_filter} AND LOWER(ph.line_type)='wireless' AND {person_has_phone_sql()} AND {usable_phone_sql('ph.phone_number')}")
+            db_data["wireless"] = cur.fetchone()[0]
+        finally:
+            if cur:
+                try: cur.close()
+                except Exception: pass
+            if conn:
+                try: conn.close()
+                except Exception: pass
     except Exception as e:
         db_data["err"] = str(e)
 
@@ -102,7 +112,8 @@ def main():
     print(f"  • 累计执行总请求 (Attempts)   : {attempts:>10,} 次")
     print(f"  • 抓取成功并处理 (Success)    : {success:>10,} 次 (成功率: {rate})")
     print(f"  • 无电话无价值过滤 (Filtered) : {empty:>10,} 条 (已自动拦截丢弃)")
-    print(f"  • 触发重试 / 限流保护 (Retry) : {r['retry'] + r['rate_limit']:>10,} 次 (自愈重试中)")
+    retries = r['retry'] + r['rate_limit'] + r['cf_fail']
+    print(f"  • 触发重试 / 限流保护 (Retry) : {retries:>10,} 次 (自愈重试中，含CF阻断 {r['cf_fail']:,} 次)")
 
     print("\n【2. 实时任务队列状态 (Redis)】")
     print(f"  • 待抓取队列池 (Pending)      : {r['pending']:>10,} 条 (调度蓄水池)")

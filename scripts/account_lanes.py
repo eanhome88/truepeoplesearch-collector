@@ -40,13 +40,16 @@ from typing import Callable, Deque, Dict, List, Optional
 from urllib.parse import urlparse, unquote
 
 
-_SID_RE = re.compile(r"(?i)-sid-[A-Za-z0-9]+-t-\d+")
-_SESSION_RE = re.compile(r"(?i)-session[_-][A-Za-z0-9]+")
+_SID_RE = re.compile(r"(?i)-sid-[A-Za-z0-9_-]+(?:-t-\d+)?")
+_SESSION_RE = re.compile(r"(?i)[-_]session[-_][A-Za-z0-9_-]+")
+_CB_RE = re.compile(r"(?i)_s[A-Za-z0-9]+(?:-\d+m)?$")
 
 
 def _base_account(username: str) -> str:
-    """去掉粘性后缀（-sid-xxx-t-NN / -session_xxx），同网关账号归一桶。"""
-    base = _SID_RE.sub("", username or "")
+    """去掉粘性后缀（-sid-xxx-t-NN / -session_xxx / _s...-30m），同网关账号归一桶。"""
+    base = username or ""
+    base = _CB_RE.sub("", base)
+    base = _SID_RE.sub("", base)
     base = _SESSION_RE.sub("", base)
     return base.strip().lower()
 

@@ -139,7 +139,7 @@ class PersonVisibilityTests(unittest.TestCase):
         self.assertEqual(wireless["with_wireless"], 4)
 
     def test_sql_eligibility_matches_the_ingestion_rule(self):
-        with patch.dict(os.environ, {}, clear=True), patch("tps_env.load_project_env"):
+        with patch.dict(os.environ, {"TPS_ACCEPT_VOIP": "0", "TPS_ACCEPT_UNKNOWN_TYPE": "0"}, clear=True), patch("tps_env.load_project_env"):
             scraper = load_module("scraper_visibility_rules", ROOT / "scripts" / "scrape_to_tidb.py")
         for row in self.query("SELECT * FROM persons"):
             row["phone_numbers"] = self.query("SELECT * FROM phone_numbers WHERE person_id = ?", (row["person_id"],))

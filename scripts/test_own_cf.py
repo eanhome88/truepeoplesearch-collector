@@ -160,12 +160,22 @@ class TestAdapters(unittest.TestCase):
         self.assertIn("Chrome/124", sol.user_agent)
 
     def test_http_adapter(self):
-        server = HTTPServer(("127.0.0.1", 0), _Handler)
+        try:
+            server = HTTPServer(("127.0.0.1", 0), _Handler)
+        except (PermissionError, OSError) as exc:
+            self.skipTest(f"Local socket bind not permitted: {exc}")
+            return
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
             solver = CfSolver(f"http://127.0.0.1:{server.server_port}/solve", timeout=10)
-            sol = asyncio.run(solver.solve("https://x/9", user_agent=None))
+            try:
+                sol = asyncio.run(solver.solve("https://x/9", user_agent=None))
+            except CfSolverError as exc:
+                if "Operation not permitted" in str(exc):
+                    self.skipTest(f"Local socket connect not permitted: {exc}")
+                    return
+                raise
             self.assertEqual(sol.cookies, {"cf_clearance": "http-first"})
             self.assertEqual(sol.user_agent, UA_131)
             self.assertTrue(solver.describe().startswith("http 127.0.0.1:"))

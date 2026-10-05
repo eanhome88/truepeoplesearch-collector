@@ -40,6 +40,14 @@ def person(with_phone=True):
 
 
 class InsertPersonTruthTests(unittest.TestCase):
+    def setUp(self):
+        patcher_voip = mock.patch.object(scrape_to_tidb, "ACCEPT_VOIP", False)
+        patcher_unk = mock.patch.object(scrape_to_tidb, "ACCEPT_UNKNOWN_TYPE", False)
+        patcher_voip.start()
+        patcher_unk.start()
+        self.addCleanup(patcher_voip.stop)
+        self.addCleanup(patcher_unk.stop)
+
     def test_business_phone_outside_person_section_is_not_attributed(self):
         text = """Test Person
 Businesses

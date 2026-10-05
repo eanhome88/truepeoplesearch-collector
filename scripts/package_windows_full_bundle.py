@@ -51,6 +51,7 @@ APP_ALLOWLIST = (
     "deploy/windows-full/Test-CustomerEnv.ps1",
     "deploy/windows-full/Test-FullBundle.ps1",
     "deploy/windows-full/Test-Stack.ps1",
+    "deploy/windows-full/Update-PinnedCode.ps1",
     "deploy/windows-full/docker-compose.yml",
     "deploy/windows-full/requirements-full.txt",
     "deploy/windows-full/runtime.env.example",
@@ -835,6 +836,7 @@ def load_vendor_files(
             detail.append("extra=" + ",".join(sorted(extra)))
         raise BundleError("offline wheelhouse does not match the locked Windows closure: " + "; ".join(detail))
 
+    canonical_records.sort(key=lambda item: item["path"])
     canonical_manifest = {
         "schema_version": 1,
         "target": TARGET,

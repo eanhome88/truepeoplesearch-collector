@@ -169,12 +169,22 @@ IP_COOLDOWN_MAP: Dict[str, float] = {}
 DEFAULT_IP_COOLDOWN_SEC = 1800.0  # 被拦 IP 默认冷却 30 分钟后自动解冻复用
 
 
+def _sweep_expired_ip_cooldown_locked(now: float) -> None:
+    expired = [k for k, v in IP_COOLDOWN_MAP.items() if now >= v]
+    for k in expired:
+        IP_COOLDOWN_MAP.pop(k, None)
+    while len(IP_COOLDOWN_MAP) > 2000:
+        IP_COOLDOWN_MAP.pop(next(iter(IP_COOLDOWN_MAP)))
+
+
 def mark_ip_cooldown(ip: str, cooldown_sec: float = DEFAULT_IP_COOLDOWN_SEC) -> None:
     """将触发拦截/异常的 IP 打入冷却池，指定冷却时间 (默认 30 分钟)。"""
     if not ip:
         return
+    now = time.time()
     with IP_COOLDOWN_LOCK:
-        IP_COOLDOWN_MAP[ip] = time.time() + cooldown_sec
+        _sweep_expired_ip_cooldown_locked(now)
+        IP_COOLDOWN_MAP[ip] = now + cooldown_sec
     try:
         r = get_redis_optional()
         if r is not None:

@@ -329,12 +329,17 @@ class BulkIngesterDaemon:
                 persons_rows.append(row_dict)
 
                 for a in (data.get("aliases") or []):
-                    name = a.get("alias_name")
+                    if isinstance(a, dict):
+                        name = a.get("alias_name")
+                    elif isinstance(a, str):
+                        name = a
+                    else:
+                        name = None
                     if name:
                         aliases_rows.append((person_id, name))
 
-                ca = data.get("current_address") or {}
-                if any(ca.get(k) is not None for k in (
+                ca = data.get("current_address")
+                if isinstance(ca, dict) and any(ca.get(k) is not None for k in (
                     "street", "unit", "city", "state", "zip_code", "county",
                     "estimated_value", "bathrooms", "square_feet", "year_built", "hoa_fee_monthly",
                 )):
@@ -346,23 +351,26 @@ class BulkIngesterDaemon:
                     ))
 
                 for a in (data.get("previous_addresses") or []):
-                    prev_addr_rows.append((
-                        person_id, a.get("street"), a.get("city"), a.get("state"),
-                        a.get("zip_code"), a.get("county"),
-                    ))
-
-                for p in (data.get("phone_numbers") or []):
-                    num = p.get("phone_number")
-                    if num:
-                        phones_rows.append((
-                            person_id, num, p.get("line_type"), p.get("carrier"),
-                            p.get("is_primary"), p.get("last_reported"),
+                    if isinstance(a, dict):
+                        prev_addr_rows.append((
+                            person_id, a.get("street"), a.get("city"), a.get("state"),
+                            a.get("zip_code"), a.get("county"),
                         ))
 
+                for p in (data.get("phone_numbers") or []):
+                    if isinstance(p, dict):
+                        num = p.get("phone_number")
+                        if num:
+                            phones_rows.append((
+                                person_id, num, p.get("line_type"), p.get("carrier"),
+                                p.get("is_primary"), p.get("last_reported"),
+                            ))
+
                 for e in (data.get("emails") or []):
-                    mail = e.get("email")
-                    if mail:
-                        emails_rows.append((person_id, mail))
+                    if isinstance(e, dict):
+                        mail = e.get("email")
+                        if mail:
+                            emails_rows.append((person_id, mail))
 
             # 批量执行
             if persons_rows:

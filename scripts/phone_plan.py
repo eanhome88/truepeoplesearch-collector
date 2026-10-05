@@ -21,7 +21,8 @@ HOT_DONE_KEY = "tps:phone:hot:done"
 def next_hot_npa(r, after: int = 0):
     """返回下一个没走完的热区号；走完返回 None（转全量扫）。"""
     try:
-        done = set(r.smembers(HOT_DONE_KEY) or set)
+        raw = r.smembers(HOT_DONE_KEY)
+        done = set(raw) if raw else set()
     except Exception:
         done = set()
     for npa in HOT_NPAS:

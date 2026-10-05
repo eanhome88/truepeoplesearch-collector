@@ -159,10 +159,21 @@ for launcher in (sync_playwright, sync_patchright):
         if page.title() != "offline-smoke":
             raise RuntimeError("offline Chromium page smoke failed")
         browser.close()
-'@
-& $venvPython -I -B -c $browserSmoke
-if ($LASTEXITCODE -ne 0) {
-    throw 'The pinned Chromium revision failed its offline Playwright/Patchright launch smoke.'
+# Windows PowerShell 5.1 调用本机程序时会吃掉 -c 参数里的双引号，烟测必须落成文件再执行。
+$smokePath = Join-Path $root 'runtime\temp\browser-smoke.py'
+$smokeWritten = $false
+try {
+    [IO.File]::WriteAllText($smokePath, $browserSmoke, (New-Object Text.UTF8Encoding($false)))
+    $smokeWritten = $true
+    & $venvPython -I -B $smokePath
+    if ($LASTEXITCODE -ne 0) {
+        throw 'The pinned Chromium revision failed its offline Playwright/Patchright launch smoke.'
+    }
+}
+finally {
+    if ($smokeWritten -and (Test-Path -LiteralPath $smokePath)) {
+        Remove-Item -LiteralPath $smokePath -Force
+    }
 }
 
 if (-not $runtimeAlreadyInstalled) {
